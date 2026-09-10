@@ -623,10 +623,40 @@ with gr.Blocks(title="Quant Convert GUI") as demo:
 
                     with gr.Accordion("Advanced options", open=False):
                         with gr.Row():
-                            comfy_quant = gr.Checkbox(value=True, label="ComfyUI-compatible layout (--comfy_quant)")
-                            save_metadata = gr.Checkbox(value=True, label="Save quantization metadata")
-                            low_memory = gr.Checkbox(value=True, label="Low memory mode")
-                        exclude_layers = gr.Textbox(label="Exclude layers (regex)", placeholder="e.g. (final_layer|txt_attn.proj)")
+                            comfy_quant = gr.Checkbox(
+                                value=True, label="ComfyUI-compatible layout (--comfy_quant)",
+                                info="Writes quantized tensors in the layout/naming ComfyUI expects, so the file "
+                                "loads directly as a checkpoint there. Turn off only if another tool needs ctq's "
+                                "plain layout instead.",
+                            )
+                            save_metadata = gr.Checkbox(
+                                value=True, label="Save quantization metadata",
+                                info="Embeds a _quantization_metadata JSON header (format/scale/group-size per "
+                                "layer). Most loaders (ComfyUI, this app's own INT4 path) need this to know a "
+                                "layer is quantized at all — off saves a few KB but risks an unreadable file.",
+                            )
+                            low_memory = gr.Checkbox(
+                                value=True, label="Low memory mode",
+                                info="Streams tensors through conversion one at a time instead of loading the "
+                                "whole model into RAM/VRAM at once. Doesn't change the output file, only avoids "
+                                "OOM on large models with limited memory (at a small speed cost).",
+                            )
+                        exclude_layers = gr.Textbox(
+                            label="Exclude layers (regex)",
+                            placeholder="e.g. (final_layer|txt_attn.proj)",
+                            info="Layers matching this stay at their original precision, overriding the format/"
+                            "preset above entirely. Use it to protect specific layers your preset doesn't already "
+                            "cover — this changes accuracy and file size, never speed.",
+                        )
+                        with gr.Row():
+                            excl_tpl_norms_btn = gr.Button("Norms & embeddings", size="sm")
+                            excl_tpl_mod_btn = gr.Button("Modulation & gating", size="sm")
+                            excl_tpl_final_btn = gr.Button("Final output layer", size="sm")
+                            excl_tpl_clear_btn = gr.Button("Clear", size="sm")
+                        gr.Markdown(
+                            "_Generic starting points, not guaranteed to match your model — check the live log "
+                            "from a previous conversion (or the Estimate panel) for its actual layer names first._"
+                        )
 
                         gr.Markdown(
                             "**Mixed precision (per-layer custom format)** — pick a base format above for most "
@@ -641,18 +671,36 @@ with gr.Blocks(title="Quant Convert GUI") as demo:
                         custom_layers = gr.Textbox(
                             label="Custom layers (regex)",
                             placeholder=r"e.g. attn\.(wq|wo|gate)|mlp\.(gate|up|down)",
+                            info="Leave empty to disable per-layer overrides entirely (every quantizable layer "
+                            "just uses the format chosen in step 3).",
                         )
                         with gr.Row():
+                            custom_tpl_potatoforge_btn = gr.Button(
+                                "PotatoForge-style (wk/wv → plain INT8)", size="sm"
+                            )
+                            custom_tpl_clear_btn = gr.Button("Clear", size="sm")
+                        with gr.Row():
                             custom_type = gr.Dropdown(
-                                ["none", "fp8", "int8", "mxfp8", "nvfp4"], value="none", label="Custom layer type"
+                                ["none", "fp8", "int8", "mxfp8", "nvfp4"], value="none", label="Custom layer type",
+                                info="Format the matched layers use instead of the main format above.",
                             )
                             custom_scaling_mode = gr.Dropdown(
-                                ["none", "tensor", "row", "block"], value="none", label="Custom layer scaling mode"
+                                ["none", "tensor", "row", "block"], value="none", label="Custom layer scaling mode",
+                                info="Scale granularity for those layers: tensor = one scale for the whole "
+                                "tensor (smallest, least accurate), row = one per output row (ctq's usual "
+                                "default), block = one per fixed-size block (most accurate, more scale data).",
                             )
                         with gr.Row():
-                            custom_convrot = gr.Checkbox(value=False, label="ConvRot on custom layers (INT8 only)")
+                            custom_convrot = gr.Checkbox(
+                                value=False, label="ConvRot on custom layers (INT8 only)",
+                                info="Applies the same Hadamard-rotation trick as the main ConvRot option, but "
+                                "only to these custom layers. Improves low-bit accuracy; only valid with custom "
+                                "type INT8.",
+                            )
                             custom_convrot_group_size = gr.Dropdown(
-                                [4, 16, 64, 256, 1024], value=256, label="Custom ConvRot group size"
+                                [4, 16, 64, 256, 1024], value=256, label="Custom ConvRot group size",
+                                info="Rotation block width for these layers - must evenly divide their width. "
+                                "Larger groups usually rotate more outliers away but need a wider layer.",
                             )
                             custom_simple = gr.Checkbox(
                                 value=True,
@@ -663,24 +711,68 @@ with gr.Blocks(title="Quant Convert GUI") as demo:
                         with gr.Row():
                             fallback = gr.Dropdown(
                                 ["none", "fp8", "int8", "mxfp8", "nvfp4"], value="none", label="Fallback type",
-                                info="What excluded/unmatched layers become, instead of staying full precision.",
+                                info="What layers excluded by your preset or the exclude-layers regex above "
+                                "become, instead of staying at full original precision. none (default) keeps "
+                                "them full precision - safest for accuracy; picking a format here shrinks the "
+                                "file further at that layer's expense.",
                             )
-                            fallback_simple = gr.Checkbox(value=False, label="Simple quant for fallback layers")
+                            fallback_simple = gr.Checkbox(
+                                value=False, label="Simple quant for fallback layers",
+                                info="Same simple-vs-learned trade-off as above, applied to fallback layers only.",
+                            )
 
                         with gr.Row():
-                            device = gr.Textbox(label="Device override", placeholder="cuda / cuda:0 / cpu")
-                            output_dtype = gr.Radio(["bfloat16", "float16"], value="bfloat16", label="Output dtype")
-                            verbose = gr.Radio(["MINIMAL", "NORMAL", "VERBOSE", "DEBUG"], value="NORMAL", label="Log verbosity")
-                        gr.Markdown("**Learned/AdaRound settings** (used only in Learned mode)")
+                            device = gr.Textbox(
+                                label="Device override", placeholder="cuda / cuda:0 / cpu",
+                                info="Where ctq computes the conversion. Never changes the output file's "
+                                "contents - only speed. Learned/AdaRound mode in particular is far slower on CPU.",
+                            )
+                            output_dtype = gr.Radio(
+                                ["bfloat16", "float16"], value="bfloat16", label="Output dtype",
+                                info="Float type for any layer that stays unquantized, plus scale tensors. "
+                                "bfloat16 matches how most modern diffusion models were trained (wide dynamic "
+                                "range, safer against outliers); float16 has finer precision at small magnitudes "
+                                "but can overflow on extreme values - some older inference stacks expect it.",
+                            )
+                            verbose = gr.Radio(
+                                ["MINIMAL", "NORMAL", "VERBOSE", "DEBUG"], value="NORMAL", label="Log verbosity",
+                                info="Console log detail only - has no effect on the resulting model.",
+                            )
+                        gr.Markdown(
+                            "**Learned/AdaRound settings** (used only in Learned mode above) — AdaRound learns "
+                            "per-tensor rounding offsets from a handful of calibration passes instead of rounding "
+                            "each weight to the nearest representable value, trading conversion time for accuracy."
+                        )
                         with gr.Row():
-                            calib_samples = gr.Number(value=3072, label="Calibration samples", precision=0)
-                            optimizer = gr.Dropdown(["prodigy", "adamw", "radam", "original"], value="prodigy", label="Optimizer")
+                            calib_samples = gr.Number(
+                                value=3072, label="Calibration samples", precision=0,
+                                info="How many calibration samples AdaRound uses per tensor. More generally means "
+                                "more accurate rounding but a slower conversion.",
+                            )
+                            optimizer = gr.Dropdown(
+                                ["prodigy", "adamw", "radam", "original"], value="prodigy", label="Optimizer",
+                                info="Which optimizer learns the per-tensor rounding offsets. prodigy (ctq's "
+                                "default) self-tunes its learning rate; adamw/radam are classic alternatives; "
+                                "original matches the original AdaRound paper's optimizer.",
+                            )
                         with gr.Row():
-                            num_iter = gr.Number(value=4000, label="Iterations per tensor", precision=0)
-                            manual_seed = gr.Number(value=-1, label="Manual seed (-1 = random)", precision=0)
+                            num_iter = gr.Number(
+                                value=4000, label="Iterations per tensor", precision=0,
+                                info="Optimization steps per tensor. Higher converges closer to the ideal "
+                                "rounding but multiplies total conversion time - e.g. halving this roughly "
+                                "halves Learned-mode runtime at some accuracy cost.",
+                            )
+                            manual_seed = gr.Number(
+                                value=-1, label="Manual seed (-1 = random)", precision=0,
+                                info="Fixes the random seed used to pick calibration samples, for reproducible "
+                                "conversions. -1 picks a new seed each run.",
+                            )
                         python_exe = gr.Textbox(
                             label="Python executable running ctq (optional)",
                             placeholder="leave blank to use this app's Python / the ctq command on PATH",
+                            info="Only matters with multiple Python installs - point this at a specific venv/"
+                            "conda interpreter (e.g. one with GPU PyTorch) instead of this app's own or "
+                            "whichever ctq is first on PATH. Doesn't affect the resulting model.",
                         )
 
                     gr.Markdown("### 5. Output")
@@ -844,6 +936,26 @@ with gr.Blocks(title="Quant Convert GUI") as demo:
     krea2_smallest_btn.click(krea2_smallest, outputs=krea2_profile_outputs).then(
         krea2_group_visibility, inputs=[preset_dd], outputs=[krea2_size_group]
     )
+
+    EXCLUDE_TEMPLATE_NORMS = r"(norm|embed)"
+    EXCLUDE_TEMPLATE_MOD = r"(modulat|\.gate\b)"
+    EXCLUDE_TEMPLATE_FINAL = r"(final_layer|proj_out|last)"
+
+    excl_tpl_norms_btn.click(lambda: EXCLUDE_TEMPLATE_NORMS, outputs=[exclude_layers])
+    excl_tpl_mod_btn.click(lambda: EXCLUDE_TEMPLATE_MOD, outputs=[exclude_layers])
+    excl_tpl_final_btn.click(lambda: EXCLUDE_TEMPLATE_FINAL, outputs=[exclude_layers])
+    excl_tpl_clear_btn.click(lambda: "", outputs=[exclude_layers])
+
+    custom_mixed_outputs = [custom_layers, custom_type, custom_scaling_mode, custom_convrot]
+
+    def custom_tpl_potatoforge():
+        # Matches PotatoForge/Kroma-INT8-Quants: attn.wk/wv stay plain
+        # tensorwise INT8 while everything else uses the main format above
+        # (pick "INT8 — ConvRot" in step 3 to reproduce their recipe exactly).
+        return r"attn\.(wk|wv)\.weight", "int8", "tensor", False
+
+    custom_tpl_potatoforge_btn.click(custom_tpl_potatoforge, outputs=custom_mixed_outputs)
+    custom_tpl_clear_btn.click(lambda: ("", "none", "none", False), outputs=custom_mixed_outputs)
 
     source.change(on_source_change, inputs=[source], outputs=[local_group, hf_group]).then(
         refresh_local_models, outputs=[local_models_dd]
