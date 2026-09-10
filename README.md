@@ -52,6 +52,43 @@ Verified end to end against a real ctq install: a regex splitting
 split (12 custom-ConvRot layers, 4 plain-tensorwise layers on a 2-block test
 model).
 
+## What does "txtfusion" in a filename mean?
+
+`kroma-v0.3-txtfusion-edition-turbo-int8-convrot-simple.safetensors` isn't a
+different quantization *format* — "txtfusion" is a **layer name**, and its
+presence in the filename means that edition was converted with ctq's
+`krea2` preset. That preset's actual definition (from
+`convert_to_quant.constants.MODEL_FILTERS["krea2"]`) is:
+
+```
+highprec: ["firs", "las", "tml", "txtfusion", "last.modulatio", "tpro"]
+```
+
+i.e. any tensor whose name contains one of those substrings — including the
+model's `txtfusion` layer (a text/image-fusion block, sensitive to
+quantization like modulation and final layers usually are) — is kept at
+full precision instead of being quantized. That's almost certainly why the
+txtfusion-edition file quantizes better than a plain "blanket ConvRot, no
+preset" conversion for this model family: it isn't quantizing everything.
+
+**To get this yourself:** open the **Model preset (layer exclusions)**
+accordion on the Convert tab and pick **krea2**. The GUI also does this
+automatically now: if your input filename or Hugging Face URL contains
+`txtfusion`, `krea`, or `kroma`, it auto-selects the `krea2` preset for you
+(as long as you haven't already picked a different one), and tells you why
+in the note under the file picker.
+
+## Estimating output size
+
+Hit **Estimate output size** (next to the command preview) after picking a
+file and format. It reads only the input file's safetensors *header*
+(tensor names/shapes/dtypes — a few KB, regardless of the model's actual
+size) and estimates the converted size from your chosen format, preset, and
+any custom-layer rules, without running ctq or needing torch/CUDA installed
+yet. If a GPU was detected, it also flags whether the estimate fits in its
+VRAM. It's a planning figure, not exact — it approximates ctq's per-layer
+choices rather than replicating them (see `quant_gui/size_estimate.py`).
+
 ## About "INT4 ConvRot"
 
 As of `convert_to_quant` v1.3.4, **there is no INT4 (integer 4-bit) output
@@ -78,7 +115,11 @@ it's missing. Safe to re-run any time; it skips whatever's already
 installed.
 
 Once installed, use `run.bat` (Windows) / `run.sh` (Linux/Mac) to start the
-app without reinstalling anything.
+app without reinstalling anything, and `update.bat` / `update.sh` to pull
+the latest code (if you cloned via git) and upgrade the GUI's own
+dependencies (gradio, huggingface_hub, convert-to-quant, scipy). PyTorch and
+Triton aren't touched by update — they're large GPU-specific downloads;
+re-run install if you want a newer CUDA build.
 
 <details>
 <summary>What the installer actually detects</summary>
@@ -144,7 +185,8 @@ everyone else can ignore them.
 
 ## Project layout
 
-- `install.bat` / `install.sh`, `run.bat` / `run.sh` — automated setup and launch.
+- `install.bat` / `install.sh`, `run.bat` / `run.sh`, `update.bat` /
+  `update.sh` — automated setup, launch, and updates.
 - `scripts/setup_env.py` — the actual installer logic (GPU/CUDA detection,
   PyTorch/Triton install, final environment check); OS-agnostic Python, so
   the `.bat`/`.sh` wrappers are thin.
@@ -153,6 +195,9 @@ everyone else can ignore them.
   function, unit-testable without a GUI).
 - `quant_gui/runner.py` — runs `ctq` as a subprocess and streams its output.
 - `quant_gui/env_check.py` — detects ctq/PyTorch/CUDA/GPU availability.
+- `quant_gui/gpu_profiles.py` — GPU-generation-to-format recommendations.
 - `quant_gui/hf.py` — downloads a single file from a Hugging Face URL.
 - `quant_gui/filters.py` — the model-family presets ctq exposes (e.g.
   `--flux2`, `--wan`, `--krea2` for txtfusion/Krea2/Kroma-style models).
+- `quant_gui/size_estimate.py` — estimates output file size from the input
+  file's safetensors header, without needing torch/ctq installed.

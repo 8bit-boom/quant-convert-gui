@@ -20,6 +20,7 @@ from quant_gui.filters import preset_choices, preset_label, suggest_preset
 from quant_gui.gpu_profiles import GPU_PROFILE_BY_KEY, GPU_PROFILES, detect_profile_key
 from quant_gui.hf import HFUrlError, download as hf_download, parse_hf_url
 from quant_gui.runner import stream_conversion
+from quant_gui.size_estimate import estimate_from_file
 
 APP_DIR = Path(__file__).resolve().parent
 DOWNLOAD_DIR = APP_DIR / "downloads"
@@ -208,12 +209,23 @@ def do_hf_download(url: str, token: str, progress=gr.Progress()):
     return local_path, f"Downloaded to `{local_path}`"
 
 
-def on_input_resolved(local_path: str, hf_url: str):
+def on_input_resolved(local_path: str, hf_url: str, current_preset_label: str):
     hint = local_path or hf_url
     preset = suggest_preset(hint)
-    if preset:
-        return f"Detected `{Path(hint).name if local_path else hf_url}` — suggesting the **{preset}** preset below (used for txtfusion/Krea2/Kroma-style models)."
-    return ""
+    if not preset:
+        return "", gr.update()
+
+    name = Path(hint).name if local_path else hf_url
+    if LABEL_TO_PRESET.get(current_preset_label, "none") == "none":
+        msg = (
+            f"Detected `{name}` — auto-selected the **{preset}** preset below "
+            "(its layer list literally includes `txtfusion`; this is what gives txtfusion-edition "
+            "models better quality than plain ConvRot). Change it below if you don't want that."
+        )
+        return msg, gr.update(value=PRESET_LABELS[preset])
+
+    msg = f"Detected `{name}` — this model usually does best with the **{preset}** preset, but you've already picked a different one."
+    return msg, gr.update()
 
 
 def run_convert(
@@ -479,6 +491,9 @@ with gr.Blocks(title="Quant Convert GUI") as demo:
 
                     command_preview = gr.Textbox(label="Command ctq will run", interactive=False, lines=2)
 
+                    estimate_btn = gr.Button("Estimate output size")
+                    estimate_md = gr.Markdown()
+
                     convert_btn = gr.Button("Convert", elem_id="convert-btn", variant="primary")
 
                 with gr.Column(scale=2):
@@ -522,6 +537,18 @@ with gr.Blocks(title="Quant Convert GUI") as demo:
                 "Picking FP8 or NVFP4 on an unsupported card doesn't reliably fail at conversion time — "
                 "the file often still gets written, it just won't load or run fast in ComfyUI. The "
                 "**Target GPU** picker on the Convert tab exists to head that off.\n\n"
+                "## What does \"txtfusion\" in a filename mean?\n"
+                "It's not a format — it's a **layer name**. `kroma-v0.3-txtfusion-edition-...` was converted "
+                "with ctq's `krea2` preset, whose high-precision keyword list literally includes `txtfusion` "
+                "(alongside a few other sensitive layers). That layer stays BF16 instead of getting quantized, "
+                "which is almost certainly why that edition looks better than a preset-less conversion. Pick "
+                "**krea2** under **Model preset (layer exclusions)** to get the same effect — the app also "
+                "auto-selects it when your filename/URL contains `txtfusion`, `krea`, or `kroma`.\n\n"
+                "## Estimating output size\n"
+                "**Estimate output size** reads only the input file's safetensors header (tensor names/shapes, "
+                "a few KB) and estimates the converted size for your chosen format/preset/custom-layer rules — "
+                "no torch or ctq install required for this step. It also flags whether the estimate fits your "
+                "detected GPU's VRAM. It's a planning figure, not an exact prediction.\n\n"
                 "## Credit\n"
                 "All the actual quantization math lives in "
                 "[silveroxides/convert_to_quant](https://github.com/silveroxides/convert_to_quant) (`ctq`). "
@@ -571,9 +598,9 @@ with gr.Blocks(title="Quant Convert GUI") as demo:
     source.change(on_source_change, inputs=[source], outputs=[local_group, hf_group])
 
     download_btn.click(do_hf_download, inputs=[input_hf_url, hf_token], outputs=[input_hf_local, download_status]).then(
-        on_input_resolved, inputs=[input_hf_local, input_hf_url], outputs=[resolved_hint]
+        on_input_resolved, inputs=[input_hf_local, input_hf_url, preset_dd], outputs=[resolved_hint, preset_dd]
     )
-    input_local.change(on_input_resolved, inputs=[input_local, input_hf_url], outputs=[resolved_hint])
+    input_local.change(on_input_resolved, inputs=[input_local, input_hf_url, preset_dd], outputs=[resolved_hint, preset_dd])
 
     auto_output.change(lambda auto: gr.update(interactive=not auto), inputs=[auto_output], outputs=[output_name])
 
@@ -600,6 +627,22 @@ with gr.Blocks(title="Quant Convert GUI") as demo:
         comp.change(refresh_preview, inputs=preview_inputs, outputs=[command_preview])
 
     fmt_value.change(refresh_preview, inputs=preview_inputs, outputs=[command_preview])
+
+    def do_estimate(*args):
+        input_local_v, input_hf_local_v, source_v = args[0], args[1], args[2]
+        input_path = input_local_v if source_v == "Local file path" else input_hf_local_v
+        rest = args[3:]
+        input_path = (input_path or "").strip()
+        if not input_path or not Path(input_path).is_file():
+            return "Pick an input file (local path, or download a Hugging Face file) first."
+        try:
+            opts = build_options(input_path, *rest)
+        except OptionsError as exc:
+            return f"Can't estimate: {exc}"
+        vram = check_environment().gpu_vram_gb
+        return estimate_from_file(input_path, opts, gpu_vram_gb=vram)
+
+    estimate_btn.click(do_estimate, inputs=preview_inputs, outputs=[estimate_md])
 
     convert_btn.click(
         run_convert,
