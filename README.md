@@ -62,7 +62,39 @@ you pick "INT4 ConvRot" it explains the gap instead of pretending to convert.
 The format list mirrors ctq's real CLI flags, so the moment ctq ships true
 INT4, adding it here is a one-line change in `quant_gui/cli_builder.py`.
 
-## Install
+## Install (automatic)
+
+**Windows:** double-click `install.bat` (or run it from a terminal). It
+finds Python, creates a `.venv`, detects your NVIDIA GPU via `nvidia-smi`,
+installs the matching PyTorch CUDA build and Triton automatically, installs
+everything else, then launches the app.
+
+**Linux/Mac:** `./install.sh` does the same thing.
+
+Only requirement: [Python 3.10+](https://www.python.org/downloads/) already
+installed and on PATH — the installer can't bootstrap Python itself (that
+needs an elevated installer), but it'll open the download page for you if
+it's missing. Safe to re-run any time; it skips whatever's already
+installed.
+
+Once installed, use `run.bat` (Windows) / `run.sh` (Linux/Mac) to start the
+app without reinstalling anything.
+
+<details>
+<summary>What the installer actually detects</summary>
+
+It runs `nvidia-smi` to read your driver's max supported CUDA version, then
+picks the newest PyTorch wheel tag that driver can run (cu130 down to
+cu118), or falls back to a CPU-only build if no NVIDIA GPU/driver is found.
+On Windows it also installs `triton-windows`, version-constrained to match
+the installed PyTorch release the way
+[convert_to_quant's own README](https://github.com/silveroxides/convert_to_quant)
+documents. None of this touches your system Python — everything installs
+into the project's own `.venv`.
+
+</details>
+
+## Install (manual)
 
 ```bash
 git clone <this repo>
@@ -88,6 +120,9 @@ additionally need Python 3.12+, PyTorch 2.10+, CUDA 13.0+, and
 python app.py
 ```
 
+(or `run.bat` / `run.sh` if you used the automatic installer, which points
+at the project's own `.venv` for you.)
+
 Then open http://127.0.0.1:7860. The **Environment** tab tells you exactly
 what's missing (ctq, PyTorch, CUDA, a compatible GPU) before you try to
 convert anything.
@@ -109,6 +144,10 @@ everyone else can ignore them.
 
 ## Project layout
 
+- `install.bat` / `install.sh`, `run.bat` / `run.sh` — automated setup and launch.
+- `scripts/setup_env.py` — the actual installer logic (GPU/CUDA detection,
+  PyTorch/Triton install, final environment check); OS-agnostic Python, so
+  the `.bat`/`.sh` wrappers are thin.
 - `app.py` — the Gradio UI.
 - `quant_gui/cli_builder.py` — turns GUI state into `ctq` CLI arguments (pure
   function, unit-testable without a GUI).
