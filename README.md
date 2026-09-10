@@ -32,6 +32,26 @@ ConvRot is both the fastest and the highest-quality option on it — pick
 that, keep **Low memory mode** on, and it'll comfortably fit most diffusion
 transformers in 12GB.
 
+## Mixed precision (per-layer custom format)
+
+[PotatoForge/Kroma-INT8-Quants](https://huggingface.co/PotatoForge/Kroma-INT8-Quants)'s
+"mixed" files aren't one uniform format — their own `_quantization_metadata`
+shows `attn.wk`/`attn.wv` left as plain tensorwise INT8 while `attn.wq`,
+`attn.wo`, `attn.gate`, and every MLP layer get row-wise INT8 ConvRot. ctq
+supports exactly this kind of per-layer split via `--custom-layers`, and the
+**Advanced options → Mixed precision** section on the Convert tab exposes it:
+pick a base format for most layers (step 3), then give a regex for the
+layers that should get a different type/scaling/ConvRot instead. The regex
+matches your *source* model's original tensor names, before any
+`--comfy_quant` renaming — check your model's actual layer names first (e.g.
+open it in the [safetensors metadata viewer on Hugging Face](https://huggingface.co/docs/safetensors)
+or list keys locally with `safetensors.safe_open`).
+
+Verified end to end against a real ctq install: a regex splitting
+`attn.wq/wo/gate` + `mlp.*` from `attn.wk/wv` reproduces PotatoForge's exact
+split (12 custom-ConvRot layers, 4 plain-tensorwise layers on a 2-block test
+model).
+
 ## About "INT4 ConvRot"
 
 As of `convert_to_quant` v1.3.4, **there is no INT4 (integer 4-bit) output

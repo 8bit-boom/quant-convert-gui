@@ -37,8 +37,23 @@ class ConvertOptions:
 
     preset: str = "none"
     exclude_layers: str | None = None
+
+    # Per-layer mixed precision ("three-tier quantization" in ctq's terms):
+    # layers matching custom_layers get custom_type/custom_scaling_mode/
+    # custom_convrot instead of the main quant_format above. This is how
+    # files like PotatoForge/Kroma-INT8-Quants mix e.g. plain int8_tensorwise
+    # attn.wk/wv projections with row-wise INT8 ConvRot everywhere else.
     custom_layers: str | None = None
-    custom_type: str | None = None
+    custom_type: str | None = None  # fp8 | int8 | mxfp8 | nvfp4
+    custom_scaling_mode: str | None = None  # tensor | row | block
+    custom_convrot: bool = False
+    custom_convrot_group_size: int = 256
+    custom_simple: bool = True
+
+    # What excluded/unmatched layers become instead of staying full precision.
+    fallback: str | None = None  # fp8 | int8 | mxfp8 | nvfp4
+    fallback_simple: bool = False
+
     device: str | None = None
     output_dtype: str = "bfloat16"
     verbose: str = "NORMAL"
@@ -75,6 +90,22 @@ def validate(opts: ConvertOptions) -> None:
 
     if opts.scaling_mode not in ("tensor", "row", "block", "block3d", "block2d"):
         raise OptionsError(f"Unknown scaling mode: {opts.scaling_mode!r}")
+
+    if opts.custom_layers and not opts.custom_type:
+        raise OptionsError("Custom layers regex is set but no custom type was chosen — ctq needs both.")
+    if opts.custom_type and not opts.custom_layers:
+        raise OptionsError("Custom type is set but no custom layers regex was given — ctq needs both.")
+    if opts.custom_type and opts.custom_type not in ("fp8", "int8", "mxfp8", "nvfp4"):
+        raise OptionsError(f"Unknown custom type: {opts.custom_type!r}")
+    if opts.custom_convrot and opts.custom_type != "int8":
+        raise OptionsError("Custom-layer ConvRot only makes sense with custom type INT8.")
+    if opts.custom_convrot and opts.custom_convrot_group_size not in CONVROT_VALID_GROUP_SIZES:
+        raise OptionsError(
+            f"Custom-layer ConvRot group size must be a power of 4 ({CONVROT_VALID_GROUP_SIZES}); "
+            f"got {opts.custom_convrot_group_size}."
+        )
+    if opts.fallback and opts.fallback not in ("fp8", "int8", "mxfp8", "nvfp4"):
+        raise OptionsError(f"Unknown fallback type: {opts.fallback!r}")
 
 
 def build_args(opts: ConvertOptions) -> list[str]:
@@ -121,10 +152,23 @@ def build_args(opts: ConvertOptions) -> list[str]:
 
     if opts.exclude_layers:
         args += ["--exclude-layers", opts.exclude_layers]
-    if opts.custom_layers:
+
+    if opts.custom_layers and opts.custom_type:
         args += ["--custom-layers", opts.custom_layers]
-    if opts.custom_type:
         args += ["--custom-type", opts.custom_type]
+        if opts.custom_scaling_mode:
+            args += ["--custom-scaling-mode", opts.custom_scaling_mode]
+        if opts.custom_convrot:
+            args.append("--custom-convrot")
+            args += ["--custom-convrot-group-size", str(opts.custom_convrot_group_size)]
+        if opts.custom_simple:
+            args.append("--custom-simple")
+
+    if opts.fallback:
+        args += ["--fallback", opts.fallback]
+        if opts.fallback_simple:
+            args.append("--fallback-simple")
+
     if opts.device:
         args += ["--device", opts.device]
     if opts.output_dtype and opts.output_dtype != "bfloat16":

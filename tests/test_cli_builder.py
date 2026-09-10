@@ -74,3 +74,53 @@ def test_output_path_omitted_lets_ctq_auto_name():
     opts = ConvertOptions(input_path="m.safetensors", output_path=None, quant_format="fp8", convrot=False)
     args = build_args(opts)
     assert "-o" not in args
+
+
+def test_potatoforge_style_mixed_layers():
+    """Reproduces the split seen in PotatoForge/Kroma-INT8-Quants metadata:
+    most layers plain int8_tensorwise (the base/fallback), attn.wq/wo/gate
+    and mlp layers get row-wise INT8 ConvRot via --custom-layers."""
+    opts = ConvertOptions(
+        input_path="m.safetensors",
+        quant_format="int8",
+        scaling_mode="tensor",
+        convrot=False,
+        custom_layers=r"attn\.(wq|wo|gate)|mlp\.(gate|up|down)",
+        custom_type="int8",
+        custom_scaling_mode="row",
+        custom_convrot=True,
+        custom_convrot_group_size=256,
+    )
+    args = build_args(opts)
+    assert "--custom-layers" in args
+    assert "--custom-type" in args and "int8" in args
+    assert "--custom-scaling-mode" in args and "row" in args
+    assert "--custom-convrot" in args
+    assert "--custom-convrot-group-size" in args and "256" in args
+
+
+def test_custom_layers_requires_custom_type():
+    opts = ConvertOptions(input_path="m.safetensors", custom_layers="attn.wq", custom_type=None)
+    with pytest.raises(OptionsError):
+        build_args(opts)
+
+
+def test_custom_type_requires_custom_layers():
+    opts = ConvertOptions(input_path="m.safetensors", custom_layers=None, custom_type="int8")
+    with pytest.raises(OptionsError):
+        build_args(opts)
+
+
+def test_custom_convrot_requires_custom_type_int8():
+    opts = ConvertOptions(
+        input_path="m.safetensors", custom_layers="mlp.up", custom_type="fp8", custom_convrot=True
+    )
+    with pytest.raises(OptionsError):
+        build_args(opts)
+
+
+def test_fallback_flag_appended():
+    opts = ConvertOptions(input_path="m.safetensors", quant_format="int8", scaling_mode="row", convrot=True, fallback="fp8", fallback_simple=True)
+    args = build_args(opts)
+    assert "--fallback" in args and "fp8" in args
+    assert "--fallback-simple" in args

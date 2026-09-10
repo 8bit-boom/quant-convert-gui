@@ -101,6 +101,13 @@ def build_options(
     low_memory: bool,
     exclude_layers: str,
     custom_layers: str,
+    custom_type: str,
+    custom_scaling_mode: str,
+    custom_convrot: bool,
+    custom_convrot_group_size: int,
+    custom_simple: bool,
+    fallback: str,
+    fallback_simple: bool,
     device: str,
     output_dtype: str,
     verbose: str,
@@ -142,6 +149,13 @@ def build_options(
         preset=preset,
         exclude_layers=(exclude_layers or "").strip() or None,
         custom_layers=(custom_layers or "").strip() or None,
+        custom_type=custom_type if custom_type and custom_type != "none" else None,
+        custom_scaling_mode=custom_scaling_mode if custom_scaling_mode and custom_scaling_mode != "none" else None,
+        custom_convrot=custom_convrot,
+        custom_convrot_group_size=int(custom_convrot_group_size),
+        custom_simple=custom_simple,
+        fallback=fallback if fallback and fallback != "none" else None,
+        fallback_simple=fallback_simple,
         device=(device or "").strip() or None,
         output_dtype=output_dtype,
         verbose=verbose,
@@ -220,6 +234,13 @@ def run_convert(
     low_memory: bool,
     exclude_layers: str,
     custom_layers: str,
+    custom_type: str,
+    custom_scaling_mode: str,
+    custom_convrot: bool,
+    custom_convrot_group_size: int,
+    custom_simple: bool,
+    fallback: str,
+    fallback_simple: bool,
     device: str,
     output_dtype: str,
     verbose: str,
@@ -245,10 +266,16 @@ def run_convert(
 
     try:
         opts = build_options(
-            input_path, output_name, auto_output, fmt, quality_mode, convrot_group_size,
-            dynamic_convrot, scaling_mode, block_size, preset_label_value, comfy_quant,
-            save_metadata, low_memory, exclude_layers, custom_layers, device, output_dtype,
-            verbose, calib_samples, optimizer, num_iter, manual_seed,
+            input_path=input_path, output_name=output_name, auto_output=auto_output, fmt=fmt,
+            quality_mode=quality_mode, convrot_group_size=convrot_group_size, dynamic_convrot=dynamic_convrot,
+            scaling_mode=scaling_mode, block_size=block_size, preset_label_value=preset_label_value,
+            comfy_quant=comfy_quant, save_metadata=save_metadata, low_memory=low_memory,
+            exclude_layers=exclude_layers, custom_layers=custom_layers, custom_type=custom_type,
+            custom_scaling_mode=custom_scaling_mode, custom_convrot=custom_convrot,
+            custom_convrot_group_size=custom_convrot_group_size, custom_simple=custom_simple,
+            fallback=fallback, fallback_simple=fallback_simple, device=device, output_dtype=output_dtype,
+            verbose=verbose, calib_samples=calib_samples, optimizer=optimizer, num_iter=num_iter,
+            manual_seed=manual_seed,
         )
         args = build_args(opts)
     except OptionsError as exc:
@@ -390,7 +417,46 @@ with gr.Blocks(title="Quant Convert GUI") as demo:
                             save_metadata = gr.Checkbox(value=True, label="Save quantization metadata")
                             low_memory = gr.Checkbox(value=True, label="Low memory mode")
                         exclude_layers = gr.Textbox(label="Exclude layers (regex)", placeholder="e.g. (final_layer|txt_attn.proj)")
-                        custom_layers = gr.Textbox(label="Custom layers (regex, advanced)")
+
+                        gr.Markdown(
+                            "**Mixed precision (per-layer custom format)** — pick a base format above for most "
+                            "layers, then carve out a regex of layers that should use a *different* format/scaling "
+                            "instead. This is how files like [PotatoForge/Kroma-INT8-Quants]"
+                            "(https://huggingface.co/PotatoForge/Kroma-INT8-Quants) mix formats per layer — "
+                            "their metadata shows attn.wk/wv projections left as plain tensorwise INT8 while "
+                            "attn.wq/wo/gate and the MLP layers get row-wise INT8 ConvRot. The regex matches your "
+                            "*source* model's original tensor names (before any ComfyUI renaming), so check your "
+                            "model's actual layer names first."
+                        )
+                        custom_layers = gr.Textbox(
+                            label="Custom layers (regex)",
+                            placeholder=r"e.g. attn\.(wq|wo|gate)|mlp\.(gate|up|down)",
+                        )
+                        with gr.Row():
+                            custom_type = gr.Dropdown(
+                                ["none", "fp8", "int8", "mxfp8", "nvfp4"], value="none", label="Custom layer type"
+                            )
+                            custom_scaling_mode = gr.Dropdown(
+                                ["none", "tensor", "row", "block"], value="none", label="Custom layer scaling mode"
+                            )
+                        with gr.Row():
+                            custom_convrot = gr.Checkbox(value=False, label="ConvRot on custom layers (INT8 only)")
+                            custom_convrot_group_size = gr.Dropdown(
+                                [4, 16, 64, 256, 1024], value=256, label="Custom ConvRot group size"
+                            )
+                            custom_simple = gr.Checkbox(
+                                value=True,
+                                label="Simple quant for custom layers",
+                                info="Recommended: without this, ctq runs slow AdaRound optimization on custom "
+                                "layers even when the base format above uses Simple mode.",
+                            )
+                        with gr.Row():
+                            fallback = gr.Dropdown(
+                                ["none", "fp8", "int8", "mxfp8", "nvfp4"], value="none", label="Fallback type",
+                                info="What excluded/unmatched layers become, instead of staying full precision.",
+                            )
+                            fallback_simple = gr.Checkbox(value=False, label="Simple quant for fallback layers")
+
                         with gr.Row():
                             device = gr.Textbox(label="Device override", placeholder="cuda / cuda:0 / cpu")
                             output_dtype = gr.Radio(["bfloat16", "float16"], value="bfloat16", label="Output dtype")
@@ -525,7 +591,9 @@ with gr.Blocks(title="Quant Convert GUI") as demo:
         input_local, input_hf_local, source,
         output_name, auto_output, fmt_value, quality_mode, convrot_group_size, dynamic_convrot,
         scaling_mode, block_size, preset_dd, comfy_quant, save_metadata, low_memory,
-        exclude_layers, custom_layers, device, output_dtype, verbose,
+        exclude_layers, custom_layers, custom_type, custom_scaling_mode, custom_convrot,
+        custom_convrot_group_size, custom_simple, fallback, fallback_simple,
+        device, output_dtype, verbose,
         calib_samples, optimizer, num_iter, manual_seed,
     ]
     for comp in preview_inputs:
@@ -538,7 +606,9 @@ with gr.Blocks(title="Quant Convert GUI") as demo:
         inputs=[
             input_local, input_hf_local, source, output_name, auto_output, fmt_value, quality_mode,
             convrot_group_size, dynamic_convrot, scaling_mode, block_size, preset_dd, comfy_quant,
-            save_metadata, low_memory, exclude_layers, custom_layers, device, output_dtype, verbose,
+            save_metadata, low_memory, exclude_layers, custom_layers, custom_type, custom_scaling_mode,
+            custom_convrot, custom_convrot_group_size, custom_simple, fallback, fallback_simple,
+            device, output_dtype, verbose,
             calib_samples, optimizer, num_iter, manual_seed, python_exe,
         ],
         outputs=[log_box, result_file],
