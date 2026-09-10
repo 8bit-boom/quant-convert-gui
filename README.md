@@ -113,13 +113,52 @@ choices rather than replicating them (see `quant_gui/size_estimate.py`).
 
 ## About "INT4 ConvRot"
 
-As of `convert_to_quant` v1.3.4, **there is no INT4 (integer 4-bit) output
-format upstream** — only INT8 (including ConvRot), FP8, NVFP4, and MXFP8.
-NVFP4 is a 4-bit *floating point* format and uses a different scheme than
-ConvRot; it also requires a Blackwell GPU. The app is upfront about this: if
-you pick "INT4 ConvRot" it explains the gap instead of pretending to convert.
-The format list mirrors ctq's real CLI flags, so the moment ctq ships true
-INT4, adding it here is a one-line change in `quant_gui/cli_builder.py`.
+Real INT4/W4A4 ConvRot models exist and are in use — e.g.
+[LAXMAYDAY/Krea-2-Turbo-int4-tensorwise-mixed](https://huggingface.co/LAXMAYDAY/Krea-2-Turbo-int4-tensorwise-mixed)
+and [Lockout/krea2-comfy-int4-mixed](https://huggingface.co/Lockout/krea2-comfy-int4-mixed): packed signed
+INT4 weights, group-256 Hadamard ConvRot, and a per-layer sensitivity
+ranking mixing INT4 and int8_tensorwise layers, keeping the text-fusion
+transformer and a handful of other sensitive layers in BF16 — the same
+layers ctq's own `krea2` preset already protects.
+
+`convert_to_quant` (ctq) itself still has **no INT4 CLI flag** on its
+current `main` branch — there's an open, unaddressed request for it,
+[INT4 ConvRot support? · Issue #50](https://github.com/silveroxides/convert_to_quant/issues/50),
+no branch or PR attached — and Lockout's own model card explains they
+found the technique by tracing LAXMAYDAY's recipe to the
+[Starnodes Model Converter](https://github.com/Starnodes2024/comfyui-starnodes-modelconverter),
+a ComfyUI custom node that can't run standalone outside ComfyUI.
+
+Rather than fake this format or require ComfyUI, this app calls the actual
+kernel underneath both of those — [`comfy_kitchen`](https://github.com/Comfy-Org/comfy-kitchen),
+a standalone, pip-installable package (`comfy_kitchen.tensor.convrot_w4a4`)
+that Starnodes wraps and that any future ctq INT4 support would presumably
+also use. `quant_gui/int4_backend.py` is a small, independent converter
+built directly on that kernel — **not** a wrapper around ctq or around the
+Starnodes node:
+
+- Install it with `pip install comfy-kitchen` (a separate, optional install —
+  not pulled in by `install.bat`/`install.sh` or `requirements.txt`, since
+  most formats in this app don't need it). The Environment tab and the
+  in-app notice on this format both tell you if it's missing.
+- Pick "INT4 ConvRot" as the format, then type a regex matching the layer
+  names you want converted to real packed-signed INT4 (e.g. `attn\.wq|mlp\.gate`).
+  Everything else quantizable falls back to plain INT8 tensorwise (via the
+  same `comfy_kitchen` package, for metadata compatibility); your model
+  preset's excluded/high-precision layers, and anything matched by the
+  exclude-layers regex, stay at original precision either way.
+- Needs Turing+ (SM 7.5+) for real speed — broader hardware support than
+  FP8 (Ada+) — but also runs, slowly, on CPU via `comfy_kitchen`'s `eager`
+  backend, so it works even without a GPU present.
+- This is **not** a reproduction of LAXMAYDAY's or Lockout's undisclosed
+  exact layer list — you choose which layers go INT4. It's verified against
+  real `comfy_kitchen` output (correct `convrot_w4a4`/`int8_tensorwise`
+  `_quantization_metadata`, correct packed tensor shapes), but it's this
+  app's own recipe, not a copy of theirs.
+
+If `comfy_kitchen` isn't installed, picking this format explains exactly
+what to install and why, instead of silently failing or pretending to
+convert.
 
 ## Install (automatic)
 

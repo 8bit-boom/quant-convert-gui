@@ -19,8 +19,10 @@ from quant_gui.env_check import check_environment, report_markdown
 from quant_gui.filters import preset_choices, preset_highprec_regex, preset_label, suggest_preset
 from quant_gui.gpu_profiles import GPU_PROFILE_BY_KEY, GPU_PROFILES, detect_profile_key
 from quant_gui.hf import HFUrlError, download as hf_download, parse_hf_url
+from quant_gui.int4_backend import stream_int4_conversion
+from quant_gui.int4_backend import is_available as int4_is_available
 from quant_gui.runner import stream_conversion
-from quant_gui.size_estimate import estimate_from_file
+from quant_gui.size_estimate import estimate_from_file, estimate_int4_mixed_from_file
 
 APP_DIR = Path(__file__).resolve().parent
 DOWNLOAD_DIR = APP_DIR / "downloads"
@@ -32,26 +34,36 @@ FORMAT_CHOICES = [
     ("FP8 (E4M3) — Ada / Hopper+ GPUs only", "fp8"),
     ("NVFP4 — 4-bit, closest available today (Blackwell GPUs only)", "nvfp4"),
     ("MXFP8 — Blackwell GPUs only", "mxfp8"),
-    ("INT4 ConvRot — not released by upstream ctq yet", "int4_convrot"),
+    ("INT4 ConvRot — experimental, real, via comfy_kitchen (not ctq)", "int4_convrot"),
 ]
 
 FORMAT_LABEL_BY_KEY = {v: k for k, v in FORMAT_CHOICES}
 
-INT4_NOTICE = (
-    "### INT4 ConvRot isn't available yet\n\n"
-    "You asked for **int4 convrot**, but as of `convert_to_quant` v1.3.4 the upstream tool "
-    "that actually performs ConvRot quantization only ships **INT8 ConvRot**. There is no "
-    "integer 4-bit output format in the converter (the `pack_uint4` code in ctq belongs to "
-    "**NVFP4**, a 4-bit *floating point* format, not INT4).\n\n"
-    "The Kroma-Quant file you linked is itself an `int8-convrot-simple` file — the reference "
-    "model, and today's ceiling for this exact technique.\n\n"
-    "Your closest real options:\n"
-    "- **NVFP4** — an actual 4-bit format, but it requires a Blackwell GPU (RTX 50-series / B-series) "
-    "plus the `comfy-kitchen` package, and is a different rotation/scaling scheme than ConvRot.\n"
-    "- **INT8 ConvRot** — the same recipe used to build the file you linked; works on any GPU.\n\n"
-    "Pick one of the buttons below to switch, or keep watching the "
-    "[silveroxides/convert_to_quant](https://github.com/silveroxides/convert_to_quant) repo — "
-    "if they add a real INT4 path this GUI will pick it up (the format list mirrors ctq's own flags)."
+INT4_NOTICE_READY = (
+    "### INT4 ConvRot — this one doesn't go through ctq\n\n"
+    "Real INT4/W4A4 ConvRot models exist in the wild — e.g. "
+    "[LAXMAYDAY/Krea-2-Turbo-int4-tensorwise-mixed](https://huggingface.co/LAXMAYDAY/Krea-2-Turbo-int4-tensorwise-mixed) "
+    "and [Lockout/krea2-comfy-int4-mixed](https://huggingface.co/Lockout/krea2-comfy-int4-mixed) — but "
+    "`convert_to_quant` (ctq, the tool the rest of this app wraps) still has no `--int4` flag "
+    "([tracked, unaddressed: issue #50](https://github.com/silveroxides/convert_to_quant/issues/50)). "
+    "This format instead calls **`comfy_kitchen`'s own `convrot_w4a4` kernel directly** — the same "
+    "primitive that recipe (and ctq's own future int4 support, whenever it lands) would use — bypassing "
+    "ctq entirely for this one format.\n\n"
+    "**You pick which layers actually go to INT4** via the regex below; everything else quantizable falls "
+    "back to plain INT8 tensorwise, and your model preset / exclude-layers rules still apply on top. This "
+    "is *not* a reproduction of LAXMAYDAY's or Lockout's exact undisclosed layer list — verified end to end "
+    "against real `comfy_kitchen` output (correct `convrot_w4a4`/`int8_tensorwise` metadata, correct packed "
+    "shapes), but it's this app's own recipe, not theirs."
+)
+
+INT4_NOTICE_MISSING = (
+    "### INT4 ConvRot needs one more package\n\n"
+    "This format calls `comfy_kitchen`'s real INT4 ConvRot kernel directly (not ctq — see the About tab for "
+    "why). It isn't installed yet:\n\n"
+    "```bash\npip install comfy-kitchen\n```\n\n"
+    "Needs a Turing-or-newer GPU (SM 7.5+ — RTX 20-series onward, so your Ampere/Ada/Blackwell card is fine) "
+    "for real speed; the same eager PyTorch path also runs correctly on CPU, just slowly. Re-check the "
+    "**Environment** tab after installing."
 )
 
 FORMAT_HELP = {
@@ -72,7 +84,11 @@ FORMAT_HELP = {
     ),
     "nvfp4": "NVIDIA's 4-bit float block format. Requires a Blackwell GPU and the comfy-kitchen package.",
     "mxfp8": "Microscaling FP8. Requires a Blackwell GPU.",
-    "int4_convrot": "Not implemented upstream yet — see the notice above.",
+    "int4_convrot": (
+        "Real packed-signed-INT4 ConvRot, via comfy_kitchen directly (not ctq). Pick which layers go INT4 "
+        "with the regex below; the rest fall back to INT8 tensorwise. Needs SM 7.5+ (Turing onward) for real "
+        "speed, works (slowly) on CPU too."
+    ),
 }
 
 PRESET_CHOICES = preset_choices()
@@ -171,14 +187,15 @@ def on_format_change(fmt: str):
     is_int8_convrot = fmt == "int8_convrot"
     is_plain_int8_or_fp8 = fmt in ("int8_plain", "fp8")
     is_int4 = fmt == "int4_convrot"
-    can_convert = not is_int4
+    notice_text = ""
+    if is_int4:
+        notice_text = INT4_NOTICE_READY if int4_is_available() else INT4_NOTICE_MISSING
     return (
         gr.update(visible=is_int8_convrot),  # convrot group
         gr.update(visible=is_plain_int8_or_fp8),  # scaling mode group
         gr.update(value=FORMAT_HELP.get(fmt, "")),
-        gr.update(visible=is_int4),  # int4 notice
-        gr.update(interactive=can_convert),  # convert button
-        gr.update(visible=is_int4),  # int4 switch-to row
+        gr.update(value=notice_text, visible=is_int4),  # int4 notice
+        gr.update(visible=is_int4),  # int4 options group
     )
 
 
@@ -256,6 +273,81 @@ def on_local_input_resolved(local_path: str, current_preset_label: str):
     return on_input_resolved(local_path, "", current_preset_label)
 
 
+def run_int4_convert(
+    input_path: str,
+    output_name: str,
+    auto_output: bool,
+    preset_label_value: str,
+    int4_layers_regex: str,
+    int4_fallback_int8: bool,
+    exclude_layers: str,
+    device: str,
+    progress: gr.Progress,
+):
+    input_path = (input_path or "").strip()
+    if not input_path:
+        yield "Pick an input file (local path or downloaded Hugging Face file) first.", None
+        return
+    if not Path(input_path).is_file():
+        yield f"Input file not found on disk: {input_path}", None
+        return
+    if not int4_is_available():
+        yield f"comfy-kitchen isn't installed. Install it with:\n  pip install comfy-kitchen\n\nThen re-run.", None
+        return
+
+    preset = LABEL_TO_PRESET.get(preset_label_value, "none")
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    name = (output_name or "").strip()
+    if not auto_output and name:
+        output_path = str(OUTPUT_DIR / name) if not os.path.isabs(name) and os.sep not in name else name
+    else:
+        stem = Path(input_path).stem
+        output_path = str(OUTPUT_DIR / f"{stem}-int4-mixed.safetensors")
+    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+
+    log = f"Converting (INT4 ConvRot via comfy_kitchen, device={device or 'cpu'})\n"
+    log += f"  input:  {input_path}\n  output: {output_path}\n"
+    log += f"  INT4 layers regex: {int4_layers_regex or '(none — no layers go INT4)'}\n"
+    log += f"  preset: {preset}\n\n"
+    yield log, None
+    progress(0, desc="Starting INT4 conversion...")
+
+    result_path = None
+    for item in stream_int4_conversion(
+        input_path, output_path, (int4_layers_regex or "").strip() or None,
+        preset=preset, exclude_regex=(exclude_layers or "").strip() or None,
+        fallback_int8=int4_fallback_int8, device=(device or "cpu").strip() or "cpu",
+    ):
+        kind = item[0]
+        if kind == "progress":
+            _, current, total, key = item
+            if total:
+                progress(current / total, desc=f"{current}/{total}: {key}")
+            log += f"({current}/{total}) {key}\n"
+            yield log, result_path
+        elif kind == "ok":
+            stats = item[1]
+            progress(1.0, desc="Done")
+            result_path = output_path if Path(output_path).is_file() else None
+            log += (
+                f"\n✅ Conversion finished.\n"
+                f"  {stats.int4_count} layer(s) → INT4 ConvRot\n"
+                f"  {stats.int8_count} layer(s) → INT8 tensorwise (fallback)\n"
+                f"  {stats.kept_count} layer(s) kept at original/BF16 precision\n"
+            )
+            if stats.skipped_shape_count:
+                log += (
+                    f"  ⚠️ {stats.skipped_shape_count} layer(s) matched the INT4 regex but their shape isn't "
+                    f"divisible by 256/64, so they fell back to INT8 instead.\n"
+                )
+            if result_path:
+                log += f"Output: {result_path}\n"
+            yield log, result_path
+        elif kind == "fail":
+            log += f"\n❌ Conversion failed: {item[1]}\n"
+            yield log, None
+
+
 def run_convert(
     input_local: str,
     input_hf: str,
@@ -289,12 +381,17 @@ def run_convert(
     num_iter: float,
     manual_seed: float,
     python_exe: str,
+    int4_layers_regex: str,
+    int4_fallback_int8: bool,
     progress: gr.Progress = gr.Progress(),
 ):
     input_path = (input_local or "").strip() if source == "Local file path" else (input_hf or "").strip()
 
     if fmt == "int4_convrot":
-        yield "INT4 ConvRot isn't supported by ctq yet — see the notice above. Nothing was run.", None
+        yield from run_int4_convert(
+            input_path, output_name, auto_output, preset_label_value,
+            int4_layers_regex, int4_fallback_int8, exclude_layers, device, progress,
+        )
         return
 
     if not input_path:
@@ -439,10 +536,19 @@ with gr.Blocks(title="Quant Convert GUI") as demo:
                     )
                     fmt_value = gr.State(FORMAT_CHOICES[0][1])
                     fmt_help = gr.Markdown(FORMAT_HELP["int8_convrot"])
-                    int4_notice = gr.Markdown(INT4_NOTICE, visible=False)
-                    with gr.Row(visible=False) as int4_switch_row:
-                        switch_to_int8 = gr.Button("Use INT8 ConvRot instead")
-                        switch_to_nvfp4 = gr.Button("Use NVFP4 instead")
+                    int4_notice = gr.Markdown(visible=False)
+                    with gr.Group(visible=False) as int4_group:
+                        int4_layers_regex = gr.Textbox(
+                            label="INT4 layers (regex)",
+                            placeholder=r"e.g. attn\.wq|mlp\.gate — layers matching this get real INT4 ConvRot",
+                            info="Matches source tensor names. Leave empty to convert nothing to INT4 "
+                            "(falls back to plain INT8 tensorwise everywhere quantizable).",
+                        )
+                        int4_fallback_int8 = gr.Checkbox(
+                            value=True,
+                            label="INT8 tensorwise fallback for other quantizable layers (recommended)",
+                            info="Unchecked, non-matched layers stay at full precision instead.",
+                        )
 
                     with gr.Group(visible=True) as convrot_group:
                         gr.Markdown("**ConvRot group size** — must divide the layer width; 256 is ctq's default.")
@@ -587,15 +693,21 @@ with gr.Blocks(title="Quant Convert GUI") as demo:
                 "which spreads out the outlier values that normally hurt low-bit accuracy in diffusion "
                 "transformers. This is the recipe behind the `*-int8-convrot*` Kroma-Quant files.\n"
                 "- **NVFP4** — NVIDIA's 4-bit floating point block format; needs a Blackwell GPU.\n"
-                "- **INT4 ConvRot** — not released by upstream `convert_to_quant` as of v1.3.4. "
-                "This GUI mirrors ctq's real flags, so it will pick this up the moment ctq ships it.\n\n"
+                "- **INT4 ConvRot** — real packed-signed-INT4 ConvRot (group-256 Hadamard rotation + INT4 "
+                "quantization), the same recipe behind LAXMAYDAY's and Lockout's Krea-2 int4-mixed releases. "
+                "`convert_to_quant` itself still has no INT4 CLI flag "
+                "([issue #50](https://github.com/silveroxides/convert_to_quant/issues/50) remains unaddressed), "
+                "so this format doesn't go through ctq at all — it calls "
+                "[comfy_kitchen](https://github.com/Comfy-Org/comfy-kitchen)'s own `convrot_w4a4` kernel "
+                "directly (the same kernel the Starnodes Model Converter uses). Needs `pip install comfy-kitchen` "
+                "and works best on Turing+ (SM 7.5+) GPUs, though it also runs — slowly — on CPU.\n\n"
                 "## Which format for which GPU\n"
                 "| GPU generation | Example cards | Hardware-accelerated formats |\n"
                 "|---|---|---|\n"
-                "| Turing/Ampere | RTX 20/30-series, A100 — **incl. RTX 3080 Ti** | **INT8 / INT8 ConvRot only** — no FP8 or NVFP4 hardware path |\n"
-                "| Ada Lovelace | RTX 40-series, L40 | FP8, INT8 ConvRot |\n"
-                "| Hopper | H100, H200 | FP8, INT8 ConvRot |\n"
-                "| Blackwell | RTX 50-series, B100/B200 | NVFP4, MXFP8, INT8 ConvRot |\n\n"
+                "| Turing/Ampere | RTX 20/30-series, A100 — **incl. RTX 3080 Ti** | **INT8 / INT8 ConvRot / INT4 ConvRot** — no FP8 or NVFP4 hardware path |\n"
+                "| Ada Lovelace | RTX 40-series, L40 | FP8, INT8 ConvRot, INT4 ConvRot |\n"
+                "| Hopper | H100, H200 | FP8, INT8 ConvRot, INT4 ConvRot |\n"
+                "| Blackwell | RTX 50-series, B100/B200 | NVFP4, MXFP8, INT8 ConvRot, INT4 ConvRot |\n\n"
                 "Picking FP8 or NVFP4 on an unsupported card doesn't reliably fail at conversion time — "
                 "the file often still gets written, it just won't load or run fast in ComfyUI. The "
                 "**Target GPU** picker on the Convert tab exists to head that off.\n\n"
@@ -632,16 +744,9 @@ with gr.Blocks(title="Quant Convert GUI") as demo:
         vis = on_format_change(value)
         return (value, *vis)
 
-    fmt_outputs = [fmt_value, convrot_group, scaling_group, fmt_help, int4_notice, convert_btn, int4_switch_row]
+    fmt_outputs = [fmt_value, convrot_group, scaling_group, fmt_help, int4_notice, int4_group]
 
     fmt.change(on_fmt_select, inputs=[fmt], outputs=fmt_outputs)
-
-    switch_to_int8.click(lambda: FORMAT_CHOICES[0][0], outputs=[fmt]).then(
-        on_fmt_select, inputs=[fmt], outputs=fmt_outputs
-    )
-    switch_to_nvfp4.click(lambda: FORMAT_CHOICES[3][0], outputs=[fmt]).then(
-        on_fmt_select, inputs=[fmt], outputs=fmt_outputs
-    )
 
     def on_gpu_select(label: str):
         key = GPU_LABEL_TO_KEY.get(label, "not_sure")
@@ -706,6 +811,8 @@ with gr.Blocks(title="Quant Convert GUI") as demo:
         input_local_v, input_hf_local_v, source_v = args[0], args[1], args[2]
         input_path = input_local_v if source_v == "Local file path" else input_hf_local_v
         rest = args[3:]
+        if rest[preview_field_index["fmt_value"]] == "int4_convrot":
+            return "(INT4 ConvRot doesn't run through ctq - see the notice above the format picker.)"
         try:
             opts = build_options(input_path or "placeholder.safetensors", *rest)
             return format_command(opts)
@@ -721,6 +828,21 @@ with gr.Blocks(title="Quant Convert GUI") as demo:
         device, output_dtype, verbose,
         calib_samples, optimizer, num_iter, manual_seed,
     ]
+    # Names for preview_inputs[3:] (the build_options-ordered "rest" slice), so
+    # code that needs one specific field doesn't have to hand-count positions.
+    preview_field_index = {
+        name: i
+        for i, name in enumerate([
+            "output_name", "auto_output", "fmt_value", "quality_mode", "convrot_group_size", "dynamic_convrot",
+            "scaling_mode", "block_size", "preset_dd", "comfy_quant", "save_metadata", "low_memory",
+            "exclude_layers", "custom_layers", "custom_type", "custom_scaling_mode", "custom_convrot",
+            "custom_convrot_group_size", "custom_simple", "fallback", "fallback_simple",
+            "device", "output_dtype", "verbose",
+            "calib_samples", "optimizer", "num_iter", "manual_seed",
+        ])
+    }
+    assert len(preview_field_index) == len(preview_inputs) - 3
+
     for comp in preview_inputs:
         comp.change(refresh_preview, inputs=preview_inputs, outputs=[command_preview])
 
@@ -729,18 +851,34 @@ with gr.Blocks(title="Quant Convert GUI") as demo:
     def do_estimate(*args):
         input_local_v, input_hf_local_v, source_v = args[0], args[1], args[2]
         input_path = input_local_v if source_v == "Local file path" else input_hf_local_v
-        rest = args[3:]
+        rest = args[3 : len(preview_inputs)]
+        int4_regex_v, int4_fallback_v = args[-2], args[-1]
+
         input_path = (input_path or "").strip()
         if not input_path or not Path(input_path).is_file():
             return "Pick an input file (local path, or download a Hugging Face file) first."
+        vram = check_environment().gpu_vram_gb
+
+        fmt_v = rest[preview_field_index["fmt_value"]]
+        if fmt_v == "int4_convrot":
+            preset = LABEL_TO_PRESET.get(rest[preview_field_index["preset_dd"]], "none")
+            exclude_layers_v = rest[preview_field_index["exclude_layers"]]
+            return estimate_int4_mixed_from_file(
+                input_path, (int4_regex_v or "").strip() or None, preset=preset,
+                exclude_regex=(exclude_layers_v or "").strip() or None,
+                fallback_int8=int4_fallback_v, gpu_vram_gb=vram,
+            )
         try:
             opts = build_options(input_path, *rest)
         except OptionsError as exc:
             return f"Can't estimate: {exc}"
-        vram = check_environment().gpu_vram_gb
         return estimate_from_file(input_path, opts, gpu_vram_gb=vram)
 
-    estimate_btn.click(do_estimate, inputs=preview_inputs, outputs=[estimate_md])
+    estimate_btn.click(
+        do_estimate,
+        inputs=preview_inputs + [int4_layers_regex, int4_fallback_int8],
+        outputs=[estimate_md],
+    )
 
     convert_btn.click(
         run_convert,
@@ -751,6 +889,7 @@ with gr.Blocks(title="Quant Convert GUI") as demo:
             custom_convrot, custom_convrot_group_size, custom_simple, fallback, fallback_simple,
             device, output_dtype, verbose,
             calib_samples, optimizer, num_iter, manual_seed, python_exe,
+            int4_layers_regex, int4_fallback_int8,
         ],
         outputs=[log_box, result_file],
     )

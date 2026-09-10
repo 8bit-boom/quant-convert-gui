@@ -201,3 +201,81 @@ def estimate_from_file(path: str, opts: ConvertOptions, gpu_vram_gb: float | Non
         return f"Couldn't read that file: {exc}"
     est = estimate_output_size(tensors, opts)
     return format_estimate_markdown(est, gpu_vram_gb)
+
+
+def estimate_int4_mixed(
+    tensors: list[TensorHeader],
+    int4_regex: str | None,
+    preset: str = "none",
+    exclude_regex: str | None = None,
+    fallback_int8: bool = True,
+) -> SizeEstimate:
+    """Same idea as estimate_output_size, for the separate INT4 ConvRot
+    (comfy_kitchen) path - int4_backend.py owns the real divisibility rules,
+    imported here rather than re-guessed so the two never drift apart."""
+    from .int4_backend import CONVROT_GROUPSIZE, INT4_QUANT_GROUPSIZE
+
+    exclude_kw, highprec_kw, _remove_kw = _preset_lists(preset)
+    int4_re = re.compile(int4_regex) if int4_regex else None
+    exclude_re = re.compile(exclude_regex) if exclude_regex else None
+
+    original_total = 0
+    estimated_total = 0
+    int4_count = int8_count = kept_count = 0
+
+    for t in tensors:
+        original_total += t.nbytes
+        excluded = _matches_any(t.name, exclude_kw) or _matches_any(t.name, highprec_kw)
+        if exclude_re is not None and exclude_re.search(t.name):
+            excluded = True
+
+        is_quantizable_shape = len(t.shape) == 2 and min(t.shape, default=0) >= MIN_QUANTIZABLE_DIM and t.dtype in FLOAT_DTYPES
+        dtype_size = DTYPE_BYTES.get(t.dtype, 4)
+        elem_count = t.nbytes / dtype_size if dtype_size else 0
+
+        wants_int4 = (
+            not excluded and is_quantizable_shape and int4_re is not None and int4_re.search(t.name) is not None
+        )
+        int4_shape_ok = (
+            wants_int4
+            and len(t.shape) == 2
+            and t.shape[1] % CONVROT_GROUPSIZE == 0
+            and t.shape[1] % INT4_QUANT_GROUPSIZE == 0
+        )
+
+        if int4_shape_ok:
+            estimated_total += int(elem_count * 0.5 * 1.02)  # 0.5 byte/elem + small scale overhead
+            int4_count += 1
+        elif not excluded and is_quantizable_shape and fallback_int8:
+            estimated_total += int(elem_count * 1.0 * 1.01)
+            int8_count += 1
+        else:
+            estimated_total += t.nbytes
+            kept_count += 1
+
+    return SizeEstimate(
+        original_bytes=original_total,
+        estimated_bytes=estimated_total,
+        quantized_count=int4_count + int8_count,
+        kept_count=kept_count,
+        removed_count=0,
+        total_count=len(tensors),
+    )
+
+
+def estimate_int4_mixed_from_file(
+    path: str,
+    int4_regex: str | None,
+    preset: str = "none",
+    exclude_regex: str | None = None,
+    fallback_int8: bool = True,
+    gpu_vram_gb: float | None = None,
+) -> str:
+    if not path or not Path(path).is_file():
+        return "Pick an input file first."
+    try:
+        tensors = read_header(path)
+    except SafetensorsHeaderError as exc:
+        return f"Couldn't read that file: {exc}"
+    est = estimate_int4_mixed(tensors, int4_regex, preset, exclude_regex, fallback_int8)
+    return format_estimate_markdown(est, gpu_vram_gb)

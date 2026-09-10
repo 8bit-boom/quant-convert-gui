@@ -35,6 +35,13 @@ class EnvReport:
         return self.cuda_capability is not None and self.cuda_capability >= (8, 9)
 
     @property
+    def is_turing_or_newer(self) -> bool:
+        """comfy_kitchen's TensorCoreConvRotW4A4Layout.MIN_SM_VERSION - Turing (7.5)
+        and up, which is broader than FP8's Ada+ requirement (e.g. Ampere/RTX 30-series
+        qualifies, even though it has no FP8 tensor cores)."""
+        return self.cuda_capability is not None and self.cuda_capability >= (7, 5)
+
+    @property
     def gpu_family(self) -> str:
         cc = self.cuda_capability
         if cc is None:
@@ -50,6 +57,19 @@ class EnvReport:
         return "pre-ampere"
 
     def ready_for(self, quant_format: str) -> tuple[bool, str]:
+        if quant_format == "int4_convrot":
+            # Doesn't go through ctq at all - runs on comfy_kitchen directly.
+            if not self.torch_installed:
+                return False, "PyTorch isn't installed. The INT4 ConvRot backend (comfy_kitchen) needs it."
+            if not self.comfy_kitchen_installed:
+                return False, "comfy-kitchen isn't installed. Install it with: pip install comfy-kitchen"
+            if self.cuda_available and not self.is_turing_or_newer:
+                return False, (
+                    "Real INT4 ConvRot tensor cores need Turing or newer (compute capability >= 7.5). "
+                    f"Your GPU reports SM {self.cuda_capability[0]}.{self.cuda_capability[1]} — "
+                    "conversion will still run on the CPU/eager path, just slowly."
+                )
+            return True, "Ready."
         if not (self.ctq_executable or self.ctq_importable):
             return False, "convert_to_quant (ctq) isn't installed. See the Environment tab for the install command."
         if not self.torch_installed:
@@ -147,7 +167,9 @@ def report_markdown(report: EnvReport) -> str:
         f"**Ada/Hopper/Blackwell (for FP8)** — {ok(report.is_ada_or_newer)}",
         f"**Blackwell (for NVFP4/MXFP8)** — {ok(report.is_blackwell)}",
         f"**Triton** (for INT8 kernels) — {ok(report.triton_installed)}",
-        f"**comfy-kitchen** (for NVFP4/MXFP8) — {ok(report.comfy_kitchen_installed)}",
+        f"**comfy-kitchen** (for NVFP4/MXFP8, and for real INT4 ConvRot) — {ok(report.comfy_kitchen_installed)}",
+        f"**Turing+ (for INT4 ConvRot tensor cores)** — {ok(report.is_turing_or_newer)}"
+        + (" (Ampere and up all qualify, incl. RTX 30-series)" if not report.cuda_available else ""),
         f"**huggingface_hub** (for downloading from a HF URL) — {ok(report.huggingface_hub_installed)}",
     ]
     return "\n\n".join(lines)
