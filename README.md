@@ -190,6 +190,15 @@ Then open http://127.0.0.1:7860. The **Environment** tab tells you exactly
 what's missing (ctq, PyTorch, CUDA, a compatible GPU) before you try to
 convert anything.
 
+**If you had `ctq` installed globally before using this app:** the GUI
+always runs ctq through the *same Python interpreter that's running
+`app.py`* (the project's own `.venv`, when launched via run.bat/run.sh) as
+long as that interpreter has `convert_to_quant` installed - it deliberately
+ignores any other `ctq` sitting elsewhere on PATH, so a stale or
+differently-configured global install can't shadow it and silently break
+things (e.g. missing `safetensors`/`scipy` from before those were added to
+`requirements.txt`).
+
 ## Using it
 
 1. Paste a Hugging Face file URL, or switch to **Local file path** — it

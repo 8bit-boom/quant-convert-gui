@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib.util
 import shutil
 import subprocess
 import sys
@@ -10,16 +11,42 @@ from collections.abc import Iterator
 _INLINE_ENTRYPOINT = "from convert_to_quant.cli import main; main()"
 
 
+def _has_convert_to_quant(python_executable: str | None) -> bool:
+    if python_executable is None:
+        # The interpreter running this code right now - check in-process,
+        # no subprocess needed.
+        return importlib.util.find_spec("convert_to_quant") is not None
+    try:
+        result = subprocess.run(
+            [python_executable, "-c", "import convert_to_quant"],
+            capture_output=True, timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return result.returncode == 0
+
+
 def resolve_command(args: list[str], python_executable: str | None = None) -> list[str]:
-    """Pick the best way to invoke ctq: the installed console script if
-    present on PATH, otherwise `python -c "from convert_to_quant.cli import
-    main; main()"` using the given (or current) interpreter.
+    """Pick the best way to invoke ctq.
+
+    Prefers running `python -c "from convert_to_quant.cli import main;
+    main()"` through the given (or current) interpreter *whenever that
+    interpreter actually has ctq installed* - this guarantees we use the
+    project's own correctly-provisioned .venv (installed by install.bat/sh)
+    rather than a stray/stale `ctq` console script that happens to be
+    first on PATH from some other, possibly incomplete, install. Only
+    falls back to a PATH-found `ctq` when the chosen interpreter doesn't
+    have ctq at all.
     """
+    py = python_executable or sys.executable
+
+    if _has_convert_to_quant(python_executable):
+        return [py, "-c", _INLINE_ENTRYPOINT, *args]
+
     ctq_path = shutil.which("ctq")
-    if ctq_path and not python_executable:
+    if ctq_path:
         return [ctq_path, *args]
 
-    py = python_executable or sys.executable
     return [py, "-c", _INLINE_ENTRYPOINT, *args]
 
 
