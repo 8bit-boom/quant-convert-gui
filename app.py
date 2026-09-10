@@ -275,6 +275,26 @@ def on_local_input_resolved(local_path: str, current_preset_label: str):
     return on_input_resolved(local_path, "", current_preset_label)
 
 
+def _progress_bar_html(fraction: float, desc: str) -> str:
+    """A small standalone progress bar, rendered as its own component
+    instead of relying on Gradio's built-in gr.Progress() overlay - that
+    overlay draws on top of *every* output of the event (log_box and
+    result_file both), hiding their real content behind a duplicated
+    "stuck" progress readout once the run finishes streaming."""
+    pct = max(0.0, min(1.0, fraction)) * 100
+    import html as _html
+
+    return (
+        '<div style="margin:2px 0 10px;">'
+        f'<div style="font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:0.82rem;'
+        f'opacity:0.85;margin-bottom:4px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">'
+        f'{_html.escape(desc)}</div>'
+        '<div style="background:rgba(128,128,128,0.25);border-radius:6px;height:10px;overflow:hidden;">'
+        f'<div style="background:#6366f1;height:100%;width:{pct:.1f}%;transition:width .15s linear;"></div>'
+        "</div></div>"
+    )
+
+
 def run_int4_convert(
     input_path: str,
     output_name: str,
@@ -284,17 +304,16 @@ def run_int4_convert(
     int4_fallback_int8: bool,
     exclude_layers: str,
     device: str,
-    progress: gr.Progress,
 ):
     input_path = (input_path or "").strip()
     if not input_path:
-        yield "Pick an input file (local path or downloaded Hugging Face file) first.", None
+        yield "Pick an input file (local path or downloaded Hugging Face file) first.", None, ""
         return
     if not Path(input_path).is_file():
-        yield f"Input file not found on disk: {input_path}", None
+        yield f"Input file not found on disk: {input_path}", None, ""
         return
     if not int4_is_available():
-        yield f"comfy-kitchen isn't installed. Install it with:\n  pip install comfy-kitchen\n\nThen re-run.", None
+        yield f"comfy-kitchen isn't installed. Install it with:\n  pip install comfy-kitchen\n\nThen re-run.", None, ""
         return
 
     preset = LABEL_TO_PRESET.get(preset_label_value, "none")
@@ -311,8 +330,7 @@ def run_int4_convert(
     log += f"  input:  {input_path}\n  output: {output_path}\n"
     log += f"  INT4 layers regex: {int4_layers_regex or '(none — no layers go INT4)'}\n"
     log += f"  preset: {preset}\n\n"
-    yield log, None
-    progress(0, desc="Starting INT4 conversion...")
+    yield log, None, _progress_bar_html(0, "Starting INT4 conversion...")
 
     result_path = None
     for item in stream_int4_conversion(
@@ -323,13 +341,11 @@ def run_int4_convert(
         kind = item[0]
         if kind == "progress":
             _, current, total, key = item
-            if total:
-                progress(current / total, desc=f"{current}/{total}: {key}")
+            bar = _progress_bar_html(current / total if total else 0, f"{current}/{total}: {key}")
             log += f"({current}/{total}) {key}\n"
-            yield log, result_path
+            yield log, result_path, bar
         elif kind == "ok":
             stats = item[1]
-            progress(1.0, desc="Done")
             result_path = output_path if Path(output_path).is_file() else None
             log += (
                 f"\n✅ Conversion finished.\n"
@@ -344,10 +360,10 @@ def run_int4_convert(
                 )
             if result_path:
                 log += f"Output: {result_path}\n"
-            yield log, result_path
+            yield log, result_path, _progress_bar_html(1.0, "Done")
         elif kind == "fail":
             log += f"\n❌ Conversion failed: {item[1]}\n"
-            yield log, None
+            yield log, None, _progress_bar_html(1.0, "Failed")
 
 
 def run_convert(
@@ -385,23 +401,22 @@ def run_convert(
     python_exe: str,
     int4_layers_regex: str,
     int4_fallback_int8: bool,
-    progress: gr.Progress = gr.Progress(),
 ):
     input_path = (input_local or "").strip() if source == "Local file path" else (input_hf or "").strip()
 
     if fmt == "int4_convrot":
         yield from run_int4_convert(
             input_path, output_name, auto_output, preset_label_value,
-            int4_layers_regex, int4_fallback_int8, exclude_layers, device, progress,
+            int4_layers_regex, int4_fallback_int8, exclude_layers, device,
         )
         return
 
     if not input_path:
-        yield "Pick an input file (local path or downloaded Hugging Face file) first.", None
+        yield "Pick an input file (local path or downloaded Hugging Face file) first.", None, ""
         return
 
     if not Path(input_path).is_file():
-        yield f"Input file not found on disk: {input_path}", None
+        yield f"Input file not found on disk: {input_path}", None, ""
         return
 
     try:
@@ -419,7 +434,7 @@ def run_convert(
         )
         args = build_args(opts)
     except OptionsError as exc:
-        yield f"Can't build a valid command: {exc}", None
+        yield f"Can't build a valid command: {exc}", None, ""
         return
 
     if opts.output_path:
@@ -427,13 +442,14 @@ def run_convert(
     else:
         OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    progress(0, desc="Starting ctq...")
+    yield "", None, _progress_bar_html(0, "Starting ctq...")
     # Matches both "(12/264) Processing (INT8): blocks.0.mlp.up.weight" and
     # "(2/6) Skipping tensor: blocks.0.firs.weight (Reason: krea2 skip)".
     tensor_progress_re = re.compile(r"\((\d+)/(\d+)\)\s*(Processing|Skipping)")
 
     log = ""
     result_path = None
+    bar = _progress_bar_html(0, "Starting ctq...")
     for chunk in stream_conversion(args, python_executable=((python_exe or "").strip() or None)):
         if chunk == "__CTQ_OK__":
             found = opts.output_path
@@ -441,17 +457,16 @@ def run_convert(
                 m = re.search(r"Saved to[:\s]+(\S+\.safetensors)", log, re.IGNORECASE)
                 found = m.group(1) if m else None
             result_path = found if found and Path(found).is_file() else None
-            progress(1.0, desc="Done")
             log += "\n✅ Conversion finished.\n"
             if result_path:
                 log += f"Output: {result_path}\n"
             elif found:
                 log += f"Output (reported, not found on disk yet): {found}\n"
-            yield log, result_path
+            yield log, result_path, _progress_bar_html(1.0, "Done")
         elif chunk.startswith("__CTQ_FAIL__"):
             code = chunk.split(":", 1)[-1]
             log += f"\n❌ ctq exited with code {code}.\n"
-            yield log, None
+            yield log, None, _progress_bar_html(1.0, "Failed")
         else:
             log += chunk
             m = tensor_progress_re.search(chunk)
@@ -463,8 +478,8 @@ def run_convert(
                     layer = tail.split(" (")[0].strip()
                 if total:
                     desc = f"{action} {current}/{total}: {layer}".rstrip(": ")
-                    progress(current / total, desc=desc)
-            yield log, result_path
+                    bar = _progress_bar_html(current / total, desc)
+            yield log, result_path, bar
 
 
 def refresh_env():
@@ -547,6 +562,18 @@ with gr.Blocks(title="Quant Convert GUI") as demo:
                             info="Matches source tensor names. Leave empty to convert nothing to INT4 "
                             "(falls back to plain INT8 tensorwise everywhere quantizable).",
                         )
+                        gr.Markdown(
+                            "**Templates** — for Flux/Krea-style blocks (`blocks.N.attn.wq/wk/wv/wo`, "
+                            "`blocks.N.mlp.gate/up/down`); check the live log from a previous conversion "
+                            "for your model's actual layer names before trusting these blindly.",
+                            elem_id="int4-template-note",
+                        )
+                        with gr.Row():
+                            int4_tpl_attn_btn = gr.Button("Attention only", size="sm")
+                            int4_tpl_mlp_btn = gr.Button("MLP only", size="sm")
+                            int4_tpl_balanced_btn = gr.Button("Attention + MLP", size="sm")
+                            int4_tpl_all_btn = gr.Button("Everything quantizable (aggressive)", size="sm")
+                            int4_tpl_clear_btn = gr.Button("Clear", size="sm")
                         int4_fallback_int8 = gr.Checkbox(
                             value=True,
                             label="INT8 tensorwise fallback for other quantizable layers (recommended)",
@@ -668,6 +695,7 @@ with gr.Blocks(title="Quant Convert GUI") as demo:
                     convert_btn = gr.Button("Convert", elem_id="convert-btn", variant="primary")
 
                 with gr.Column(scale=2):
+                    convert_progress = gr.HTML(value="")
                     log_box = gr.Textbox(label="Live conversion log", lines=28, elem_id="log-box", interactive=False, autoscroll=True)
                     result_file = gr.File(label="Converted file", interactive=False)
 
@@ -770,6 +798,17 @@ with gr.Blocks(title="Quant Convert GUI") as demo:
     int4_install_btn.click(
         run_int4_install, inputs=[python_exe], outputs=[log_box, int4_notice, int4_install_btn]
     )
+
+    INT4_TEMPLATE_ATTN = r"attn\.(wq|wk|wv|wo)\.weight"
+    INT4_TEMPLATE_MLP = r"mlp\.(gate|up|down)\.weight"
+    INT4_TEMPLATE_BALANCED = rf"{INT4_TEMPLATE_ATTN}|{INT4_TEMPLATE_MLP}"
+    INT4_TEMPLATE_ALL = r".*"
+
+    int4_tpl_attn_btn.click(lambda: INT4_TEMPLATE_ATTN, outputs=[int4_layers_regex])
+    int4_tpl_mlp_btn.click(lambda: INT4_TEMPLATE_MLP, outputs=[int4_layers_regex])
+    int4_tpl_balanced_btn.click(lambda: INT4_TEMPLATE_BALANCED, outputs=[int4_layers_regex])
+    int4_tpl_all_btn.click(lambda: INT4_TEMPLATE_ALL, outputs=[int4_layers_regex])
+    int4_tpl_clear_btn.click(lambda: "", outputs=[int4_layers_regex])
 
     def on_gpu_select(label: str):
         key = GPU_LABEL_TO_KEY.get(label, "not_sure")
@@ -914,7 +953,11 @@ with gr.Blocks(title="Quant Convert GUI") as demo:
             calib_samples, optimizer, num_iter, manual_seed, python_exe,
             int4_layers_regex, int4_fallback_int8,
         ],
-        outputs=[log_box, result_file],
+        outputs=[log_box, result_file, convert_progress],
+        # We render our own bar into convert_progress; gr.Progress()'s built-in
+        # overlay otherwise blankets *every* output of this event (log_box and
+        # result_file included) for the whole run and can get stuck once streaming ends.
+        show_progress="hidden",
     )
 
     refresh_btn.click(refresh_env, outputs=[env_md])
