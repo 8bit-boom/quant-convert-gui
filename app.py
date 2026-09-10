@@ -289,6 +289,7 @@ def run_convert(
     num_iter: float,
     manual_seed: float,
     python_exe: str,
+    progress: gr.Progress = gr.Progress(),
 ):
     input_path = (input_local or "").strip() if source == "Local file path" else (input_hf or "").strip()
 
@@ -327,6 +328,11 @@ def run_convert(
     else:
         OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
+    progress(0, desc="Starting ctq...")
+    # Matches both "(12/264) Processing (INT8): blocks.0.mlp.up.weight" and
+    # "(2/6) Skipping tensor: blocks.0.firs.weight (Reason: krea2 skip)".
+    tensor_progress_re = re.compile(r"\((\d+)/(\d+)\)\s*(Processing|Skipping)")
+
     log = ""
     result_path = None
     for chunk in stream_conversion(args, python_executable=((python_exe or "").strip() or None)):
@@ -336,6 +342,7 @@ def run_convert(
                 m = re.search(r"Saved to[:\s]+(\S+\.safetensors)", log, re.IGNORECASE)
                 found = m.group(1) if m else None
             result_path = found if found and Path(found).is_file() else None
+            progress(1.0, desc="Done")
             log += "\n✅ Conversion finished.\n"
             if result_path:
                 log += f"Output: {result_path}\n"
@@ -348,6 +355,16 @@ def run_convert(
             yield log, None
         else:
             log += chunk
+            m = tensor_progress_re.search(chunk)
+            if m:
+                current, total, action = int(m.group(1)), int(m.group(2)), m.group(3)
+                layer = ""
+                if ":" in chunk:
+                    tail = chunk.split(":", 1)[-1].strip()
+                    layer = tail.split(" (")[0].strip()
+                if total:
+                    desc = f"{action} {current}/{total}: {layer}".rstrip(": ")
+                    progress(current / total, desc=desc)
             yield log, result_path
 
 

@@ -210,7 +210,9 @@ things (e.g. missing `safetensors`/`scipy` from before those were added to
 3. Optionally pick a model preset (keeps sensitive layers like norms/
    modulation at full precision) and a quality mode (Simple is fast;
    Learned/AdaRound is slower but higher quality).
-4. Hit **Convert** and watch the live log. The finished file shows up under
+4. Hit **Convert** and watch the live log, plus a progress bar tracking
+   which tensor ctq is on (parsed from its own `(N/M) Processing: ...`
+   output — no polling, no guessing). The finished file shows up under
    **Converted file** when it's done.
 
 Advanced ctq flags (exclude-layers regex, device override, calibration
