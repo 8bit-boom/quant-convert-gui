@@ -186,6 +186,27 @@ def on_source_change(source: str):
     return gr.update(visible=source == "Local file path"), gr.update(visible=source == "Hugging Face URL")
 
 
+def list_downloaded_models() -> list[tuple[str, str]]:
+    """(label, absolute path) for every .safetensors file under downloads/,
+    newest first, so 'Local file path' can offer them without retyping."""
+    if not DOWNLOAD_DIR.is_dir():
+        return []
+    files = sorted(DOWNLOAD_DIR.rglob("*.safetensors"), key=lambda p: p.stat().st_mtime, reverse=True)
+    choices = []
+    for f in files:
+        size_gb = f.stat().st_size / (1024**3)
+        rel = f.relative_to(DOWNLOAD_DIR)
+        choices.append((f"{rel} ({size_gb:.2f} GB)", str(f)))
+    return choices
+
+
+def refresh_local_models():
+    choices = list_downloaded_models()
+    if not choices:
+        return gr.update(choices=[], value=None, label="Found in downloads/ (none yet)")
+    return gr.update(choices=choices, value=None, label=f"Found in downloads/ ({len(choices)})")
+
+
 def do_hf_download(url: str, token: str, progress=gr.Progress()):
     url = (url or "").strip()
     if not url:
@@ -226,6 +247,13 @@ def on_input_resolved(local_path: str, hf_url: str, current_preset_label: str):
 
     msg = f"Detected `{name}` — this model usually does best with the **{preset}** preset, but you've already picked a different one."
     return msg, gr.update()
+
+
+def on_local_input_resolved(local_path: str, current_preset_label: str):
+    """Same as on_input_resolved, but for local-file-only triggers (the path
+    textbox, the downloads/ dropdown) - never falls back to the (irrelevant,
+    possibly still prefilled) Hugging Face URL field."""
+    return on_input_resolved(local_path, "", current_preset_label)
 
 
 def run_convert(
@@ -351,6 +379,13 @@ with gr.Blocks(title="Quant Convert GUI") as demo:
                     source = gr.Radio(["Local file path", "Hugging Face URL"], value="Hugging Face URL", label="Source")
 
                     with gr.Group(visible=False) as local_group:
+                        with gr.Row():
+                            local_models_dd = gr.Dropdown(
+                                choices=[], value=None, label="Found in downloads/",
+                                info="Models already sitting in this app's downloads/ folder.",
+                                scale=4,
+                            )
+                            refresh_local_models_btn = gr.Button("🔄", scale=1, min_width=40)
                         input_local = gr.Textbox(
                             label="Local .safetensors path",
                             placeholder="/path/to/model.safetensors",
@@ -626,13 +661,26 @@ with gr.Blocks(title="Quant Convert GUI") as demo:
         krea2_group_visibility, inputs=[preset_dd], outputs=[krea2_size_group]
     )
 
-    source.change(on_source_change, inputs=[source], outputs=[local_group, hf_group])
+    source.change(on_source_change, inputs=[source], outputs=[local_group, hf_group]).then(
+        refresh_local_models, outputs=[local_models_dd]
+    )
+    refresh_local_models_btn.click(refresh_local_models, outputs=[local_models_dd])
+    demo.load(refresh_local_models, outputs=[local_models_dd])
 
     download_btn.click(do_hf_download, inputs=[input_hf_url, hf_token], outputs=[input_hf_local, download_status]).then(
         on_input_resolved, inputs=[input_hf_local, input_hf_url, preset_dd], outputs=[resolved_hint, preset_dd]
-    ).then(krea2_group_visibility, inputs=[preset_dd], outputs=[krea2_size_group])
+    ).then(krea2_group_visibility, inputs=[preset_dd], outputs=[krea2_size_group]).then(
+        refresh_local_models, outputs=[local_models_dd]
+    )
     input_local.change(
-        on_input_resolved, inputs=[input_local, input_hf_url, preset_dd], outputs=[resolved_hint, preset_dd]
+        on_local_input_resolved, inputs=[input_local, preset_dd], outputs=[resolved_hint, preset_dd]
+    ).then(krea2_group_visibility, inputs=[preset_dd], outputs=[krea2_size_group])
+
+    def apply_local_model_choice(path):
+        return path if path else gr.update()
+
+    local_models_dd.change(apply_local_model_choice, inputs=[local_models_dd], outputs=[input_local]).then(
+        on_local_input_resolved, inputs=[input_local, preset_dd], outputs=[resolved_hint, preset_dd]
     ).then(krea2_group_visibility, inputs=[preset_dd], outputs=[krea2_size_group])
 
     auto_output.change(lambda auto: gr.update(interactive=not auto), inputs=[auto_output], outputs=[output_name])

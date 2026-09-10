@@ -192,7 +192,10 @@ convert anything.
 
 ## Using it
 
-1. Paste a Hugging Face file URL (or a local path) to your model.
+1. Paste a Hugging Face file URL, or switch to **Local file path** — it
+   auto-lists any `.safetensors` file already sitting in this app's
+   `downloads/` folder (including ones you downloaded earlier), so you
+   usually don't need to type/paste a path at all.
 2. Pick a format — **INT8 ConvRot** is selected by default and is what the
    reference Kroma-Quant `*-int8-convrot-simple.safetensors` files use.
 3. Optionally pick a model preset (keeps sensitive layers like norms/

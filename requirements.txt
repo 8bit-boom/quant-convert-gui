@@ -10,9 +10,11 @@ huggingface_hub>=0.24
 #   pip install torch --index-url https://download.pytorch.org/whl/cu128
 convert-to-quant>=1.3.4
 
-# ConvRot's Hadamard rotation needs scipy, but ctq's own package metadata
-# doesn't pull it in - install it explicitly or `--convrot` will crash with
-# "ModuleNotFoundError: No module named 'scipy'".
+# ctq's own installed package metadata doesn't reliably pull these in on
+# every platform (seen missing on both Linux and Windows installs) - install
+# them explicitly or ctq crashes with "ModuleNotFoundError" the first time
+# it actually needs them (safetensors: always; scipy: only with --convrot).
+safetensors>=0.4.2
 scipy
 
 # Optional, speeds up INT8 kernels on Linux (use triton-windows on Windows,
