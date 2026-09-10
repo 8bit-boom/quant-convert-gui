@@ -1,0 +1,20 @@
+# GUI itself
+gradio>=5.0,<7
+
+# Lets the GUI download a model straight from a Hugging Face URL
+huggingface_hub>=0.24
+
+# --- The actual quantization engine (does the real work) ---
+# PyTorch is NOT included here on purpose: install the build that matches
+# your GPU/CUDA from https://pytorch.org/get-started/locally/ first, e.g.
+#   pip install torch --index-url https://download.pytorch.org/whl/cu128
+convert-to-quant>=1.3.4
+
+# ConvRot's Hadamard rotation needs scipy, but ctq's own package metadata
+# doesn't pull it in - install it explicitly or `--convrot` will crash with
+# "ModuleNotFoundError: No module named 'scipy'".
+scipy
+
+# Optional, speeds up INT8 kernels on Linux (use triton-windows on Windows,
+# see the Environment tab in the app for the exact command).
+# triton
