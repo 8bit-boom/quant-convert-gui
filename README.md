@@ -1,17 +1,21 @@
 # Quant Convert GUI
 
 A simple, browser-based GUI for quantizing `.safetensors` models to **FP8**,
-**INT8**, **INT8 ConvRot**, or **NVFP4** — always `.safetensors` out, never
-GGUF. Same formats used by the
+**INT8**, **INT8 ConvRot**, **NVFP4**, real **INT4 ConvRot**, or **GGUF**.
+The `.safetensors` formats are the same ones used by the
 [Kroma-Quant](https://huggingface.co/silveroxides/Kroma-Quant) and
 [PotatoForge/Kroma-INT8-Quants](https://huggingface.co/PotatoForge/Kroma-INT8-Quants)
 files.
 
-It does not reimplement quantization math itself. It's a front end over
+For FP8/INT8/INT8 ConvRot/NVFP4/MXFP8, this app does not reimplement
+quantization math itself — it's a front end over
 [`silveroxides/convert_to_quant`](https://github.com/silveroxides/convert_to_quant)
 (the `ctq` CLI), the real tool that builds those files, so the output is
 identical to what you'd get running `ctq` by hand — just without memorizing
-its flags.
+its flags. INT4 ConvRot and GGUF are formats `ctq` doesn't produce, so those
+two go through their own independent backends instead (`comfy_kitchen` and
+`gguf` respectively) — see [About "INT4 ConvRot"](#about-int4-convrot) and
+[About "GGUF"](#about-gguf) below.
 
 ## Which format for your GPU
 
@@ -314,3 +318,52 @@ everyone else can ignore them.
   `--flux2`, `--wan`, `--krea2` for txtfusion/Krea2/Kroma-style models).
 - `quant_gui/size_estimate.py` — estimates output file size from the input
   file's safetensors header, without needing torch/ctq installed.
+- `quant_gui/int4_backend.py` — real INT4 ConvRot conversion via
+  `comfy_kitchen`, independent of ctq (see [About "INT4 ConvRot"](#about-int4-convrot)).
+- `quant_gui/gguf_backend.py` — GGUF export via llama.cpp's `gguf` package,
+  independent of ctq (see [About "GGUF"](#about-gguf)).
+
+## Sources
+
+Background research and reference implementations this app's INT4 ConvRot
+and GGUF backends are built on/verified against, since neither format goes
+through `ctq`:
+
+- [silveroxides/convert_to_quant](https://github.com/silveroxides/convert_to_quant) —
+  the `ctq` CLI this app wraps for every `.safetensors` format
+  (FP8/INT8/INT8 ConvRot/NVFP4/MXFP8), including its
+  [issue #50](https://github.com/silveroxides/convert_to_quant/issues/50)
+  ("INT4 convrot support?"), open and unaddressed as of this writing.
+- [silveroxides/Kroma-Quant](https://huggingface.co/silveroxides/Kroma-Quant)
+  and [PotatoForge/Kroma-INT8-Quants](https://huggingface.co/PotatoForge/Kroma-INT8-Quants) —
+  the reference `.safetensors` files this app's presets and mixed-precision
+  templates are designed to reproduce.
+- [LAXMAYDAY/Krea-2-Turbo-int4-tensorwise-mixed](https://huggingface.co/LAXMAYDAY/Krea-2-Turbo-int4-tensorwise-mixed)
+  and [Lockout/krea2-comfy-int4-mixed](https://huggingface.co/Lockout/krea2-comfy-int4-mixed) —
+  the real INT4/W4A4 ConvRot community models that started the INT4
+  investigation; Lockout's own model card documents tracing LAXMAYDAY's
+  undisclosed recipe back to the Starnodes tool below.
+- [Starnodes2024/comfyui-starnodes-modelconverter](https://github.com/Starnodes2024/comfyui-starnodes-modelconverter) —
+  a ComfyUI-only custom node whose `int4_convrot` code path is the reference
+  for this app's exact `convrot_w4a4`/`int8_tensorwise` conventions
+  (metadata shape, layer key suffixes) - it can't run standalone outside
+  ComfyUI, which is why this app calls the kernel beneath it directly
+  instead of wrapping the node itself.
+- [Comfy-Org/comfy-kitchen](https://github.com/Comfy-Org/comfy-kitchen) —
+  the standalone, pip-installable kernel library (`comfy_kitchen.tensor.convrot_w4a4`)
+  that both Starnodes and this app's `quant_gui/int4_backend.py` actually
+  quantize with.
+- [city96/ComfyUI-GGUF](https://github.com/city96/ComfyUI-GGUF), specifically
+  its `tools/convert.py` and `loader.py` — the reference this app's GGUF
+  architecture detection and F32-fallback rules are ported from, and the
+  ComfyUI-side loader that GGUF files from this app are meant to load into.
+- [gguf-py](https://github.com/ggerganov/llama.cpp/tree/master/gguf-py)
+  (the `gguf` PyPI package) — llama.cpp's own Python bindings, and the
+  actual pure-Python block-quantization implementation
+  (`quant_gui/gguf_backend.py` calls `gguf.quants`/`gguf.GGUFWriter`
+  directly).
+
+Every claim above about what's real vs. not (e.g. which GGUF quant types
+have pure-Python support, whether a package needs a GPU) was checked
+directly against these sources' own code, not assumed from their
+documentation alone.
