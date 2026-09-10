@@ -263,6 +263,85 @@ def estimate_int4_mixed(
     )
 
 
+def estimate_gguf(tensors: list[TensorHeader], quant_type: str, preset: str = "none", exclude_regex: str | None = None) -> SizeEstimate:
+    """Same idea as estimate_output_size, for the GGUF export path - shares
+    gguf_backend's own arch detection and F32-fallback rules (1D / small /
+    hiprec / shape-not-divisible-by-32) so the estimate can't drift from the
+    real converter."""
+    from .gguf_backend import MAX_TENSOR_DIMS, QUANT_BYTES_PER_ELEM, QUANTIZATION_THRESHOLD, detect_arch
+
+    exclude_kw, highprec_kw, _remove_kw = _preset_lists(preset)
+    exclude_re = re.compile(exclude_regex) if exclude_regex else None
+    bytes_per_elem = QUANT_BYTES_PER_ELEM.get(quant_type, 4.0)
+
+    arch = detect_arch({t.name for t in tensors})
+    hiprec_kw = list(arch.keys_hiprec) if arch else []
+
+    original_total = 0
+    estimated_total = 0
+    quantized = kept = 0
+
+    for t in tensors:
+        original_total += t.nbytes
+        dtype_size = DTYPE_BYTES.get(t.dtype, 4)
+        elem_count = t.nbytes / dtype_size if dtype_size else 0
+
+        if len(t.shape) > MAX_TENSOR_DIMS:
+            estimated_total += t.nbytes  # skipped, kept as-is in the estimate
+            kept += 1
+            continue
+
+        force_f32 = (
+            len(t.shape) == 1
+            or elem_count <= QUANTIZATION_THRESHOLD
+            or _matches_any(t.name, hiprec_kw)
+            or _matches_any(t.name, exclude_kw)
+            or _matches_any(t.name, highprec_kw)
+            or (exclude_re is not None and exclude_re.search(t.name))
+        )
+        shape_ok = len(t.shape) >= 1 and t.shape[-1] % 32 == 0
+
+        if force_f32 or not shape_ok:
+            estimated_total += int(elem_count * (4.0 if force_f32 else 2.0))  # F32 kept, else F16 fallback
+            kept += 1
+        else:
+            estimated_total += int(elem_count * bytes_per_elem)
+            quantized += 1
+
+    return SizeEstimate(
+        original_bytes=original_total,
+        estimated_bytes=estimated_total,
+        quantized_count=quantized,
+        kept_count=kept,
+        removed_count=0,
+        total_count=len(tensors),
+    )
+
+
+def estimate_gguf_from_file(
+    path: str, quant_type: str, preset: str = "none", exclude_regex: str | None = None, gpu_vram_gb: float | None = None,
+) -> str:
+    if not path or not Path(path).is_file():
+        return "Pick an input file first."
+    try:
+        tensors = read_header(path)
+    except SafetensorsHeaderError as exc:
+        return f"Couldn't read that file: {exc}"
+    from .gguf_backend import detect_arch
+
+    arch = detect_arch({t.name for t in tensors})
+    if arch is None:
+        from .gguf_backend import SUPPORTED_ARCH_NAMES
+
+        return (
+            "Unknown model architecture - GGUF export only recognizes: "
+            f"{', '.join(SUPPORTED_ARCH_NAMES)}. This file doesn't match any of them."
+        )
+    est = estimate_gguf(tensors, quant_type, preset, exclude_regex)
+    header = f"Detected architecture: **{arch.arch}**\n\n"
+    return header + format_estimate_markdown(est, gpu_vram_gb)
+
+
 def estimate_int4_mixed_from_file(
     path: str,
     int4_regex: str | None,

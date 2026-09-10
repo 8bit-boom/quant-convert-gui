@@ -6,7 +6,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from quant_gui.cli_builder import ConvertOptions
-from quant_gui.size_estimate import estimate_int4_mixed, estimate_output_size, read_header
+from quant_gui.size_estimate import estimate_gguf, estimate_int4_mixed, estimate_output_size, read_header
 
 
 def write_fake_safetensors(path: Path, tensors: dict[str, tuple[str, list[int]]]) -> None:
@@ -102,6 +102,26 @@ def test_krea2_preset_keeps_txtfusion_layer_full_precision(tmp_path):
     # txtfusion.projector + norm (1D) both stay full precision; wq/wk/mlp.gate get quantized.
     assert est.quantized_count == 3
     assert est.kept_count == 2
+
+
+def test_estimate_gguf_matches_gguf_backend_splits(tmp_path):
+    model_path = tmp_path / "model.safetensors"
+    write_fake_safetensors(model_path, {
+        # Matches gguf_backend's lumina2 detection keys.
+        "cap_embedder.1.weight": ("BF16", [1024, 2048]),
+        "context_refiner.0.attention.qkv.weight": ("BF16", [3072, 1024]),
+        "blocks.0.attn.wq.weight": ("BF16", [1024, 1024]),
+        "blocks.0.norm.weight": ("BF16", [1024]),  # 1D -> kept
+        "blocks.0.tiny.weight": ("BF16", [4, 4]),  # small -> kept
+        "blocks.0.oddshape.weight": ("BF16", [64, 50]),  # last dim not div by 32 -> kept (F16 fallback)
+    })
+    tensors = read_header(str(model_path))
+
+    est = estimate_gguf(tensors, "Q8_0", preset="none")
+
+    assert est.quantized_count == 3  # cap_embedder, context_refiner, attn.wq
+    assert est.kept_count == 3  # norm, tiny, oddshape
+    assert est.estimated_bytes < est.original_bytes
 
 
 def test_custom_layers_use_custom_type_for_size():

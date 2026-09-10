@@ -22,6 +22,7 @@ class EnvReport:
     cuda_capability: tuple[int, int] | None
     triton_installed: bool
     comfy_kitchen_installed: bool
+    gguf_installed: bool
     huggingface_hub_installed: bool
 
     @property
@@ -57,6 +58,11 @@ class EnvReport:
         return "pre-ampere"
 
     def ready_for(self, quant_format: str) -> tuple[bool, str]:
+        if quant_format == "gguf":
+            # Doesn't go through ctq at all - pure Python/numpy, no GPU needed.
+            if not self.gguf_installed:
+                return False, "gguf isn't installed. Install it with: pip install gguf"
+            return True, "Ready."
         if quant_format == "int4_convrot":
             # Doesn't go through ctq at all - runs on comfy_kitchen directly.
             if not self.torch_installed:
@@ -123,6 +129,7 @@ def check_environment() -> EnvReport:
 
     triton_installed = importlib.util.find_spec("triton") is not None
     comfy_kitchen_installed = importlib.util.find_spec("comfy_kitchen") is not None
+    gguf_installed = importlib.util.find_spec("gguf") is not None
     huggingface_hub_installed = importlib.util.find_spec("huggingface_hub") is not None
 
     return EnvReport(
@@ -138,6 +145,7 @@ def check_environment() -> EnvReport:
         cuda_capability=cuda_capability,
         triton_installed=triton_installed,
         comfy_kitchen_installed=comfy_kitchen_installed,
+        gguf_installed=gguf_installed,
         huggingface_hub_installed=huggingface_hub_installed,
     )
 
@@ -170,6 +178,7 @@ def report_markdown(report: EnvReport) -> str:
         f"**comfy-kitchen** (for NVFP4/MXFP8, and for real INT4 ConvRot) — {ok(report.comfy_kitchen_installed)}",
         f"**Turing+ (for INT4 ConvRot tensor cores)** — {ok(report.is_turing_or_newer)}"
         + (" (Ampere and up all qualify, incl. RTX 30-series)" if not report.cuda_available else ""),
+        f"**gguf** (for GGUF export) — {ok(report.gguf_installed)}",
         f"**huggingface_hub** (for downloading from a HF URL) — {ok(report.huggingface_hub_installed)}",
     ]
     return "\n\n".join(lines)

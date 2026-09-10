@@ -160,6 +160,44 @@ If `comfy_kitchen` isn't installed, picking this format explains exactly
 what to install and why, instead of silently failing or pretending to
 convert.
 
+## About "GGUF"
+
+`convert_to_quant` only ever writes `.safetensors` — GGUF is llama.cpp's
+own, completely different container/quantization format, read by ComfyUI
+through the separate [city96/ComfyUI-GGUF](https://github.com/city96/ComfyUI-GGUF)
+custom node. Like INT4 ConvRot above, this bypasses ctq entirely: it calls
+the [`gguf`](https://github.com/ggerganov/llama.cpp/tree/master/gguf-py)
+package (llama.cpp's own Python bindings) directly, the same one
+ComfyUI-GGUF's own `tools/convert.py` uses.
+
+- **Real, pure-Python block quantization** for Q8_0/Q5_1/Q5_0/Q4_1/Q4_0
+  (`gguf.quants`, confirmed against the installed package's source — no
+  C++ build, no GPU, no ComfyUI install needed just to *produce* the
+  file). F16/BF16 skip quantization entirely (just repacks into a GGUF
+  container) — useful as input to your own `llama-quantize` run.
+- **K-quants (Q4_K_M, Q5_K_S, Q6_K, etc.) are not available.** That family
+  only has a *decoder* in the `gguf` package; producing them needs a
+  patched `llama-quantize` binary compiled from llama.cpp source (see
+  [ComfyUI-GGUF's `tools/README.md`](https://github.com/city96/ComfyUI-GGUF/blob/main/tools/README.md)).
+  Convert to F16/BF16 here first if you want to run that yourself.
+- **Architecture is auto-detected**, not guessed: `quant_gui/gguf_backend.py`
+  ports the exact same detection keys (`double_blocks.0.img_attn.proj.weight`
+  for Flux, etc.) that ComfyUI-GGUF's own `tools/convert.py` uses, because
+  its loader hard-rejects any `general.architecture` value outside a fixed
+  allowlist (flux, sd3, aura, hidream, cosmos, hyvid, wan, ltxv, sdxl, sd1,
+  lumina2). An unrecognized model is refused rather than silently
+  mislabeled.
+- 1D tensors, tensors with ≤ 1024 elements, and each architecture's own
+  precision-sensitive layers (e.g. Wan's `.modulation`, matching
+  ComfyUI-GGUF's own script) always stay F32; a shape whose last dimension
+  isn't divisible by 32 falls back to F16, exactly like `tools/convert.py`
+  does. Your model preset / exclude-layers rules apply on top of that.
+
+Verified end-to-end against a real GGUF round-trip (`gguf.GGUFReader`/
+`quants.dequantize`): correct `general.architecture` field, correct
+per-tensor `GGMLQuantizationType`, and the packed shapes ComfyUI-GGUF's own
+loader validation expects.
+
 ## Install (automatic)
 
 **Windows:** double-click `install.bat` (or run it from a terminal). It

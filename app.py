@@ -19,10 +19,14 @@ from quant_gui.env_check import check_environment, report_markdown
 from quant_gui.filters import preset_choices, preset_highprec_regex, preset_label, suggest_preset
 from quant_gui.gpu_profiles import GPU_PROFILE_BY_KEY, GPU_PROFILES, detect_profile_key
 from quant_gui.hf import HFUrlError, download as hf_download, parse_hf_url
+from quant_gui.gguf_backend import stream_gguf_conversion, stream_install as stream_gguf_install
+from quant_gui.gguf_backend import QUANT_TYPE_CHOICES as GGUF_QUANT_TYPE_CHOICES
+from quant_gui.gguf_backend import SUPPORTED_ARCH_NAMES as GGUF_SUPPORTED_ARCH_NAMES
+from quant_gui.gguf_backend import is_available as gguf_is_available
 from quant_gui.int4_backend import stream_int4_conversion, stream_install as stream_int4_install
 from quant_gui.int4_backend import is_available as int4_is_available
 from quant_gui.runner import stream_conversion
-from quant_gui.size_estimate import estimate_from_file, estimate_int4_mixed_from_file
+from quant_gui.size_estimate import estimate_from_file, estimate_gguf_from_file, estimate_int4_mixed_from_file
 
 APP_DIR = Path(__file__).resolve().parent
 DOWNLOAD_DIR = APP_DIR / "downloads"
@@ -35,9 +39,39 @@ FORMAT_CHOICES = [
     ("NVFP4 — 4-bit, closest available today (Blackwell GPUs only)", "nvfp4"),
     ("MXFP8 — Blackwell GPUs only", "mxfp8"),
     ("INT4 ConvRot — experimental, real, via comfy_kitchen (not ctq)", "int4_convrot"),
+    ("GGUF — for ComfyUI-GGUF's loader (Q4_0..Q8_0, not ctq)", "gguf"),
 ]
 
 FORMAT_LABEL_BY_KEY = {v: k for k, v in FORMAT_CHOICES}
+
+GGUF_NOTICE_READY = (
+    "### GGUF — this one doesn't go through ctq either\n\n"
+    "`convert_to_quant` only ever writes `.safetensors` — GGUF is a completely different container/quant "
+    "format (llama.cpp's), read by ComfyUI through the separate "
+    "[city96/ComfyUI-GGUF](https://github.com/city96/ComfyUI-GGUF) custom node. This format calls the "
+    "`gguf` package (llama.cpp's own Python bindings) directly, the same one that project's own "
+    "`tools/convert.py` uses.\n\n"
+    f"**Real, pure-Python block quantization** — {', '.join(t for t in GGUF_QUANT_TYPE_CHOICES if t.startswith('Q'))} "
+    "are genuinely computed here (`gguf.quants`, no C++ build needed), not just relabeled F16. "
+    "**K-quants (Q4_K_M, Q5_K_S, Q6_K, etc.) are *not* available** — that family only has a *decoder* in "
+    "the Python package; producing them needs a patched `llama-quantize` binary compiled from source (see "
+    "ComfyUI-GGUF's `tools/README.md`), which this app doesn't build or shell out to. If you need K-quants, "
+    "convert here to F16/BF16 first, then run `llama-quantize` yourself on that file.\n\n"
+    "**Architecture is auto-detected** from the tensor names already in your file — GGUF's own loader "
+    f"only accepts a fixed set of names, so this app recognizes exactly those: {', '.join(GGUF_SUPPORTED_ARCH_NAMES)}. "
+    "Anything else (including diffusers-format checkpoints) is refused rather than silently mislabeled. "
+    "1D tensors, tiny tensors (≤ 1024 elements), and a per-architecture handful of precision-sensitive "
+    "layers (matching city96's own conversion script) always stay F32; your model preset / exclude-layers "
+    "rules apply on top of that."
+)
+
+GGUF_NOTICE_MISSING = (
+    "### GGUF needs one more package\n\n"
+    "This format calls the `gguf` package directly (not ctq — see the About tab for why). It isn't "
+    "installed yet — click **Install gguf** below (streams to the log on the right), or run it yourself:\n\n"
+    "```bash\npip install gguf\n```\n\n"
+    "Pure Python/numpy — no GPU, no compiler, no ComfyUI install needed to *produce* the file."
+)
 
 INT4_NOTICE_READY = (
     "### INT4 ConvRot — this one doesn't go through ctq\n\n"
@@ -88,6 +122,12 @@ FORMAT_HELP = {
         "Real packed-signed-INT4 ConvRot, via comfy_kitchen directly (not ctq). Pick which layers go INT4 "
         "with the regex below; the rest fall back to INT8 tensorwise. Needs SM 7.5+ (Turing onward) for real "
         "speed, works (slowly) on CPU too."
+    ),
+    "gguf": (
+        "A completely different container/quant format from everything else here - for ComfyUI's separate "
+        "GGUF loader, via the `gguf` package directly (not ctq). Real Q4_0/Q4_1/Q5_0/Q5_1/Q8_0 quantization; "
+        "K-quants need a compiled llama-quantize binary this app doesn't provide. Architecture is "
+        "auto-detected from your model's tensor names - unsupported architectures are refused outright."
     ),
 }
 
@@ -187,17 +227,21 @@ def on_format_change(fmt: str):
     is_int8_convrot = fmt == "int8_convrot"
     is_plain_int8_or_fp8 = fmt in ("int8_plain", "fp8")
     is_int4 = fmt == "int4_convrot"
+    is_gguf = fmt == "gguf"
     int4_ready = int4_is_available()
-    notice_text = ""
-    if is_int4:
-        notice_text = INT4_NOTICE_READY if int4_ready else INT4_NOTICE_MISSING
+    gguf_ready = gguf_is_available()
+    int4_notice_text = INT4_NOTICE_READY if int4_ready else INT4_NOTICE_MISSING if is_int4 else ""
+    gguf_notice_text = GGUF_NOTICE_READY if gguf_ready else GGUF_NOTICE_MISSING if is_gguf else ""
     return (
         gr.update(visible=is_int8_convrot),  # convrot group
         gr.update(visible=is_plain_int8_or_fp8),  # scaling mode group
         gr.update(value=FORMAT_HELP.get(fmt, "")),
-        gr.update(value=notice_text, visible=is_int4),  # int4 notice
+        gr.update(value=int4_notice_text, visible=is_int4),  # int4 notice
         gr.update(visible=is_int4),  # int4 options group
         gr.update(visible=is_int4 and not int4_ready),  # int4 install button
+        gr.update(value=gguf_notice_text, visible=is_gguf),  # gguf notice
+        gr.update(visible=is_gguf),  # gguf options group
+        gr.update(visible=is_gguf and not gguf_ready),  # gguf install button
     )
 
 
@@ -366,6 +410,77 @@ def run_int4_convert(
             yield log, None, _progress_bar_html(1.0, "Failed")
 
 
+def run_gguf_convert(
+    input_path: str,
+    output_name: str,
+    auto_output: bool,
+    preset_label_value: str,
+    gguf_quant_type: str,
+    exclude_layers: str,
+):
+    input_path = (input_path or "").strip()
+    if not input_path:
+        yield "Pick an input file (local path or downloaded Hugging Face file) first.", None, ""
+        return
+    if not Path(input_path).is_file():
+        yield f"Input file not found on disk: {input_path}", None, ""
+        return
+    if not gguf_is_available():
+        yield "gguf isn't installed. Install it with:\n  pip install gguf\n\nThen re-run.", None, ""
+        return
+
+    preset = LABEL_TO_PRESET.get(preset_label_value, "none")
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    name = (output_name or "").strip()
+    if not auto_output and name:
+        output_path = str(OUTPUT_DIR / name) if not os.path.isabs(name) and os.sep not in name else name
+    else:
+        stem = Path(input_path).stem
+        output_path = str(OUTPUT_DIR / f"{stem}-{gguf_quant_type}.gguf")
+    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+
+    log = f"Converting to GGUF ({gguf_quant_type} via the gguf package)\n"
+    log += f"  input:  {input_path}\n  output: {output_path}\n"
+    log += f"  preset: {preset}\n\n"
+    yield log, None, _progress_bar_html(0, "Starting GGUF conversion...")
+
+    result_path = None
+    for item in stream_gguf_conversion(
+        input_path, output_path, gguf_quant_type,
+        preset=preset, exclude_regex=(exclude_layers or "").strip() or None,
+    ):
+        kind = item[0]
+        if kind == "progress":
+            _, current, total, key = item
+            bar = _progress_bar_html(current / total if total else 0, f"{current}/{total}: {key}")
+            log += f"({current}/{total}) {key}\n"
+            yield log, result_path, bar
+        elif kind == "ok":
+            stats = item[1]
+            result_path = output_path if Path(output_path).is_file() else None
+            log += (
+                f"\n✅ Conversion finished. Detected architecture: {stats.arch}\n"
+                f"  {stats.quantized_count} layer(s) → {gguf_quant_type}\n"
+                f"  {stats.f32_kept_count} layer(s) kept F32 (1D / tiny / precision-sensitive)\n"
+            )
+            if stats.fallback_f16_count:
+                log += (
+                    f"  ⚠️ {stats.fallback_f16_count} layer(s) had a shape not divisible by 32 and fell "
+                    f"back to F16 instead of {gguf_quant_type}.\n"
+                )
+            if stats.skipped_high_dim_count:
+                log += (
+                    f"  ⚠️ {stats.skipped_high_dim_count} tensor(s) with more than 4 dimensions were skipped "
+                    "entirely - GGUF can't represent them (see ComfyUI-GGUF's fix_5d_tensors.py).\n"
+                )
+            if result_path:
+                log += f"Output: {result_path}\n"
+            yield log, result_path, _progress_bar_html(1.0, "Done")
+        elif kind == "fail":
+            log += f"\n❌ Conversion failed: {item[1]}\n"
+            yield log, None, _progress_bar_html(1.0, "Failed")
+
+
 def run_convert(
     input_local: str,
     input_hf: str,
@@ -401,6 +516,7 @@ def run_convert(
     python_exe: str,
     int4_layers_regex: str,
     int4_fallback_int8: bool,
+    gguf_quant_type: str,
 ):
     input_path = (input_local or "").strip() if source == "Local file path" else (input_hf or "").strip()
 
@@ -408,6 +524,12 @@ def run_convert(
         yield from run_int4_convert(
             input_path, output_name, auto_output, preset_label_value,
             int4_layers_regex, int4_fallback_int8, exclude_layers, device,
+        )
+        return
+
+    if fmt == "gguf":
+        yield from run_gguf_convert(
+            input_path, output_name, auto_output, preset_label_value, gguf_quant_type, exclude_layers,
         )
         return
 
@@ -494,12 +616,13 @@ CSS = """
 with gr.Blocks(title="Quant Convert GUI") as demo:
     gr.Markdown(
         "# Quant Convert GUI\n"
-        "Turn a `.safetensors` model into **FP8**, **INT8**, **INT8 ConvRot**, or **NVFP4** — always "
-        "`.safetensors` out, never GGUF — using "
-        "[silveroxides/convert_to_quant](https://github.com/silveroxides/convert_to_quant) under the hood, "
-        "the same tool used to build the [Kroma-Quant](https://huggingface.co/silveroxides/Kroma-Quant) and "
-        "PotatoForge/Kroma-INT8-Quants files. Pick your GPU below and it'll steer you toward a format your "
-        "card can actually accelerate."
+        "Turn a `.safetensors` model into **FP8**, **INT8**, **INT8 ConvRot**, **NVFP4**, real **INT4 ConvRot**, "
+        "or **GGUF** — using "
+        "[silveroxides/convert_to_quant](https://github.com/silveroxides/convert_to_quant) for the `.safetensors` "
+        "formats (the same tool used to build the [Kroma-Quant](https://huggingface.co/silveroxides/Kroma-Quant) "
+        "and PotatoForge/Kroma-INT8-Quants files), plus two independent backends — `comfy_kitchen` for INT4 and "
+        "`gguf` for GGUF — for the formats ctq doesn't produce. Pick your GPU below and it'll steer you toward a "
+        "format your card can actually accelerate."
     )
 
     with gr.Tabs():
@@ -578,6 +701,23 @@ with gr.Blocks(title="Quant Convert GUI") as demo:
                             value=True,
                             label="INT8 tensorwise fallback for other quantizable layers (recommended)",
                             info="Unchecked, non-matched layers stay at full precision instead.",
+                        )
+
+                    gguf_notice = gr.Markdown(visible=False)
+                    gguf_install_btn = gr.Button("Install gguf", visible=False)
+                    with gr.Group(visible=False) as gguf_group:
+                        gguf_quant_type = gr.Dropdown(
+                            GGUF_QUANT_TYPE_CHOICES,
+                            value="Q8_0",
+                            label="GGUF quant type",
+                            info="Q8_0 = best quality/largest of the real quant types here; Q4_0 = smallest/"
+                            "roughest. F16/BF16 skip quantization entirely (just repacks into a GGUF "
+                            "container) - useful as input to your own llama-quantize run for K-quants.",
+                        )
+                        gr.Markdown(
+                            f"Architecture is auto-detected from your model's own tensor names - supported: "
+                            f"{', '.join(GGUF_SUPPORTED_ARCH_NAMES)}. Anything else is refused rather than "
+                            "silently mislabeled; the Estimate button below will tell you which one it found."
                         )
 
                     with gr.Group(visible=True) as convrot_group:
@@ -823,7 +963,16 @@ with gr.Blocks(title="Quant Convert GUI") as demo:
                 "so this format doesn't go through ctq at all — it calls "
                 "[comfy_kitchen](https://github.com/Comfy-Org/comfy-kitchen)'s own `convrot_w4a4` kernel "
                 "directly (the same kernel the Starnodes Model Converter uses). Needs `pip install comfy-kitchen` "
-                "and works best on Turing+ (SM 7.5+) GPUs, though it also runs — slowly — on CPU.\n\n"
+                "and works best on Turing+ (SM 7.5+) GPUs, though it also runs — slowly — on CPU.\n"
+                "- **GGUF** — a completely different container/quant format (llama.cpp's), read by ComfyUI "
+                "through the separate [city96/ComfyUI-GGUF](https://github.com/city96/ComfyUI-GGUF) custom "
+                "node. `convert_to_quant` never touches GGUF at all, so this also bypasses ctq — it calls the "
+                "`gguf` package (llama.cpp's Python bindings) directly, real Q4_0/Q4_1/Q5_0/Q5_1/Q8_0 block "
+                "quantization computed in pure Python. K-quants (Q4_K_M, Q6_K, etc.) aren't available — that "
+                "family only has a *decoder* in the Python package; producing them needs a compiled, patched "
+                "`llama-quantize` binary that this app doesn't build. Architecture (flux/sdxl/wan/etc.) is "
+                "auto-detected from your model's own tensor names, using the exact same detection logic as "
+                "ComfyUI-GGUF's own converter, since its loader rejects anything it doesn't recognize.\n\n"
                 "## Which format for which GPU\n"
                 "| GPU generation | Example cards | Hardware-accelerated formats |\n"
                 "|---|---|---|\n"
@@ -833,7 +982,9 @@ with gr.Blocks(title="Quant Convert GUI") as demo:
                 "| Blackwell | RTX 50-series, B100/B200 | NVFP4, MXFP8, INT8 ConvRot, INT4 ConvRot |\n\n"
                 "Picking FP8 or NVFP4 on an unsupported card doesn't reliably fail at conversion time — "
                 "the file often still gets written, it just won't load or run fast in ComfyUI. The "
-                "**Target GPU** picker on the Convert tab exists to head that off.\n\n"
+                "**Target GPU** picker on the Convert tab exists to head that off. GGUF isn't in the table "
+                "above because its conversion runs in pure Python on any GPU or CPU — what matters instead is "
+                "whether ComfyUI-GGUF recognizes your model's architecture (see above).\n\n"
                 "## What does \"txtfusion\" in a filename mean?\n"
                 "It's not a format — it's a **layer name**. `kroma-v0.3-txtfusion-edition-...` was converted "
                 "with ctq's `krea2` preset, whose high-precision keyword list literally includes `txtfusion` "
@@ -867,7 +1018,11 @@ with gr.Blocks(title="Quant Convert GUI") as demo:
         vis = on_format_change(value)
         return (value, *vis)
 
-    fmt_outputs = [fmt_value, convrot_group, scaling_group, fmt_help, int4_notice, int4_group, int4_install_btn]
+    fmt_outputs = [
+        fmt_value, convrot_group, scaling_group, fmt_help,
+        int4_notice, int4_group, int4_install_btn,
+        gguf_notice, gguf_group, gguf_install_btn,
+    ]
 
     fmt.change(on_fmt_select, inputs=[fmt], outputs=fmt_outputs)
 
@@ -889,6 +1044,26 @@ with gr.Blocks(title="Quant Convert GUI") as demo:
 
     int4_install_btn.click(
         run_int4_install, inputs=[python_exe], outputs=[log_box, int4_notice, int4_install_btn]
+    )
+
+    def run_gguf_install(python_exe_v: str):
+        log = "Installing gguf...\n\n"
+        yield log, gr.update(), gr.update(interactive=False)
+        for line in stream_gguf_install((python_exe_v or "").strip() or None):
+            if line == "__GGUF_INSTALL_OK__":
+                log += "\n✅ gguf installed.\n"
+                yield log, gr.update(value=GGUF_NOTICE_READY), gr.update(visible=False, interactive=True)
+                return
+            if line.startswith("__GGUF_INSTALL_FAIL__"):
+                code = line.split(":", 1)[1] if ":" in line else "?"
+                log += f"\n❌ pip install failed (exit code {code}). See the log above for details.\n"
+                yield log, gr.update(), gr.update(interactive=True)
+                return
+            log += line
+            yield log, gr.update(), gr.update()
+
+    gguf_install_btn.click(
+        run_gguf_install, inputs=[python_exe], outputs=[log_box, gguf_notice, gguf_install_btn]
     )
 
     INT4_TEMPLATE_ATTN = r"attn\.(wq|wk|wv|wo)\.weight"
@@ -987,6 +1162,8 @@ with gr.Blocks(title="Quant Convert GUI") as demo:
         rest = args[3:]
         if rest[preview_field_index["fmt_value"]] == "int4_convrot":
             return "(INT4 ConvRot doesn't run through ctq - see the notice above the format picker.)"
+        if rest[preview_field_index["fmt_value"]] == "gguf":
+            return "(GGUF doesn't run through ctq - see the notice above the format picker.)"
         try:
             opts = build_options(input_path or "placeholder.safetensors", *rest)
             return format_command(opts)
@@ -1026,7 +1203,7 @@ with gr.Blocks(title="Quant Convert GUI") as demo:
         input_local_v, input_hf_local_v, source_v = args[0], args[1], args[2]
         input_path = input_local_v if source_v == "Local file path" else input_hf_local_v
         rest = args[3 : len(preview_inputs)]
-        int4_regex_v, int4_fallback_v = args[-2], args[-1]
+        int4_regex_v, int4_fallback_v, gguf_quant_type_v = args[-3], args[-2], args[-1]
 
         input_path = (input_path or "").strip()
         if not input_path or not Path(input_path).is_file():
@@ -1034,13 +1211,18 @@ with gr.Blocks(title="Quant Convert GUI") as demo:
         vram = check_environment().gpu_vram_gb
 
         fmt_v = rest[preview_field_index["fmt_value"]]
+        preset = LABEL_TO_PRESET.get(rest[preview_field_index["preset_dd"]], "none")
+        exclude_layers_v = rest[preview_field_index["exclude_layers"]]
         if fmt_v == "int4_convrot":
-            preset = LABEL_TO_PRESET.get(rest[preview_field_index["preset_dd"]], "none")
-            exclude_layers_v = rest[preview_field_index["exclude_layers"]]
             return estimate_int4_mixed_from_file(
                 input_path, (int4_regex_v or "").strip() or None, preset=preset,
                 exclude_regex=(exclude_layers_v or "").strip() or None,
                 fallback_int8=int4_fallback_v, gpu_vram_gb=vram,
+            )
+        if fmt_v == "gguf":
+            return estimate_gguf_from_file(
+                input_path, gguf_quant_type_v, preset=preset,
+                exclude_regex=(exclude_layers_v or "").strip() or None, gpu_vram_gb=vram,
             )
         try:
             opts = build_options(input_path, *rest)
@@ -1050,7 +1232,7 @@ with gr.Blocks(title="Quant Convert GUI") as demo:
 
     estimate_btn.click(
         do_estimate,
-        inputs=preview_inputs + [int4_layers_regex, int4_fallback_int8],
+        inputs=preview_inputs + [int4_layers_regex, int4_fallback_int8, gguf_quant_type],
         outputs=[estimate_md],
     )
 
@@ -1063,7 +1245,7 @@ with gr.Blocks(title="Quant Convert GUI") as demo:
             custom_convrot, custom_convrot_group_size, custom_simple, fallback, fallback_simple,
             device, output_dtype, verbose,
             calib_samples, optimizer, num_iter, manual_seed, python_exe,
-            int4_layers_regex, int4_fallback_int8,
+            int4_layers_regex, int4_fallback_int8, gguf_quant_type,
         ],
         outputs=[log_box, result_file, convert_progress],
         # We render our own bar into convert_progress; gr.Progress()'s built-in
