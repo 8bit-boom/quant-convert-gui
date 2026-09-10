@@ -78,6 +78,28 @@ automatically now: if your input filename or Hugging Face URL contains
 (as long as you haven't already picked a different one), and tells you why
 in the note under the file picker.
 
+### Krea2 size profiles (for now, just this preset)
+
+Once krea2 is selected, three quick-preset buttons appear right below it,
+covering the space between "keep those layers full BF16" and "quantize
+absolutely everything":
+
+- **Balanced (recommended)** — krea2's normal behavior; largest, best quality.
+- **Compact** — the krea2-sensitive layers (`txtfusion`, `last.modulatio`, etc.)
+  get quantized too, but gently: plain row-wise INT8, no ConvRot rotation,
+  via `--custom-layers` (which ctq applies with priority over the preset's
+  exclusions). Meaningfully smaller than Balanced.
+- **Smallest** — no exclusions at all; every layer gets the same INT8 ConvRot
+  as everything else. Same as leaving the preset on `none`.
+
+Verified against a real ctq run: on a test file matching every krea2
+keyword, Balanced left 5 of 6 tensors unquantized (ctq logged `krea2 skip`
+for each); Compact quantized all 6 (logged `custom INT8` for the 5 that
+would've been skipped) and the output file came out ~44% smaller. These
+aren't reproductions of PotatoForge's own undisclosed v3/v4/v5 recipes —
+they're this GUI's own size/quality points, built from ctq's real flags.
+Use **Estimate output size** to preview the difference before converting.
+
 ## Estimating output size
 
 Hit **Estimate output size** (next to the command preview) after picking a

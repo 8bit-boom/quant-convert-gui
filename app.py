@@ -16,7 +16,7 @@ import gradio as gr
 
 from quant_gui.cli_builder import ConvertOptions, OptionsError, build_args, format_command
 from quant_gui.env_check import check_environment, report_markdown
-from quant_gui.filters import preset_choices, preset_label, suggest_preset
+from quant_gui.filters import preset_choices, preset_highprec_regex, preset_label, suggest_preset
 from quant_gui.gpu_profiles import GPU_PROFILE_BY_KEY, GPU_PROFILES, detect_profile_key
 from quant_gui.hf import HFUrlError, download as hf_download, parse_hf_url
 from quant_gui.runner import stream_conversion
@@ -422,6 +422,16 @@ with gr.Blocks(title="Quant Convert GUI") as demo:
                             info="Keeps sensitive layers (norms, embeddings, modulation) at full precision. "
                             "Pick the family closest to your model.",
                         )
+                        with gr.Group(visible=False) as krea2_size_group:
+                            gr.Markdown(
+                                "**Krea2 size profile** (for now, just this preset) — trades quality for a "
+                                "smaller file by deciding how the layers krea2 normally keeps full-precision "
+                                "get treated. Check **Estimate output size** after picking one."
+                            )
+                            with gr.Row():
+                                krea2_balanced_btn = gr.Button("Balanced (recommended) — largest")
+                                krea2_compact_btn = gr.Button("Compact — sensitive layers → plain INT8")
+                                krea2_smallest_btn = gr.Button("Smallest — no exclusions, blanket ConvRot")
 
                     with gr.Accordion("Advanced options", open=False):
                         with gr.Row():
@@ -595,12 +605,35 @@ with gr.Blocks(title="Quant Convert GUI") as demo:
         on_fmt_select, inputs=[fmt], outputs=fmt_outputs
     )
 
+    def krea2_group_visibility(label: str):
+        return gr.update(visible=LABEL_TO_PRESET.get(label, "none") == "krea2")
+
+    krea2_profile_outputs = [custom_layers, custom_type, custom_scaling_mode, custom_convrot, preset_dd]
+
+    def krea2_balanced():
+        return "", "none", "none", False, gr.update()
+
+    def krea2_compact():
+        return preset_highprec_regex("krea2") or "", "int8", "row", False, gr.update()
+
+    def krea2_smallest():
+        return "", "none", "none", False, PRESET_LABELS["none"]
+
+    preset_dd.change(krea2_group_visibility, inputs=[preset_dd], outputs=[krea2_size_group])
+    krea2_balanced_btn.click(krea2_balanced, outputs=krea2_profile_outputs)
+    krea2_compact_btn.click(krea2_compact, outputs=krea2_profile_outputs)
+    krea2_smallest_btn.click(krea2_smallest, outputs=krea2_profile_outputs).then(
+        krea2_group_visibility, inputs=[preset_dd], outputs=[krea2_size_group]
+    )
+
     source.change(on_source_change, inputs=[source], outputs=[local_group, hf_group])
 
     download_btn.click(do_hf_download, inputs=[input_hf_url, hf_token], outputs=[input_hf_local, download_status]).then(
         on_input_resolved, inputs=[input_hf_local, input_hf_url, preset_dd], outputs=[resolved_hint, preset_dd]
-    )
-    input_local.change(on_input_resolved, inputs=[input_local, input_hf_url, preset_dd], outputs=[resolved_hint, preset_dd])
+    ).then(krea2_group_visibility, inputs=[preset_dd], outputs=[krea2_size_group])
+    input_local.change(
+        on_input_resolved, inputs=[input_local, input_hf_url, preset_dd], outputs=[resolved_hint, preset_dd]
+    ).then(krea2_group_visibility, inputs=[preset_dd], outputs=[krea2_size_group])
 
     auto_output.change(lambda auto: gr.update(interactive=not auto), inputs=[auto_output], outputs=[output_name])
 

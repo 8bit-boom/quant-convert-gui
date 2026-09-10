@@ -8,7 +8,14 @@ snapshot (from ctq v1.3.4) so the GUI still renders and explains itself.
 
 from __future__ import annotations
 
-FALLBACK_MODEL_FILTERS: dict[str, dict[str, str]] = {
+import re
+
+# Exact highprec keyword list for krea2, confirmed against
+# convert_to_quant.constants.MODEL_FILTERS["krea2"]["highprec"] - kept here
+# too so the size-profile buttons still work if ctq isn't installed yet.
+_KREA2_HIGHPREC_FALLBACK = ["firs", "las", "tml", "txtfusion", "last.modulatio", "tpro"]
+
+FALLBACK_MODEL_FILTERS: dict[str, dict[str, object]] = {
     "gemma4": {"help": "Gemma4 text/multimodal model: skip audio, per_layer_input_gate, per_layer_projection, vision, multi_modal_projector", "category": "text"},
     "qwen_vlm": {"help": "Qwen VLM family: skip first/last language layers, embeddings, MTP, and the full visual encoder", "category": "text"},
     "qwen35": {"help": "Compatibility alias for --qwen_vlm", "category": "text"},
@@ -24,7 +31,11 @@ FALLBACK_MODEL_FILTERS: dict[str, dict[str, str]] = {
     "nerf_large": {"help": "NeRF (large): keep nerf_blocks, distilled_guidance, txt_in high-precision", "category": "diffusion"},
     "nerf_small": {"help": "NeRF (small): keep nerf_blocks, distilled_guidance high-precision", "category": "diffusion"},
     "radiance": {"help": "Radiance model: keep img_in_patch, nerf_final_layer high-precision", "category": "diffusion"},
-    "krea2": {"help": "Krea2 / txtfusion-style models: keep firs, las, tml, txtfusion, last.modulation, tpro layers high-precision", "category": "diffusion"},
+    "krea2": {
+        "help": "Krea2 / txtfusion-style models: keep firs, las, tml, txtfusion, last.modulation, tpro layers high-precision",
+        "category": "diffusion",
+        "highprec": _KREA2_HIGHPREC_FALLBACK,
+    },
     "ideogram4": {"help": "Ideogram4: keep embed_image_indicator, t_embedding, adaln_proj, final_layer, input_proj layers high-precision", "category": "diffusion"},
     "wan": {"help": "WAN video model: skip embeddings, encoders, head", "category": "video"},
     "hunyuan": {"help": "Hunyuan Video 1.5: skip layernorm, attn norms, vision_in", "category": "video"},
@@ -73,3 +84,20 @@ def suggest_preset(name_hint: str) -> str | None:
     if any(hint in lowered for hint in _KREA2_HINTS):
         return "krea2"
     return None
+
+
+def preset_highprec_keywords(preset: str) -> list[str]:
+    """The substrings a preset keeps at full precision (its --custom-layers
+    equivalent target), if ctq's registry exposes one for this preset."""
+    info = get_model_filters().get(preset, {})
+    return list(info.get("highprec", []) or [])
+
+
+def preset_highprec_regex(preset: str) -> str | None:
+    """A regex matching the same layers `preset` would otherwise keep at
+    full precision - lets --custom-layers deliberately re-target them at a
+    *lighter* quantization instead of leaving them unquantized."""
+    keywords = preset_highprec_keywords(preset)
+    if not keywords:
+        return None
+    return "|".join(re.escape(kw) for kw in keywords)
