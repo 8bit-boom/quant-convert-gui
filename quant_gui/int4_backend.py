@@ -47,6 +47,41 @@ def install_hint() -> str:
     return "pip install comfy-kitchen  # https://github.com/Comfy-Org/comfy-kitchen"
 
 
+def stream_install(python_executable: str | None = None):
+    """Run `pip install comfy-kitchen` via the given (or current) interpreter,
+    yielding its stdout/stderr lines as they arrive - mirrors
+    quant_gui.runner.stream_conversion's interface/sentinel style.
+
+    The final yielded line is one of:
+      "__INT4_INSTALL_OK__"        on success (return code 0)
+      "__INT4_INSTALL_FAIL__:<c>"  on non-zero exit or launch failure
+    """
+    import subprocess
+    import sys
+
+    py = python_executable or sys.executable
+    cmd = [py, "-m", "pip", "install", "-U", "comfy-kitchen"]
+    yield f"$ {' '.join(cmd)}\n"
+
+    try:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+    except OSError as exc:
+        yield f"Could not launch pip: {exc}\n"
+        yield "__INT4_INSTALL_FAIL__:127"
+        return
+
+    assert proc.stdout is not None
+    for line in proc.stdout:
+        yield line
+    code = proc.wait()
+
+    if code == 0:
+        importlib.invalidate_caches()  # so is_available() sees the just-installed package
+        yield "__INT4_INSTALL_OK__"
+    else:
+        yield f"__INT4_INSTALL_FAIL__:{code}"
+
+
 @dataclass
 class Int4ConvertStats:
     total: int = 0

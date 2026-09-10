@@ -19,7 +19,7 @@ from quant_gui.env_check import check_environment, report_markdown
 from quant_gui.filters import preset_choices, preset_highprec_regex, preset_label, suggest_preset
 from quant_gui.gpu_profiles import GPU_PROFILE_BY_KEY, GPU_PROFILES, detect_profile_key
 from quant_gui.hf import HFUrlError, download as hf_download, parse_hf_url
-from quant_gui.int4_backend import stream_int4_conversion
+from quant_gui.int4_backend import stream_int4_conversion, stream_install as stream_int4_install
 from quant_gui.int4_backend import is_available as int4_is_available
 from quant_gui.runner import stream_conversion
 from quant_gui.size_estimate import estimate_from_file, estimate_int4_mixed_from_file
@@ -59,11 +59,11 @@ INT4_NOTICE_READY = (
 INT4_NOTICE_MISSING = (
     "### INT4 ConvRot needs one more package\n\n"
     "This format calls `comfy_kitchen`'s real INT4 ConvRot kernel directly (not ctq — see the About tab for "
-    "why). It isn't installed yet:\n\n"
+    "why). It isn't installed yet — click **Install comfy-kitchen** below (streams to the log on the right), "
+    "or run it yourself:\n\n"
     "```bash\npip install comfy-kitchen\n```\n\n"
     "Needs a Turing-or-newer GPU (SM 7.5+ — RTX 20-series onward, so your Ampere/Ada/Blackwell card is fine) "
-    "for real speed; the same eager PyTorch path also runs correctly on CPU, just slowly. Re-check the "
-    "**Environment** tab after installing."
+    "for real speed; the same eager PyTorch path also runs correctly on CPU, just slowly."
 )
 
 FORMAT_HELP = {
@@ -187,15 +187,17 @@ def on_format_change(fmt: str):
     is_int8_convrot = fmt == "int8_convrot"
     is_plain_int8_or_fp8 = fmt in ("int8_plain", "fp8")
     is_int4 = fmt == "int4_convrot"
+    int4_ready = int4_is_available()
     notice_text = ""
     if is_int4:
-        notice_text = INT4_NOTICE_READY if int4_is_available() else INT4_NOTICE_MISSING
+        notice_text = INT4_NOTICE_READY if int4_ready else INT4_NOTICE_MISSING
     return (
         gr.update(visible=is_int8_convrot),  # convrot group
         gr.update(visible=is_plain_int8_or_fp8),  # scaling mode group
         gr.update(value=FORMAT_HELP.get(fmt, "")),
         gr.update(value=notice_text, visible=is_int4),  # int4 notice
         gr.update(visible=is_int4),  # int4 options group
+        gr.update(visible=is_int4 and not int4_ready),  # int4 install button
     )
 
 
@@ -537,6 +539,7 @@ with gr.Blocks(title="Quant Convert GUI") as demo:
                     fmt_value = gr.State(FORMAT_CHOICES[0][1])
                     fmt_help = gr.Markdown(FORMAT_HELP["int8_convrot"])
                     int4_notice = gr.Markdown(visible=False)
+                    int4_install_btn = gr.Button("Install comfy-kitchen", visible=False)
                     with gr.Group(visible=False) as int4_group:
                         int4_layers_regex = gr.Textbox(
                             label="INT4 layers (regex)",
@@ -744,9 +747,29 @@ with gr.Blocks(title="Quant Convert GUI") as demo:
         vis = on_format_change(value)
         return (value, *vis)
 
-    fmt_outputs = [fmt_value, convrot_group, scaling_group, fmt_help, int4_notice, int4_group]
+    fmt_outputs = [fmt_value, convrot_group, scaling_group, fmt_help, int4_notice, int4_group, int4_install_btn]
 
     fmt.change(on_fmt_select, inputs=[fmt], outputs=fmt_outputs)
+
+    def run_int4_install(python_exe_v: str):
+        log = "Installing comfy-kitchen...\n\n"
+        yield log, gr.update(), gr.update(interactive=False)
+        for line in stream_int4_install((python_exe_v or "").strip() or None):
+            if line == "__INT4_INSTALL_OK__":
+                log += "\n✅ comfy-kitchen installed.\n"
+                yield log, gr.update(value=INT4_NOTICE_READY), gr.update(visible=False, interactive=True)
+                return
+            if line.startswith("__INT4_INSTALL_FAIL__"):
+                code = line.split(":", 1)[1] if ":" in line else "?"
+                log += f"\n❌ pip install failed (exit code {code}). See the log above for details.\n"
+                yield log, gr.update(), gr.update(interactive=True)
+                return
+            log += line
+            yield log, gr.update(), gr.update()
+
+    int4_install_btn.click(
+        run_int4_install, inputs=[python_exe], outputs=[log_box, int4_notice, int4_install_btn]
+    )
 
     def on_gpu_select(label: str):
         key = GPU_LABEL_TO_KEY.get(label, "not_sure")
