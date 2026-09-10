@@ -17,6 +17,7 @@ import gradio as gr
 from quant_gui.cli_builder import ConvertOptions, OptionsError, build_args, format_command
 from quant_gui.env_check import check_environment, report_markdown
 from quant_gui.filters import preset_choices, preset_label, suggest_preset
+from quant_gui.gpu_profiles import GPU_PROFILE_BY_KEY, GPU_PROFILES, detect_profile_key
 from quant_gui.hf import HFUrlError, download as hf_download, parse_hf_url
 from quant_gui.runner import stream_conversion
 
@@ -26,12 +27,14 @@ OUTPUT_DIR = APP_DIR / "converted"
 
 FORMAT_CHOICES = [
     ("INT8 — ConvRot (recommended, matches Kroma-Quant *-int8-convrot* files)", "int8_convrot"),
-    ("INT8 — plain (row / block / tensor scaling, no rotation)", "int8_plain"),
-    ("FP8 (E4M3) — Ada / Hopper+ GPUs", "fp8"),
+    ("INT8 — mixed precision (row/block/tensor scaling, no rotation)", "int8_plain"),
+    ("FP8 (E4M3) — Ada / Hopper+ GPUs only", "fp8"),
     ("NVFP4 — 4-bit, closest available today (Blackwell GPUs only)", "nvfp4"),
     ("MXFP8 — Blackwell GPUs only", "mxfp8"),
     ("INT4 ConvRot — not released by upstream ctq yet", "int4_convrot"),
 ]
+
+FORMAT_LABEL_BY_KEY = {v: k for k, v in FORMAT_CHOICES}
 
 INT4_NOTICE = (
     "### INT4 ConvRot isn't available yet\n\n"
@@ -56,8 +59,16 @@ FORMAT_HELP = {
         "quantizing, which is what gives ConvRot files their quality edge over plain INT8. "
         "Runs on any GPU (or CPU, slowly)."
     ),
-    "int8_plain": "Straight INT8 quantization with row/block/tensor scaling, no rotation step. Any GPU.",
-    "fp8": "8-bit float. Needs an Ada/Hopper-or-newer NVIDIA GPU to actually run faster than bf16.",
+    "int8_plain": (
+        "Straight INT8 quantization with row/block/tensor scaling, no rotation step — any GPU. "
+        "Pair it with a model preset below to keep sensitive layers (norms, embeddings, modulation) in "
+        "BF16 while the rest goes to INT8: this is the 'mixed precision INT8' style used by repos like "
+        "PotatoForge/Kroma-INT8-Quants."
+    ),
+    "fp8": (
+        "8-bit float. Needs an Ada/Hopper/Blackwell NVIDIA GPU (compute capability >= 8.9) — "
+        "Ampere cards (RTX 30-series, e.g. RTX 3080 Ti) have no FP8 hardware path at all. Use INT8 on those instead."
+    ),
     "nvfp4": "NVIDIA's 4-bit float block format. Requires a Blackwell GPU and the comfy-kitchen package.",
     "mxfp8": "Microscaling FP8. Requires a Blackwell GPU.",
     "int4_convrot": "Not implemented upstream yet — see the notice above.",
@@ -66,6 +77,12 @@ FORMAT_HELP = {
 PRESET_CHOICES = preset_choices()
 PRESET_LABELS = {name: preset_label(name) for name in PRESET_CHOICES}
 LABEL_TO_PRESET = {v: k for k, v in PRESET_LABELS.items()}
+
+GPU_PROFILE_LABELS = {p.key: p.label for p in GPU_PROFILES}
+GPU_LABEL_TO_KEY = {v: k for k, v in GPU_PROFILE_LABELS.items()}
+
+_initial_env = check_environment()
+_initial_gpu_key = detect_profile_key(_initial_env.gpu_family)
 
 
 def build_options(
@@ -279,9 +296,12 @@ CSS = """
 with gr.Blocks(title="Quant Convert GUI") as demo:
     gr.Markdown(
         "# Quant Convert GUI\n"
-        "Turn a `.safetensors` model into **FP8**, **INT8**, **INT8 ConvRot**, or **NVFP4**, "
-        "using [silveroxides/convert_to_quant](https://github.com/silveroxides/convert_to_quant) under the hood — "
-        "the same tool used to build the [Kroma-Quant](https://huggingface.co/silveroxides/Kroma-Quant) files."
+        "Turn a `.safetensors` model into **FP8**, **INT8**, **INT8 ConvRot**, or **NVFP4** — always "
+        "`.safetensors` out, never GGUF — using "
+        "[silveroxides/convert_to_quant](https://github.com/silveroxides/convert_to_quant) under the hood, "
+        "the same tool used to build the [Kroma-Quant](https://huggingface.co/silveroxides/Kroma-Quant) and "
+        "PotatoForge/Kroma-INT8-Quants files. Pick your GPU below and it'll steer you toward a format your "
+        "card can actually accelerate."
     )
 
     with gr.Tabs():
@@ -310,7 +330,17 @@ with gr.Blocks(title="Quant Convert GUI") as demo:
 
                     resolved_hint = gr.Markdown()
 
-                    gr.Markdown("### 2. Choose an output format")
+                    gr.Markdown("### 2. What GPU will run this model?")
+                    gpu_dd = gr.Dropdown(
+                        [GPU_PROFILE_LABELS[p.key] for p in GPU_PROFILES],
+                        value=GPU_PROFILE_LABELS[_initial_gpu_key],
+                        label="Target GPU",
+                        info="This never touches your files — it just picks a sane default format and warns you off formats your GPU can't accelerate.",
+                    )
+                    gpu_note = gr.Markdown(GPU_PROFILE_BY_KEY[_initial_gpu_key].note)
+                    apply_gpu_recommendation = gr.Button("Use recommended format for this GPU")
+
+                    gr.Markdown("### 3. Choose an output format")
                     fmt = gr.Radio(
                         [c[0] for c in FORMAT_CHOICES],
                         value=FORMAT_CHOICES[0][0],
@@ -335,7 +365,7 @@ with gr.Blocks(title="Quant Convert GUI") as demo:
                         scaling_mode = gr.Radio(["row", "block", "tensor"], value="row", label="Scaling mode")
                         block_size = gr.Number(value=128, label="Block size (block scaling only)", precision=0)
 
-                    gr.Markdown("### 3. Quality vs. speed")
+                    gr.Markdown("### 4. Quality vs. speed")
                     quality_mode = gr.Radio(
                         [
                             ("Simple — direct rounding, fast, matches *-simple files", "simple"),
@@ -377,7 +407,7 @@ with gr.Blocks(title="Quant Convert GUI") as demo:
                             placeholder="leave blank to use this app's Python / the ctq command on PATH",
                         )
 
-                    gr.Markdown("### 4. Output")
+                    gr.Markdown("### 5. Output")
                     auto_output = gr.Checkbox(value=True, label="Auto-generate output filename (recommended)")
                     output_name = gr.Textbox(label="Output filename", interactive=False, placeholder="auto")
 
@@ -394,7 +424,7 @@ with gr.Blocks(title="Quant Convert GUI") as demo:
                 "Conversion runs on **your machine** through `ctq`. This checks whether it (and PyTorch/CUDA) "
                 "are actually installed and what hardware is available."
             )
-            env_md = gr.Markdown(report_markdown(check_environment()))
+            env_md = gr.Markdown(report_markdown(_initial_env))
             refresh_btn = gr.Button("Re-check environment")
             gr.Markdown(
                 "**Install ctq:**\n```bash\npip install convert-to-quant\n"
@@ -407,18 +437,31 @@ with gr.Blocks(title="Quant Convert GUI") as demo:
             gr.Markdown(
                 "## What these formats mean\n"
                 "- **FP8 (E4M3)** — 8-bit float, halves VRAM vs. bf16, needs Ada/Hopper+.\n"
-                "- **INT8** — 8-bit integer with a per-row/block/tensor scale.\n"
+                "- **INT8** — 8-bit integer with a per-row/block/tensor scale. Combined with a model preset "
+                "that keeps a handful of sensitive layers in BF16, this is the 'mixed precision INT8' style "
+                "used by repos like PotatoForge/Kroma-INT8-Quants.\n"
                 "- **INT8 ConvRot** — INT8 plus a group-wise Hadamard rotation applied before quantizing, "
                 "which spreads out the outlier values that normally hurt low-bit accuracy in diffusion "
                 "transformers. This is the recipe behind the `*-int8-convrot*` Kroma-Quant files.\n"
                 "- **NVFP4** — NVIDIA's 4-bit floating point block format; needs a Blackwell GPU.\n"
                 "- **INT4 ConvRot** — not released by upstream `convert_to_quant` as of v1.3.4. "
                 "This GUI mirrors ctq's real flags, so it will pick this up the moment ctq ships it.\n\n"
+                "## Which format for which GPU\n"
+                "| GPU generation | Example cards | Hardware-accelerated formats |\n"
+                "|---|---|---|\n"
+                "| Turing/Ampere | RTX 20/30-series, A100 — **incl. RTX 3080 Ti** | **INT8 / INT8 ConvRot only** — no FP8 or NVFP4 hardware path |\n"
+                "| Ada Lovelace | RTX 40-series, L40 | FP8, INT8 ConvRot |\n"
+                "| Hopper | H100, H200 | FP8, INT8 ConvRot |\n"
+                "| Blackwell | RTX 50-series, B100/B200 | NVFP4, MXFP8, INT8 ConvRot |\n\n"
+                "Picking FP8 or NVFP4 on an unsupported card doesn't reliably fail at conversion time — "
+                "the file often still gets written, it just won't load or run fast in ComfyUI. The "
+                "**Target GPU** picker on the Convert tab exists to head that off.\n\n"
                 "## Credit\n"
                 "All the actual quantization math lives in "
                 "[silveroxides/convert_to_quant](https://github.com/silveroxides/convert_to_quant) (`ctq`). "
                 "This app is just a GUI wrapper around it, and downloads/uploads nothing on its own besides "
-                "the model file you point it at."
+                "the model file you point it at. It only ever produces `.safetensors` output — it has no "
+                "GGUF code path at all."
             )
 
     # --- wiring ---
@@ -442,6 +485,20 @@ with gr.Blocks(title="Quant Convert GUI") as demo:
         on_fmt_select, inputs=[fmt], outputs=fmt_outputs
     )
     switch_to_nvfp4.click(lambda: FORMAT_CHOICES[3][0], outputs=[fmt]).then(
+        on_fmt_select, inputs=[fmt], outputs=fmt_outputs
+    )
+
+    def on_gpu_select(label: str):
+        key = GPU_LABEL_TO_KEY.get(label, "not_sure")
+        return GPU_PROFILE_BY_KEY[key].note
+
+    def recommended_fmt_label(gpu_label: str) -> str:
+        key = GPU_LABEL_TO_KEY.get(gpu_label, "not_sure")
+        rec_key = GPU_PROFILE_BY_KEY[key].recommended_format
+        return FORMAT_LABEL_BY_KEY.get(rec_key, FORMAT_CHOICES[0][0])
+
+    gpu_dd.change(on_gpu_select, inputs=[gpu_dd], outputs=[gpu_note])
+    apply_gpu_recommendation.click(recommended_fmt_label, inputs=[gpu_dd], outputs=[fmt]).then(
         on_fmt_select, inputs=[fmt], outputs=fmt_outputs
     )
 

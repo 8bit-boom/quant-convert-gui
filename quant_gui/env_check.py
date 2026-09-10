@@ -28,6 +28,27 @@ class EnvReport:
     def is_blackwell(self) -> bool:
         return self.cuda_capability is not None and self.cuda_capability[0] >= 10
 
+    @property
+    def is_ada_or_newer(self) -> bool:
+        """FP8 tensor cores exist on Ada (SM 8.9), Hopper (9.0), and Blackwell (10.0+),
+        but not on Ampere (8.0-8.6, e.g. RTX 30-series) or older."""
+        return self.cuda_capability is not None and self.cuda_capability >= (8, 9)
+
+    @property
+    def gpu_family(self) -> str:
+        cc = self.cuda_capability
+        if cc is None:
+            return "unknown"
+        if cc[0] >= 10:
+            return "blackwell"
+        if cc == (9, 0):
+            return "hopper"
+        if cc >= (8, 9):
+            return "ada"
+        if cc[0] == 8:
+            return "ampere"
+        return "pre-ampere"
+
     def ready_for(self, quant_format: str) -> tuple[bool, str]:
         if not (self.ctq_executable or self.ctq_importable):
             return False, "convert_to_quant (ctq) isn't installed. See the Environment tab for the install command."
@@ -37,6 +58,12 @@ class EnvReport:
             return False, (
                 f"{quant_format.upper()} needs an NVIDIA Blackwell GPU (compute capability >= 10.0). "
                 "Conversion will likely fail or produce a file your hardware can't run."
+            )
+        if quant_format == "fp8" and self.cuda_available and not self.is_ada_or_newer:
+            return False, (
+                "FP8 tensor cores need an Ada/Hopper/Blackwell GPU (compute capability >= 8.9). "
+                f"Your GPU reports SM {self.cuda_capability[0]}.{self.cuda_capability[1]} (Ampere or older) — "
+                "it has no FP8 hardware path. Use INT8 instead (Ampere has full native INT8 tensor-core support)."
             )
         return True, "Ready."
 
@@ -115,6 +142,9 @@ def report_markdown(report: EnvReport) -> str:
             if report.cuda_available and report.gpu_name
             else "none detected (CPU-only conversion will be very slow, or use --device cpu)"
         ),
+        f"**GPU family** — {report.gpu_family}"
+        + (" (no FP8/NVFP4/MXFP8 hardware — use INT8)" if report.gpu_family == "ampere" else ""),
+        f"**Ada/Hopper/Blackwell (for FP8)** — {ok(report.is_ada_or_newer)}",
         f"**Blackwell (for NVFP4/MXFP8)** — {ok(report.is_blackwell)}",
         f"**Triton** (for INT8 kernels) — {ok(report.triton_installed)}",
         f"**comfy-kitchen** (for NVFP4/MXFP8) — {ok(report.comfy_kitchen_installed)}",
