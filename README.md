@@ -241,16 +241,43 @@ this app's), and shells out to its actual tools:
 - A **Hugging Face repo ID** downloads the *whole* model repo (config,
   tokenizer, every safetensors shard) via `huggingface_hub.snapshot_download`
   - unlike the Convert tab above, which only ever needs one file.
+- **`llama-imatrix`**, once built, generates a real importance matrix -
+  the same mechanism behind most "imatrix" GGUF quants on Hugging Face,
+  and the foundation Unsloth's own "Dynamic" quants are built on (per
+  their own docs: an imatrix calibration file that "helps the quantizer
+  identify model layers that need more precision"). It runs calibration
+  text through the full-precision model and records which weights
+  actually matter, then `llama-quantize --imatrix ...` uses that to round
+  more carefully where it counts. A small generic calibration text ships
+  bundled (`quant_gui/data/default_calibration.txt`) so the feature works
+  with no setup; paste your own file for better results on a specific
+  domain - quality depends heavily on how representative the calibration
+  text is of real usage, which is most of what Unsloth's own curation
+  actually does.
+- **Per-layer type overrides**, via `llama-quantize`'s own
+  `--tensor-type-file` (a plain text file of `tensor.name=GGML_TYPE`
+  lines) - the real mechanism behind manually assigning a different type
+  per layer, which is what Unsloth's "Dynamic 3.0" per-layer mixing is
+  built from. This app does **not** generate one automatically: Unsloth's
+  specific per-model choices of which layer gets which type aren't
+  published anywhere in a form this module can consume, so this is
+  exposed as a manual power-user override, not a reproduction of their
+  recipe.
 
 Verified end-to-end against a real synthetic Llama-architecture model
-(tiny SentencePiece tokenizer + tiny safetensors weights, built with
+(tiny SentencePiece tokenizer, trained with byte-fallback so it can encode
+arbitrary calibration text, + tiny safetensors weights, built with
 `transformers`/`sentencepiece` directly, since no real model was
-downloaded for this) run through the actual cloned `convert_hf_to_gguf.py`
-and a real compiled `llama-quantize` binary - correct tensor names/shapes,
-correct hyperparameters (context length, head counts, rope theta), correct
-tokenizer/special-token IDs, and a real Q4_K_M output file that
-`gguf.GGUFReader` reads back with the right architecture and per-tensor
-quant types.
+downloaded for this) run through the actual cloned `convert_hf_to_gguf.py`,
+a real compiled `llama-quantize` binary, and a real compiled
+`llama-imatrix` binary - correct tensor names/shapes, correct
+hyperparameters (context length, head counts, rope theta), correct
+tokenizer/special-token IDs, a real generated importance matrix
+(`llama-quantize`'s own log confirms `have_imatrix`/entries loaded), a
+real per-layer type override applied via `--tensor-type-file` (confirmed
+by reading the exact GGML type back out of the output file), and a real
+Q4_K_M output file that `gguf.GGUFReader` reads back with the right
+architecture and per-tensor quant types.
 
 ## Install (automatic)
 
@@ -374,8 +401,12 @@ everyone else can ignore them.
 - `quant_gui/gguf_backend.py` — GGUF export via llama.cpp's `gguf` package,
   independent of ctq (see [About "GGUF"](#about-gguf)).
 - `quant_gui/llamacpp_backend.py` — manages a real llama.cpp checkout/venv
-  and shells out to its `convert_hf_to_gguf.py`/`llama-quantize` for LLMs
+  and shells out to its `convert_hf_to_gguf.py`/`llama-quantize`/
+  `llama-imatrix` for LLMs
   (see [About "LLM to GGUF"](#about-llm-to-gguf-gemma-llama-qwen-etc)).
+- `quant_gui/data/default_calibration.txt` — the small bundled generic
+  imatrix calibration text (multi-domain: prose, code, lists, Q&A) used
+  when no custom calibration file is supplied.
 
 ## Sources
 
@@ -418,14 +449,28 @@ none of the three go through `ctq`:
   directly).
 - [llama.cpp](https://github.com/ggerganov/llama.cpp) itself, specifically
   its `convert_hf_to_gguf.py` and `conversion/` package (tokenizer
-  conversion, per-architecture hyperparameter mapping) and its
-  `tools/quantize` (`llama-quantize`, the real K-quant implementation) —
-  `quant_gui/llamacpp_backend.py` clones and shells out to these directly,
-  the same way the rest of this app shells out to `ctq`, rather than
-  reimplementing any of it.
+  conversion, per-architecture hyperparameter mapping), its
+  `tools/quantize` (`llama-quantize`, the real K-quant and
+  `--imatrix`/`--tensor-type-file` implementation), and its
+  `tools/imatrix` (`llama-imatrix`, the real importance-matrix
+  implementation) — `quant_gui/llamacpp_backend.py` clones and shells out
+  to all of these directly, the same way the rest of this app shells out
+  to `ctq`, rather than reimplementing any of it.
+- [Unsloth's Dynamic 2.0/3.0 GGUF docs](https://unsloth.ai/docs/basics/dynamic-3.0-ggufs) -
+  read via web search (unsloth.ai itself was network-blocked in the
+  environment this was built in) to understand what their technique
+  actually is: an imatrix calibration file plus finer per-layer type
+  decisions, both real llama.cpp mechanisms and not a new algorithm of
+  their own. Their specific calibration dataset and specific per-model
+  layer-type choices aren't published, so this app exposes the same real
+  mechanisms as general-purpose tools rather than claiming to reproduce
+  their exact recipe.
 
 Every claim above about what's real vs. not (e.g. which GGUF quant types
 have pure-Python support, whether a package needs a GPU, whether K-quants
-need a compiled binary) was checked directly against these sources' own
-code - including a real `cmake` build of `llama-quantize` and a real
-`convert_hf_to_gguf.py` run - not assumed from their documentation alone.
+need a compiled binary, whether imatrix/per-layer overrides actually work)
+was checked directly against these sources' own code - including a real
+`cmake` build of `llama-quantize` and `llama-imatrix`, a real
+`convert_hf_to_gguf.py` run, a real generated importance matrix, and a
+real per-layer type override read back out of the quantized file - not
+assumed from documentation alone.

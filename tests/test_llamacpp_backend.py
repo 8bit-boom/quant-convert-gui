@@ -8,15 +8,19 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import pytest
 
 from quant_gui.llamacpp_backend import (
+    DEFAULT_CALIBRATION_FILE,
     QUANT_TYPE_CHOICES,
+    _imatrix_binary,
     _quantize_binary,
     _venv_python,
     is_cloned,
+    is_imatrix_built,
     is_quantize_built,
     is_venv_ready,
     stream_build_quantize,
     stream_clone_or_update,
     stream_convert_to_gguf,
+    stream_generate_imatrix,
     stream_quantize,
     stream_setup_venv,
 )
@@ -122,3 +126,62 @@ def test_stream_quantize_rejects_unknown_type(tmp_path):
 
     events = list(stream_quantize(tmp_path, "/in.gguf", "/out.gguf", "NOT_A_REAL_TYPE"))
     assert events[-1].startswith("__FAIL__")
+
+
+def test_default_calibration_file_exists_and_is_nonempty():
+    assert DEFAULT_CALIBRATION_FILE.is_file()
+    assert DEFAULT_CALIBRATION_FILE.stat().st_size > 1000
+
+
+def test_is_imatrix_built_false_when_missing(tmp_path):
+    assert is_imatrix_built(tmp_path) is False
+
+
+def test_imatrix_binary_finds_unix_binary(tmp_path):
+    binpath = tmp_path / "build" / "bin" / "llama-imatrix"
+    binpath.parent.mkdir(parents=True)
+    binpath.write_text("#!/bin/sh\n")
+    binpath.chmod(0o755)
+    assert _imatrix_binary(tmp_path) == binpath
+    assert is_imatrix_built(tmp_path) is True
+
+
+def test_stream_generate_imatrix_fails_fast_when_binary_missing(tmp_path):
+    events = list(stream_generate_imatrix(tmp_path, "/model.gguf", str(tmp_path / "imatrix.gguf")))
+    assert events[-1].startswith("__FAIL__")
+
+
+def test_stream_generate_imatrix_fails_fast_when_model_missing(tmp_path):
+    binpath = tmp_path / "build" / "bin" / "llama-imatrix"
+    binpath.parent.mkdir(parents=True)
+    binpath.write_text("#!/bin/sh\n")
+    binpath.chmod(0o755)
+
+    events = list(stream_generate_imatrix(tmp_path, "/no/such/model.gguf", str(tmp_path / "imatrix.gguf")))
+    assert events[-1].startswith("__FAIL__")
+
+
+def test_stream_generate_imatrix_fails_fast_when_calibration_file_missing(tmp_path):
+    binpath = tmp_path / "build" / "bin" / "llama-imatrix"
+    binpath.parent.mkdir(parents=True)
+    binpath.write_text("#!/bin/sh\n")
+    binpath.chmod(0o755)
+    model = tmp_path / "model.gguf"
+    model.write_text("fake")
+
+    events = list(stream_generate_imatrix(
+        tmp_path, str(model), str(tmp_path / "imatrix.gguf"), calibration_file=str(tmp_path / "missing.txt"),
+    ))
+    assert events[-1].startswith("__FAIL__")
+
+
+def test_stream_quantize_includes_imatrix_flag_in_command(tmp_path):
+    binpath = tmp_path / "build" / "bin" / "llama-quantize"
+    binpath.parent.mkdir(parents=True)
+    binpath.write_text("#!/bin/sh\nexit 1\n")
+    binpath.chmod(0o755)
+
+    events = list(stream_quantize(
+        tmp_path, "/in.gguf", "/out.gguf", "Q4_K_M", imatrix_file="/some/imatrix.gguf",
+    ))
+    assert "--imatrix /some/imatrix.gguf" in events[0]

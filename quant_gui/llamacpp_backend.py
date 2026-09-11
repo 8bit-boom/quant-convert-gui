@@ -20,6 +20,18 @@ the same reason). Real K-quants (Q4_K_M, Q6_K, etc. - what most LLM GGUFs
 actually use) need `llama-quantize`, a compiled C++ binary: this module
 can build it (needs cmake + a C/C++ toolchain already on the machine) but
 never fakes having it when it doesn't.
+
+Also manages `llama-imatrix`, the same real tool behind most "imatrix"
+GGUF quants on Hugging Face (and the foundation Unsloth's own "Dynamic"
+quants are built on, per their own docs): it runs calibration text through
+the full-precision model and records which weights actually matter, so
+`llama-quantize --imatrix ...` can round more carefully on the layers that
+need it. `llama-quantize` also exposes `--tensor-type`/`--tensor-type-file`
+for manually assigning a different GGML type per tensor - the real
+mechanism behind per-layer "dynamic" mixing, exposed here as a power-user
+override rather than an automatic reproduction of any specific published
+recipe, since exact per-model layer choices (Unsloth's included) aren't
+published in a form this module can just consume.
 """
 
 from __future__ import annotations
@@ -52,6 +64,8 @@ QUANT_TYPE_CHOICES = [
 
 REQUIRED_MODULES = ("gguf", "transformers", "sentencepiece")
 
+DEFAULT_CALIBRATION_FILE = Path(__file__).resolve().parent / "data" / "default_calibration.txt"
+
 
 class LlamaCppBackendError(RuntimeError):
     pass
@@ -67,15 +81,23 @@ def _venv_python(llamacpp_dir: Path) -> Path:
     return llamacpp_dir / ".venv" / "bin" / "python"
 
 
-def _quantize_binary(llamacpp_dir: Path) -> Path | None:
+def _find_binary(llamacpp_dir: Path, name: str) -> Path | None:
     for candidate in (
-        llamacpp_dir / "build" / "bin" / "llama-quantize",
-        llamacpp_dir / "build" / "bin" / "llama-quantize.exe",
-        llamacpp_dir / "build" / "bin" / "Release" / "llama-quantize.exe",
+        llamacpp_dir / "build" / "bin" / name,
+        llamacpp_dir / "build" / "bin" / f"{name}.exe",
+        llamacpp_dir / "build" / "bin" / "Release" / f"{name}.exe",
     ):
         if candidate.is_file():
             return candidate
     return None
+
+
+def _quantize_binary(llamacpp_dir: Path) -> Path | None:
+    return _find_binary(llamacpp_dir, "llama-quantize")
+
+
+def _imatrix_binary(llamacpp_dir: Path) -> Path | None:
+    return _find_binary(llamacpp_dir, "llama-imatrix")
 
 
 def is_cloned(llamacpp_dir: Path) -> bool:
@@ -98,6 +120,10 @@ def is_venv_ready(llamacpp_dir: Path) -> bool:
 
 def is_quantize_built(llamacpp_dir: Path) -> bool:
     return _quantize_binary(llamacpp_dir) is not None
+
+
+def is_imatrix_built(llamacpp_dir: Path) -> bool:
+    return _imatrix_binary(llamacpp_dir) is not None
 
 
 @dataclass
@@ -192,14 +218,17 @@ def stream_build_quantize(llamacpp_dir: Path, jobs: int | None = None):
 
     r2 = _ProcResult()
     yield from _run_streamed(
-        ["cmake", "--build", str(build_dir), "--config", "Release", "-j", str(jobs), "--target", "llama-quantize"],
+        [
+            "cmake", "--build", str(build_dir), "--config", "Release", "-j", str(jobs),
+            "--target", "llama-quantize", "--target", "llama-imatrix",
+        ],
         cwd=str(llamacpp_dir), result=r2,
     )
     if r2.returncode != 0:
         yield f"\n❌ Build failed (exit {r2.returncode}).\n"
         yield f"__FAIL__:{r2.returncode}"
         return
-    yield "\n✅ llama-quantize built.\n"
+    yield "\n✅ llama-quantize and llama-imatrix built.\n"
     yield "__OK__"
 
 
@@ -218,7 +247,44 @@ def stream_convert_to_gguf(llamacpp_dir: Path, model_dir: str, output_path: str,
     yield "__OK__" if r.returncode == 0 else f"__FAIL__:{r.returncode}"
 
 
-def stream_quantize(llamacpp_dir: Path, input_gguf: str, output_gguf: str, quant_type: str):
+def stream_generate_imatrix(
+    llamacpp_dir: Path, model_gguf: str, output_imatrix: str,
+    calibration_file: str | None = None, chunks: int | None = None,
+):
+    """Runs llama-imatrix: the real tool behind most "imatrix" GGUF quants
+    (and the foundation Unsloth's own Dynamic quants are built on) - records
+    which weights actually matter by running calibration text through the
+    full-precision model, so a later llama-quantize --imatrix run can round
+    more carefully on the layers that need it."""
+    binary = _imatrix_binary(llamacpp_dir)
+    if binary is None:
+        yield "llama-imatrix isn't built yet.\n"
+        yield "__FAIL__:1"
+        return
+    if not Path(model_gguf).is_file():
+        yield f"Model GGUF not found: {model_gguf}\n"
+        yield "__FAIL__:1"
+        return
+
+    calib_path = Path(calibration_file) if (calibration_file or "").strip() else DEFAULT_CALIBRATION_FILE
+    if not calib_path.is_file():
+        yield f"Calibration file not found: {calib_path}\n"
+        yield "__FAIL__:1"
+        return
+
+    Path(output_imatrix).parent.mkdir(parents=True, exist_ok=True)
+    cmd = [str(binary), "-m", model_gguf, "-f", str(calib_path), "-o", output_imatrix]
+    if chunks:
+        cmd += ["--chunks", str(chunks)]
+    r = _ProcResult()
+    yield from _run_streamed(cmd, result=r)
+    yield "__OK__" if r.returncode == 0 else f"__FAIL__:{r.returncode}"
+
+
+def stream_quantize(
+    llamacpp_dir: Path, input_gguf: str, output_gguf: str, quant_type: str,
+    imatrix_file: str | None = None, tensor_type_file: str | None = None,
+):
     binary = _quantize_binary(llamacpp_dir)
     if binary is None:
         yield "llama-quantize isn't built yet.\n"
@@ -230,7 +296,12 @@ def stream_quantize(llamacpp_dir: Path, input_gguf: str, output_gguf: str, quant
         return
 
     Path(output_gguf).parent.mkdir(parents=True, exist_ok=True)
-    cmd = [str(binary), input_gguf, output_gguf, quant_type]
+    cmd = [str(binary)]
+    if (imatrix_file or "").strip():
+        cmd += ["--imatrix", imatrix_file.strip()]
+    if (tensor_type_file or "").strip():
+        cmd += ["--tensor-type-file", tensor_type_file.strip()]
+    cmd += [input_gguf, output_gguf, quant_type]
     r = _ProcResult()
     yield from _run_streamed(cmd, result=r)
     yield "__OK__" if r.returncode == 0 else f"__FAIL__:{r.returncode}"

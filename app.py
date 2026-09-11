@@ -491,11 +491,13 @@ def llamacpp_status_markdown() -> str:
     cloned = lcpp.is_cloned(LLAMACPP_DIR)
     venv_ready = lcpp.is_venv_ready(LLAMACPP_DIR)
     quantize_built = lcpp.is_quantize_built(LLAMACPP_DIR)
+    imatrix_built = lcpp.is_imatrix_built(LLAMACPP_DIR)
     return (
         f"**llama.cpp cloned** — {ok(cloned)} `{LLAMACPP_DIR}`\n\n"
         f"**Python deps installed** (transformers/sentencepiece/gguf, in their own venv) — {ok(venv_ready)}\n\n"
-        f"**llama-quantize built** (for real K-quants like Q4_K_M) — {ok(quantize_built)} "
-        + ("_optional - skip this if F16/BF16/Q8_0 is enough for you_" if not quantize_built else "")
+        f"**llama-quantize + llama-imatrix built** (for real K-quants like Q4_K_M, and for imatrix/dynamic-"
+        f"style calibrated quants) — {ok(quantize_built and imatrix_built)} "
+        + ("_optional - skip this if F16/BF16/Q8_0 is enough for you_" if not (quantize_built and imatrix_built) else "")
     )
 
 
@@ -611,7 +613,42 @@ def run_llm_convert(model_dir: str, output_name: str, outtype: str):
             yield log, result_path
 
 
-def run_llm_quantize(input_gguf: str, output_name: str, quant_type: str):
+def run_llm_generate_imatrix(model_gguf: str, calibration_file: str, output_name: str):
+    model_gguf = (model_gguf or "").strip()
+    if not model_gguf or not Path(model_gguf).is_file():
+        yield "Pick an input GGUF file first (the output of the conversion step above, or any existing .gguf file).", None
+        return
+    if not lcpp.is_imatrix_built(LLAMACPP_DIR):
+        yield "llama-imatrix isn't built yet - see the Setup section above.", None
+        return
+
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    name = (output_name or "").strip()
+    if name:
+        output_path = str(OUTPUT_DIR / name) if not os.path.isabs(name) and os.sep not in name else name
+    else:
+        output_path = str(OUTPUT_DIR / f"{Path(model_gguf).stem}.imatrix.gguf")
+
+    calib = (calibration_file or "").strip()
+    log = f"Generating importance matrix for {model_gguf}\n"
+    log += f"  calibration: {calib or 'bundled default (quant_gui/data/default_calibration.txt)'}\n"
+    log += f"  output: {output_path}\n\n"
+    yield log, None
+    result_path = None
+    for line in lcpp.stream_generate_imatrix(LLAMACPP_DIR, model_gguf, output_path, calibration_file=calib or None):
+        if line == "__OK__":
+            result_path = output_path if Path(output_path).is_file() else None
+            log += f"\n✅ Importance matrix generated.\nOutput: {result_path or output_path}\n"
+            yield log, result_path
+        elif line.startswith("__FAIL__"):
+            log += "\n❌ Generation failed (see log above).\n"
+            yield log, None
+        else:
+            log += line
+            yield log, result_path
+
+
+def run_llm_quantize(input_gguf: str, output_name: str, quant_type: str, imatrix_file: str, tensor_type_file: str):
     input_gguf = (input_gguf or "").strip()
     if not input_gguf or not Path(input_gguf).is_file():
         yield f"Pick an input GGUF file first (the output of the conversion step above, or any existing .gguf file).", None
@@ -628,10 +665,19 @@ def run_llm_quantize(input_gguf: str, output_name: str, quant_type: str):
         stem = Path(input_gguf).stem
         output_path = str(OUTPUT_DIR / f"{stem}-{quant_type}.gguf")
 
-    log = f"Quantizing {input_gguf} -> {quant_type}\n  output: {output_path}\n\n"
+    log = f"Quantizing {input_gguf} -> {quant_type}\n  output: {output_path}\n"
+    if (imatrix_file or "").strip():
+        log += f"  imatrix: {imatrix_file.strip()}\n"
+    if (tensor_type_file or "").strip():
+        log += f"  tensor-type overrides: {tensor_type_file.strip()}\n"
+    log += "\n"
     yield log, None
     result_path = None
-    for line in lcpp.stream_quantize(LLAMACPP_DIR, input_gguf, output_path, quant_type):
+    for line in lcpp.stream_quantize(
+        LLAMACPP_DIR, input_gguf, output_path, quant_type,
+        imatrix_file=(imatrix_file or "").strip() or None,
+        tensor_type_file=(tensor_type_file or "").strip() or None,
+    ):
         if line == "__OK__":
             result_path = output_path if Path(output_path).is_file() else None
             log += f"\n✅ Quantization finished.\nOutput: {result_path or output_path}\n"
@@ -1125,7 +1171,7 @@ with gr.Blocks(title="Quant Convert GUI") as demo:
             with gr.Row():
                 llamacpp_clone_btn = gr.Button("Clone / update llama.cpp")
                 llamacpp_venv_btn = gr.Button("Install Python deps")
-                llamacpp_build_btn = gr.Button("Build llama-quantize (optional, for K-quants)")
+                llamacpp_build_btn = gr.Button("Build llama-quantize + llama-imatrix (optional, for K-quants)")
             llamacpp_build_jobs = gr.Textbox(
                 label="Build parallelism (optional)", placeholder="defaults to CPU core count",
             )
@@ -1159,7 +1205,27 @@ with gr.Blocks(title="Quant Convert GUI") as demo:
             llm_convert_btn = gr.Button("Convert to GGUF", variant="primary")
 
             gr.Markdown(
-                "### 4. Quantize to a K-quant (optional)\n"
+                "### 4. Generate an importance matrix (optional, for calibrated/\"dynamic\"-style quants)\n"
+                "Needs **llama-imatrix built** (step 1). Runs calibration text through the full-precision "
+                "model and records which weights actually matter, so quantizing below can round more "
+                "carefully on the layers that need it - the same real mechanism behind most \"imatrix\" GGUF "
+                "quants on Hugging Face, and the foundation Unsloth's own \"Dynamic\" quants are built on "
+                "(per their own docs). Uses a small bundled generic calibration text by default; paste your "
+                "own file below for better results on a specific domain."
+            )
+            with gr.Row():
+                llm_imatrix_model = gr.Textbox(
+                    label="Model GGUF (F16/BF16)", placeholder="auto-filled from step 3, or paste any .gguf path",
+                )
+                llm_imatrix_calibration = gr.Textbox(
+                    label="Calibration text file (optional)",
+                    placeholder="leave blank to use the bundled generic default",
+                )
+            llm_imatrix_output_name = gr.Textbox(label="Output filename (optional)", placeholder="auto")
+            llm_imatrix_btn = gr.Button("Generate importance matrix")
+
+            gr.Markdown(
+                "### 5. Quantize to a K-quant (optional)\n"
                 "Needs **llama-quantize built** (step 1). Takes any GGUF file (typically this tab's own F16/"
                 "BF16 output above) and produces a real, smaller K-quant."
             )
@@ -1168,6 +1234,18 @@ with gr.Blocks(title="Quant Convert GUI") as demo:
                     label="Input GGUF", placeholder="auto-filled from step 3, or paste any .gguf path",
                 )
                 llm_quant_type = gr.Dropdown(lcpp.QUANT_TYPE_CHOICES, value="Q4_K_M", label="Quant type")
+            with gr.Row():
+                llm_quantize_imatrix = gr.Textbox(
+                    label="Importance matrix (optional)",
+                    placeholder="auto-filled from step 4, or paste any imatrix.gguf path",
+                )
+                llm_quantize_tensor_types = gr.Textbox(
+                    label="Per-layer type overrides (optional, advanced)",
+                    placeholder="path to a tensor-type-file, e.g. lines like 'blk.0.attn_k.weight=Q8_0'",
+                    info="The real mechanism behind manual \"dynamic\" per-layer mixing - this app doesn't "
+                    "generate one automatically (Unsloth's own per-model choices aren't published), but you "
+                    "can supply your own.",
+                )
             llm_quantize_output_name = gr.Textbox(label="Output filename (optional)", placeholder="auto")
             llm_quantize_btn = gr.Button("Quantize")
 
@@ -1227,7 +1305,12 @@ with gr.Blocks(title="Quant Convert GUI") as demo:
                 "`convert_hf_to_gguf.py` / `llama-quantize` directly, instead of reimplementing any of it here. "
                 "Real K-quants (Q4_K_M, Q6_K, etc.) need `llama-quantize` compiled from source - that's an "
                 "optional, separate build step in that tab since it needs a C/C++ toolchain, not just a pip "
-                "install.\n\n"
+                "install. That tab also has a real **imatrix / \"dynamic\"-style calibrated quant** step "
+                "(`llama-imatrix` + `llama-quantize --imatrix`) - the same mechanism behind most \"imatrix\" "
+                "GGUF quants on Hugging Face and the one Unsloth's own Dynamic quants are built on, per their "
+                "docs. A small bundled calibration text makes it work out of the box; a manual per-layer type "
+                "override (`--tensor-type-file`) is also exposed for power users, since Unsloth's specific "
+                "per-model layer choices aren't published anywhere this app could just consume.\n\n"
                 "## What does \"txtfusion\" in a filename mean?\n"
                 "It's not a format — it's a **layer name**. `kroma-v0.3-txtfusion-edition-...` was converted "
                 "with ctq's `krea2` preset, whose high-precision keyword list literally includes `txtfusion` "
@@ -1527,15 +1610,29 @@ with gr.Blocks(title="Quant Convert GUI") as demo:
         outputs=[llm_log, llm_model_dir],
     )
 
-    def carry_over_to_quantize_input(result_path):
-        return result_path if result_path else gr.update()
+    def carry_over_result(result_path):
+        return (result_path if result_path else gr.update())
+
+    def carry_over_result_x2(result_path):
+        val = result_path if result_path else gr.update()
+        return val, val
 
     llm_convert_btn.click(
         run_llm_convert, inputs=[llm_model_dir, llm_convert_output_name, llm_outtype],
         outputs=[llm_log, llm_result_file],
-    ).then(carry_over_to_quantize_input, inputs=[llm_result_file], outputs=[llm_quantize_input])
+    ).then(
+        carry_over_result_x2, inputs=[llm_result_file], outputs=[llm_imatrix_model, llm_quantize_input],
+    )
+    llm_imatrix_btn.click(
+        run_llm_generate_imatrix, inputs=[llm_imatrix_model, llm_imatrix_calibration, llm_imatrix_output_name],
+        outputs=[llm_log, llm_result_file],
+    ).then(carry_over_result, inputs=[llm_result_file], outputs=[llm_quantize_imatrix])
     llm_quantize_btn.click(
-        run_llm_quantize, inputs=[llm_quantize_input, llm_quantize_output_name, llm_quant_type],
+        run_llm_quantize,
+        inputs=[
+            llm_quantize_input, llm_quantize_output_name, llm_quant_type,
+            llm_quantize_imatrix, llm_quantize_tensor_types,
+        ],
         outputs=[llm_log, llm_result_file],
     )
 
