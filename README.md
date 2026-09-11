@@ -17,6 +17,12 @@ two go through their own independent backends instead (`comfy_kitchen` and
 `gguf` respectively) — see [About "INT4 ConvRot"](#about-int4-convrot) and
 [About "GGUF"](#about-gguf) below.
 
+There's also a separate **LLM → GGUF** tab for converting text models
+(Gemma, Llama, Qwen, etc.) — a genuinely different pipeline built around a
+real [llama.cpp](https://github.com/ggerganov/llama.cpp) checkout rather
+than any of the above; see
+[About "LLM to GGUF"](#about-llm-to-gguf-gemma-llama-qwen-etc) below.
+
 ## Which format for your GPU
 
 FP8 and NVFP4 need specific tensor-core hardware; picking one your GPU
@@ -202,6 +208,50 @@ Verified end-to-end against a real GGUF round-trip (`gguf.GGUFReader`/
 per-tensor `GGMLQuantizationType`, and the packed shapes ComfyUI-GGUF's own
 loader validation expects.
 
+## About "LLM to GGUF" (Gemma, Llama, Qwen, etc.)
+
+This is a separate tab and a separate tool from everything above it.
+
+Everything above is for diffusion models. Text LLMs need a real, different
+pipeline: proper tokenizer/vocab conversion plus per-architecture
+hyperparameter mapping (attention head count, rope settings, etc.), which
+`quant_gui/gguf_backend.py` above doesn't attempt - that's exactly what
+[llama.cpp](https://github.com/ggerganov/llama.cpp) itself implements, in
+a `conversion/` package that's 90+ files and pinned to an exact
+`transformers` version as of this writing. There's no equivalent
+lightweight pip package, and reimplementing it here would mean re-chasing
+every new model release by hand.
+
+So the **LLM → GGUF** tab manages a real llama.cpp checkout instead
+(cloned into `llama.cpp/`, in its *own* venv so its pinned deps never touch
+this app's), and shells out to its actual tools:
+
+- **`convert_hf_to_gguf.py`** does the HF → GGUF step - real tokenizer
+  conversion, real per-architecture metadata, whatever llama.cpp supports
+  (Gemma included). Direct output is limited to F32/F16/BF16/Q8_0 (the
+  same pure-Python-quantizable types as the diffusion GGUF backend, for
+  the same reason).
+- **`llama-quantize`**, once built, produces real K-quants (Q4_K_M, Q6_K,
+  etc. - what most LLM GGUFs on Hugging Face actually are). Building it
+  needs a C/C++ toolchain and `cmake` already on your machine (Visual
+  Studio Build Tools on Windows, `build-essential` on Linux, Xcode command
+  line tools on Mac) - a bigger ask than any pip install this app has
+  needed so far, which is why it's a separate, optional step with its own
+  button, not bundled into setup automatically.
+- A **Hugging Face repo ID** downloads the *whole* model repo (config,
+  tokenizer, every safetensors shard) via `huggingface_hub.snapshot_download`
+  - unlike the Convert tab above, which only ever needs one file.
+
+Verified end-to-end against a real synthetic Llama-architecture model
+(tiny SentencePiece tokenizer + tiny safetensors weights, built with
+`transformers`/`sentencepiece` directly, since no real model was
+downloaded for this) run through the actual cloned `convert_hf_to_gguf.py`
+and a real compiled `llama-quantize` binary - correct tensor names/shapes,
+correct hyperparameters (context length, head counts, rope theta), correct
+tokenizer/special-token IDs, and a real Q4_K_M output file that
+`gguf.GGUFReader` reads back with the right architecture and per-tensor
+quant types.
+
 ## Install (automatic)
 
 **Windows:** double-click `install.bat` (or run it from a terminal). It
@@ -313,7 +363,8 @@ everyone else can ignore them.
 - `quant_gui/runner.py` — runs `ctq` as a subprocess and streams its output.
 - `quant_gui/env_check.py` — detects ctq/PyTorch/CUDA/GPU availability.
 - `quant_gui/gpu_profiles.py` — GPU-generation-to-format recommendations.
-- `quant_gui/hf.py` — downloads a single file from a Hugging Face URL.
+- `quant_gui/hf.py` — downloads a single file, or a whole repo (for LLMs),
+  from Hugging Face.
 - `quant_gui/filters.py` — the model-family presets ctq exposes (e.g.
   `--flux2`, `--wan`, `--krea2` for txtfusion/Krea2/Kroma-style models).
 - `quant_gui/size_estimate.py` — estimates output file size from the input
@@ -322,12 +373,15 @@ everyone else can ignore them.
   `comfy_kitchen`, independent of ctq (see [About "INT4 ConvRot"](#about-int4-convrot)).
 - `quant_gui/gguf_backend.py` — GGUF export via llama.cpp's `gguf` package,
   independent of ctq (see [About "GGUF"](#about-gguf)).
+- `quant_gui/llamacpp_backend.py` — manages a real llama.cpp checkout/venv
+  and shells out to its `convert_hf_to_gguf.py`/`llama-quantize` for LLMs
+  (see [About "LLM to GGUF"](#about-llm-to-gguf-gemma-llama-qwen-etc)).
 
 ## Sources
 
-Background research and reference implementations this app's INT4 ConvRot
-and GGUF backends are built on/verified against, since neither format goes
-through `ctq`:
+Background research and reference implementations this app's INT4 ConvRot,
+diffusion-GGUF, and LLM-GGUF backends are built on/verified against, since
+none of the three go through `ctq`:
 
 - [silveroxides/convert_to_quant](https://github.com/silveroxides/convert_to_quant) —
   the `ctq` CLI this app wraps for every `.safetensors` format
@@ -362,8 +416,16 @@ through `ctq`:
   actual pure-Python block-quantization implementation
   (`quant_gui/gguf_backend.py` calls `gguf.quants`/`gguf.GGUFWriter`
   directly).
+- [llama.cpp](https://github.com/ggerganov/llama.cpp) itself, specifically
+  its `convert_hf_to_gguf.py` and `conversion/` package (tokenizer
+  conversion, per-architecture hyperparameter mapping) and its
+  `tools/quantize` (`llama-quantize`, the real K-quant implementation) —
+  `quant_gui/llamacpp_backend.py` clones and shells out to these directly,
+  the same way the rest of this app shells out to `ctq`, rather than
+  reimplementing any of it.
 
 Every claim above about what's real vs. not (e.g. which GGUF quant types
-have pure-Python support, whether a package needs a GPU) was checked
-directly against these sources' own code, not assumed from their
-documentation alone.
+have pure-Python support, whether a package needs a GPU, whether K-quants
+need a compiled binary) was checked directly against these sources' own
+code - including a real `cmake` build of `llama-quantize` and a real
+`convert_hf_to_gguf.py` run - not assumed from their documentation alone.

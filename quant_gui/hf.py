@@ -68,6 +68,23 @@ def download(url: str, dest_dir: str, token: str | None = None, progress_cb=None
         return _plain_download(target, dest_dir, token, progress_cb)
 
 
+def download_repo(repo_id: str, dest_dir: str, token: str | None = None, revision: str = "main") -> str:
+    """Download a whole model repo (config, tokenizer, safetensors shards) -
+    needed for LLM -> GGUF conversion, which reads far more than one file.
+    Skips redundant/large weight formats (.bin, .onnx, etc.) since the repo
+    almost always also ships safetensors."""
+    from huggingface_hub import snapshot_download
+
+    Path(dest_dir).mkdir(parents=True, exist_ok=True)
+    return snapshot_download(
+        repo_id=repo_id,
+        revision=revision,
+        local_dir=dest_dir,
+        token=token,
+        ignore_patterns=["*.bin", "*.onnx", "*.msgpack", "*.h5", "*.pth", "*.ckpt", "*.gguf", "*.tflite", "original/*"],
+    )
+
+
 def _plain_download(target: HFTarget, dest_dir: str, token: str | None, progress_cb) -> str:
     import urllib.request
 

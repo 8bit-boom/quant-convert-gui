@@ -4,4 +4,7 @@ __pycache__/
 venv/
 downloads/
 converted/
+llm_models/
+llama.cpp/
 *.safetensors
+*.gguf

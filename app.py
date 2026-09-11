@@ -18,7 +18,8 @@ from quant_gui.cli_builder import ConvertOptions, OptionsError, build_args, form
 from quant_gui.env_check import check_environment, report_markdown
 from quant_gui.filters import preset_choices, preset_highprec_regex, preset_label, suggest_preset
 from quant_gui.gpu_profiles import GPU_PROFILE_BY_KEY, GPU_PROFILES, detect_profile_key
-from quant_gui.hf import HFUrlError, download as hf_download, parse_hf_url
+from quant_gui.hf import HFUrlError, download as hf_download, download_repo as hf_download_repo, parse_hf_url
+from quant_gui import llamacpp_backend as lcpp
 from quant_gui.gguf_backend import stream_gguf_conversion, stream_install as stream_gguf_install
 from quant_gui.gguf_backend import QUANT_TYPE_CHOICES as GGUF_QUANT_TYPE_CHOICES
 from quant_gui.gguf_backend import SUPPORTED_ARCH_NAMES as GGUF_SUPPORTED_ARCH_NAMES
@@ -31,6 +32,8 @@ from quant_gui.size_estimate import estimate_from_file, estimate_gguf_from_file,
 APP_DIR = Path(__file__).resolve().parent
 DOWNLOAD_DIR = APP_DIR / "downloads"
 OUTPUT_DIR = APP_DIR / "converted"
+LLAMACPP_DIR = lcpp.default_llamacpp_dir(APP_DIR)
+LLM_MODELS_DIR = APP_DIR / "llm_models"
 
 FORMAT_CHOICES = [
     ("INT8 — ConvRot (recommended, matches Kroma-Quant *-int8-convrot* files)", "int8_convrot"),
@@ -481,6 +484,166 @@ def run_gguf_convert(
             yield log, None, _progress_bar_html(1.0, "Failed")
 
 
+def llamacpp_status_markdown() -> str:
+    def ok(flag: bool) -> str:
+        return "✅" if flag else "❌"
+
+    cloned = lcpp.is_cloned(LLAMACPP_DIR)
+    venv_ready = lcpp.is_venv_ready(LLAMACPP_DIR)
+    quantize_built = lcpp.is_quantize_built(LLAMACPP_DIR)
+    return (
+        f"**llama.cpp cloned** — {ok(cloned)} `{LLAMACPP_DIR}`\n\n"
+        f"**Python deps installed** (transformers/sentencepiece/gguf, in their own venv) — {ok(venv_ready)}\n\n"
+        f"**llama-quantize built** (for real K-quants like Q4_K_M) — {ok(quantize_built)} "
+        + ("_optional - skip this if F16/BF16/Q8_0 is enough for you_" if not quantize_built else "")
+    )
+
+
+def run_llamacpp_setup_step(step: str, jobs: str):
+    """step is 'clone', 'venv', or 'quantize' - drives one of the three
+    setup buttons, all sharing the same log box/status refresh."""
+    log = ""
+    if step == "clone":
+        stream = lcpp.stream_clone_or_update(LLAMACPP_DIR)
+    elif step == "venv":
+        stream = lcpp.stream_setup_venv(LLAMACPP_DIR)
+    else:
+        try:
+            jobs_n = int(jobs) if (jobs or "").strip() else None
+        except ValueError:
+            jobs_n = None
+        stream = lcpp.stream_build_quantize(LLAMACPP_DIR, jobs=jobs_n)
+
+    for line in stream:
+        if line == "__OK__":
+            yield log, llamacpp_status_markdown()
+        elif line.startswith("__FAIL__"):
+            yield log, llamacpp_status_markdown()
+        else:
+            log += line
+            yield log, gr.update()
+
+
+def run_llm_download(source: str, repo_id: str, local_dir: str, token: str):
+    if source == "Local directory":
+        path = (local_dir or "").strip()
+        if not path or not Path(path).is_dir():
+            yield f"That doesn't look like a directory: {path}", gr.update()
+            return
+        yield f"Using local directory: {path}\n", path
+        return
+
+    repo_id = (repo_id or "").strip()
+    if not repo_id:
+        yield "Paste a Hugging Face repo ID first (e.g. google/gemma-3-4b-it).", gr.update()
+        return
+
+    import queue
+    import threading
+
+    q: "queue.Queue" = queue.Queue()
+    SENTINEL = object()
+
+    def worker():
+        try:
+            dest = str(LLM_MODELS_DIR / repo_id.replace("/", "__"))
+            local_path = hf_download_repo(repo_id, dest, token=(token or "").strip() or None)
+            q.put(("ok", local_path))
+        except Exception as exc:  # noqa: BLE001 - surfaced to the UI
+            q.put(("fail", str(exc)))
+        finally:
+            q.put(SENTINEL)
+
+    thread = threading.Thread(target=worker, daemon=True)
+    thread.start()
+
+    log = f"Downloading {repo_id} from Hugging Face (this can take a while for multi-GB models)...\n"
+    yield log, gr.update()
+    elapsed = 0
+    while True:
+        try:
+            item = q.get(timeout=3)
+        except queue.Empty:
+            elapsed += 3
+            yield log + f"\n({elapsed}s elapsed...)", gr.update()
+            continue
+        if item is SENTINEL:
+            break
+        kind, payload = item
+        if kind == "ok":
+            log += f"\n✅ Downloaded to {payload}\n"
+            yield log, payload
+        else:
+            log += f"\n❌ Download failed: {payload}\n"
+            yield log, gr.update()
+
+
+def run_llm_convert(model_dir: str, output_name: str, outtype: str):
+    model_dir = (model_dir or "").strip()
+    if not model_dir or not Path(model_dir).is_dir():
+        yield f"Pick a model directory first (download one above, or point at an existing local HF model folder).", None
+        return
+    if not lcpp.is_venv_ready(LLAMACPP_DIR):
+        yield "llama.cpp's Python environment isn't set up yet - see the Setup section above.", None
+        return
+
+    LLM_MODELS_DIR.mkdir(parents=True, exist_ok=True)
+    name = (output_name or "").strip()
+    if name:
+        output_path = str(OUTPUT_DIR / name) if not os.path.isabs(name) and os.sep not in name else name
+    else:
+        stem = Path(model_dir).name
+        output_path = str(OUTPUT_DIR / f"{stem}-{outtype}.gguf")
+
+    log = f"Converting {model_dir} to GGUF (outtype={outtype})\n  output: {output_path}\n\n"
+    yield log, None
+    result_path = None
+    for line in lcpp.stream_convert_to_gguf(LLAMACPP_DIR, model_dir, output_path, outtype=outtype):
+        if line == "__OK__":
+            result_path = output_path if Path(output_path).is_file() else None
+            log += f"\n✅ Conversion finished.\nOutput: {result_path or output_path}\n"
+            yield log, result_path
+        elif line.startswith("__FAIL__"):
+            log += f"\n❌ Conversion failed (see log above).\n"
+            yield log, None
+        else:
+            log += line
+            yield log, result_path
+
+
+def run_llm_quantize(input_gguf: str, output_name: str, quant_type: str):
+    input_gguf = (input_gguf or "").strip()
+    if not input_gguf or not Path(input_gguf).is_file():
+        yield f"Pick an input GGUF file first (the output of the conversion step above, or any existing .gguf file).", None
+        return
+    if not lcpp.is_quantize_built(LLAMACPP_DIR):
+        yield "llama-quantize isn't built yet - see the Setup section above.", None
+        return
+
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    name = (output_name or "").strip()
+    if name:
+        output_path = str(OUTPUT_DIR / name) if not os.path.isabs(name) and os.sep not in name else name
+    else:
+        stem = Path(input_gguf).stem
+        output_path = str(OUTPUT_DIR / f"{stem}-{quant_type}.gguf")
+
+    log = f"Quantizing {input_gguf} -> {quant_type}\n  output: {output_path}\n\n"
+    yield log, None
+    result_path = None
+    for line in lcpp.stream_quantize(LLAMACPP_DIR, input_gguf, output_path, quant_type):
+        if line == "__OK__":
+            result_path = output_path if Path(output_path).is_file() else None
+            log += f"\n✅ Quantization finished.\nOutput: {result_path or output_path}\n"
+            yield log, result_path
+        elif line.startswith("__FAIL__"):
+            log += f"\n❌ Quantization failed (see log above).\n"
+            yield log, None
+        else:
+            log += line
+            yield log, result_path
+
+
 def run_convert(
     input_local: str,
     input_hf: str,
@@ -622,7 +785,8 @@ with gr.Blocks(title="Quant Convert GUI") as demo:
         "formats (the same tool used to build the [Kroma-Quant](https://huggingface.co/silveroxides/Kroma-Quant) "
         "and PotatoForge/Kroma-INT8-Quants files), plus two independent backends — `comfy_kitchen` for INT4 and "
         "`gguf` for GGUF — for the formats ctq doesn't produce. Pick your GPU below and it'll steer you toward a "
-        "format your card can actually accelerate."
+        "format your card can actually accelerate. There's also a separate **LLM → GGUF** tab for text models "
+        "(Gemma, Llama, Qwen, etc.) — a different pipeline built around a real llama.cpp checkout."
     )
 
     with gr.Tabs():
@@ -945,6 +1109,76 @@ with gr.Blocks(title="Quant Convert GUI") as demo:
                 "pip install -U triton   # optional, speeds up INT8 kernels\n```"
             )
 
+        with gr.Tab("LLM → GGUF"):
+            gr.Markdown(
+                "Converts **text LLMs** (Gemma, Llama, Qwen, etc.) to GGUF - a completely separate pipeline "
+                "from the rest of this app. Diffusion models above go through ctq/comfy_kitchen/gguf directly; "
+                "LLMs need real tokenizer conversion and per-architecture hyperparameter mapping, which only "
+                "[llama.cpp](https://github.com/ggerganov/llama.cpp) itself implements well - so this tab "
+                "manages its own clone of llama.cpp (in its own Python environment, kept separate from this "
+                "app's) and runs its real `convert_hf_to_gguf.py` / `llama-quantize`, the same tools you'd run "
+                "by hand."
+            )
+
+            gr.Markdown("### 1. Setup (one-time)")
+            llamacpp_status = gr.Markdown(llamacpp_status_markdown())
+            with gr.Row():
+                llamacpp_clone_btn = gr.Button("Clone / update llama.cpp")
+                llamacpp_venv_btn = gr.Button("Install Python deps")
+                llamacpp_build_btn = gr.Button("Build llama-quantize (optional, for K-quants)")
+            llamacpp_build_jobs = gr.Textbox(
+                label="Build parallelism (optional)", placeholder="defaults to CPU core count",
+            )
+            llamacpp_refresh_btn = gr.Button("Re-check status")
+            llamacpp_log = gr.Textbox(label="Setup log", lines=12, interactive=False, autoscroll=True)
+
+            gr.Markdown(
+                "### 2. Get a model\n"
+                "Paste a Hugging Face repo ID (e.g. `google/gemma-3-4b-it`) to download the whole repo "
+                "(config, tokenizer, safetensors - not just one file, unlike the Convert tab above), or point "
+                "at a model folder already on disk."
+            )
+            llm_source = gr.Radio(["Hugging Face repo", "Local directory"], value="Hugging Face repo", label="Source")
+            with gr.Row():
+                llm_repo_id = gr.Textbox(label="Hugging Face repo ID", placeholder="google/gemma-3-4b-it")
+                llm_hf_token = gr.Textbox(label="HF access token (gated repos only)", type="password")
+            llm_local_dir = gr.Textbox(
+                label="Local model directory", placeholder="/path/to/model/folder", visible=False,
+            )
+            llm_download_btn = gr.Button("Download model")
+            llm_model_dir = gr.Textbox(label="Resolved model directory", interactive=False)
+
+            gr.Markdown("### 3. Convert to GGUF")
+            with gr.Row():
+                llm_outtype = gr.Dropdown(
+                    lcpp.DIRECT_OUTTYPE_CHOICES, value="auto", label="Output type",
+                    info="auto keeps the model's own dtype; q8_0 quantizes directly (pure Python, real). For "
+                    "K-quants (Q4_K_M etc.), convert to f16/bf16 here first, then quantize below.",
+                )
+                llm_convert_output_name = gr.Textbox(label="Output filename (optional)", placeholder="auto")
+            llm_convert_btn = gr.Button("Convert to GGUF", variant="primary")
+
+            gr.Markdown(
+                "### 4. Quantize to a K-quant (optional)\n"
+                "Needs **llama-quantize built** (step 1). Takes any GGUF file (typically this tab's own F16/"
+                "BF16 output above) and produces a real, smaller K-quant."
+            )
+            with gr.Row():
+                llm_quantize_input = gr.Textbox(
+                    label="Input GGUF", placeholder="auto-filled from step 3, or paste any .gguf path",
+                )
+                llm_quant_type = gr.Dropdown(lcpp.QUANT_TYPE_CHOICES, value="Q4_K_M", label="Quant type")
+            llm_quantize_output_name = gr.Textbox(label="Output filename (optional)", placeholder="auto")
+            llm_quantize_btn = gr.Button("Quantize")
+
+            with gr.Row():
+                with gr.Column():
+                    llm_log = gr.Textbox(
+                        label="Conversion log", lines=20, interactive=False, autoscroll=True, elem_id="llm-log-box",
+                    )
+                with gr.Column():
+                    llm_result_file = gr.File(label="Output file", interactive=False)
+
         with gr.Tab("About"):
             gr.Markdown(
                 "## What these formats mean\n"
@@ -985,6 +1219,15 @@ with gr.Blocks(title="Quant Convert GUI") as demo:
                 "**Target GPU** picker on the Convert tab exists to head that off. GGUF isn't in the table "
                 "above because its conversion runs in pure Python on any GPU or CPU — what matters instead is "
                 "whether ComfyUI-GGUF recognizes your model's architecture (see above).\n\n"
+                "## What about LLMs (Gemma, Llama, Qwen, etc.)?\n"
+                "That's the separate **LLM → GGUF** tab, not this one — everything above is for diffusion "
+                "models. Text LLMs need real tokenizer conversion and per-architecture hyperparameter mapping "
+                "that only [llama.cpp](https://github.com/ggerganov/llama.cpp) itself implements well, so that "
+                "tab manages its own llama.cpp checkout (in its own Python environment) and runs its real "
+                "`convert_hf_to_gguf.py` / `llama-quantize` directly, instead of reimplementing any of it here. "
+                "Real K-quants (Q4_K_M, Q6_K, etc.) need `llama-quantize` compiled from source - that's an "
+                "optional, separate build step in that tab since it needs a C/C++ toolchain, not just a pip "
+                "install.\n\n"
                 "## What does \"txtfusion\" in a filename mean?\n"
                 "It's not a format — it's a **layer name**. `kroma-v0.3-txtfusion-edition-...` was converted "
                 "with ctq's `krea2` preset, whose high-precision keyword list literally includes `txtfusion` "
@@ -1255,6 +1498,46 @@ with gr.Blocks(title="Quant Convert GUI") as demo:
     )
 
     refresh_btn.click(refresh_env, outputs=[env_md])
+
+    def run_llamacpp_clone():
+        yield from run_llamacpp_setup_step("clone", "")
+
+    def run_llamacpp_venv():
+        yield from run_llamacpp_setup_step("venv", "")
+
+    def run_llamacpp_build(jobs):
+        yield from run_llamacpp_setup_step("quantize", jobs)
+
+    llamacpp_clone_btn.click(run_llamacpp_clone, outputs=[llamacpp_log, llamacpp_status])
+    llamacpp_venv_btn.click(run_llamacpp_venv, outputs=[llamacpp_log, llamacpp_status])
+    llamacpp_build_btn.click(
+        run_llamacpp_build, inputs=[llamacpp_build_jobs], outputs=[llamacpp_log, llamacpp_status],
+    )
+    llamacpp_refresh_btn.click(llamacpp_status_markdown, outputs=[llamacpp_status])
+
+    def on_llm_source_change(s: str):
+        is_hf = s == "Hugging Face repo"
+        return gr.update(visible=is_hf), gr.update(visible=is_hf), gr.update(visible=not is_hf)
+
+    llm_source.change(
+        on_llm_source_change, inputs=[llm_source], outputs=[llm_repo_id, llm_hf_token, llm_local_dir],
+    )
+    llm_download_btn.click(
+        run_llm_download, inputs=[llm_source, llm_repo_id, llm_local_dir, llm_hf_token],
+        outputs=[llm_log, llm_model_dir],
+    )
+
+    def carry_over_to_quantize_input(result_path):
+        return result_path if result_path else gr.update()
+
+    llm_convert_btn.click(
+        run_llm_convert, inputs=[llm_model_dir, llm_convert_output_name, llm_outtype],
+        outputs=[llm_log, llm_result_file],
+    ).then(carry_over_to_quantize_input, inputs=[llm_result_file], outputs=[llm_quantize_input])
+    llm_quantize_btn.click(
+        run_llm_quantize, inputs=[llm_quantize_input, llm_quantize_output_name, llm_quant_type],
+        outputs=[llm_log, llm_result_file],
+    )
 
 
 if __name__ == "__main__":
