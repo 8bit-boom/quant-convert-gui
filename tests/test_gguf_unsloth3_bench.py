@@ -158,6 +158,51 @@ def test_bits_per_weight_f32_is_32(tmp_path):
     assert n == 256 * 64
 
 
+# ------------------------------------------------------- per-family tuning
+
+
+def test_model_info_reads_arch_and_largest_tensor(tmp_path):
+    rng = np.random.default_rng(5)
+    p = _write_gguf(
+        tmp_path / "m.gguf",
+        {
+            "big.weight": (rng.standard_normal((1024, 256), dtype=np.float32), "F32"),
+            "small.weight": (rng.standard_normal((64, 32), dtype=np.float32), "F32"),
+        },
+    )
+    info = gb.model_info(p)
+    assert info["n_params"] == 1024 * 256 + 64 * 32
+    assert info["largest_tensor_params"] == 1024 * 256
+    assert info["largest_tensor_name"] == "big.weight"
+    assert info["embed_fraction"] == pytest.approx(1024 * 256 / info["n_params"])
+
+
+def test_tune_sweep_scales_budget_past_embedding():
+    # Gemma-4-like: a 700M-param embedding in a 3B model.
+    tune = gb.tune_sweep(
+        {"arch": "gemma4", "largest_tensor_params": 700_000_000, "embed_fraction": 0.23}
+    )
+    assert tune["error_budget"] == 1_400_000_000  # 2x the embedding
+    assert tune["emb_q8_variants"] is True
+    assert tune["family"] == "gemma4"
+
+
+def test_tune_sweep_small_embedding_stays_default():
+    tune = gb.tune_sweep(
+        {"arch": "llama", "largest_tensor_params": 40_000_000, "embed_fraction": 0.02}
+    )
+    assert tune["error_budget"] == 300_000_000
+    assert tune["emb_q8_variants"] is False
+
+
+def test_tune_sweep_qwen35_arch_key():
+    tune = gb.tune_sweep(
+        {"arch": "qwen3_5", "largest_tensor_params": 380_000_000, "embed_fraction": 0.19}
+    )
+    assert tune["emb_q8_variants"] is True
+    assert tune["error_budget"] == 760_000_000
+
+
 # ------------------------------------------------- toolchain-gated benchmark
 
 

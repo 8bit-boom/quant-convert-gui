@@ -858,7 +858,6 @@ def run_llm_find_best(input_gguf: str, imatrix_file: str, quants: list[str] | No
                     out_dir=out_dir,
                     quantize_bin=lcpp._quantize_binary(LLAMACPP_DIR),
                     quants=quants,
-                    error_budget_params=300_000_000,
                     log=wlog,
                 )
                 state["imatrix"] = im
@@ -1875,8 +1874,9 @@ with gr.Blocks(title="Quant Convert GUI") as demo:
                 "**Find best quant** runs every ~3bpw candidate (Q3_K_L/M/S, IQ3_M/S/XS/XXS) through "
                 "llama-quantize on the input file — generating an imatrix first if none is given — and "
                 "measures size, time, and reconstruction error vs the input. The winner is pre-selected "
-                "in the Quant type dropdown; intermediate outputs are discarded. Weight-space error, not "
-                "perplexity — it ranks settings, it doesn't judge generation quality."
+                "in the Quant type dropdown; intermediate outputs are discarded. Big-vocab models (Gemma 4, "
+                "Qwen 3.5-3.8) automatically also get Q8_0 token-embedding variants. Weight-space error, "
+                "not perplexity — it ranks settings, it doesn't judge generation quality."
             )
 
             with gr.Row():
