@@ -27,7 +27,9 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from .checkpoints import Checkpoint, record_tensor, set_total
 from .filters import get_model_filters
+from .run_control import RunCancelled
 
 CONVROT_GROUPSIZE = 256
 INT4_QUANT_GROUPSIZE = 64  # fixed by comfy_kitchen's int4 tensor-core kernel
@@ -112,6 +114,8 @@ def convert_int4_mixed(
     fallback_int8: bool = True,
     device: str = "cpu",
     progress_cb=None,
+    control=None,
+    checkpoint: Checkpoint | None = None,
 ) -> Int4ConvertStats:
     """Convert a safetensors model to a mixed INT4 ConvRot / INT8 tensorwise
     / BF16 file, streaming one tensor at a time (never holds the whole model
@@ -124,6 +128,13 @@ def convert_int4_mixed(
     by `preset`'s exclusion list or `exclude_regex`, or that isn't a
     quantizable 2D float tensor, stays at its original precision (cast to
     BF16 if it was a wider float type).
+
+    Pause/resume: `control` (a run_control.RunControl) lets the UI pause the
+    loop between tensors or stop it entirely. `checkpoint` (a
+    checkpoints.Checkpoint) records every finished tensor to disk so a
+    stopped/failed/interrupted run can be continued later from exactly the
+    next tensor - pass the same checkpoint back in and already-processed
+    tensors are replayed from its shards instead of being recomputed.
     """
     if not is_available():
         raise Int4BackendError(
@@ -132,7 +143,7 @@ def convert_int4_mixed(
 
     import torch
     from safetensors import safe_open
-    from safetensors.torch import save_file
+    from safetensors.torch import load_file, save_file
 
     from comfy_kitchen.tensor import TensorWiseINT8Layout
     from comfy_kitchen.tensor.convrot_w4a4 import TensorCoreConvRotW4A4Layout
@@ -148,11 +159,45 @@ def convert_int4_mixed(
     with safe_open(input_path, framework="pt", device=device) as f:
         keys = list(f.keys())
         stats.total = len(keys)
+        if checkpoint is not None:
+            set_total(checkpoint, stats.total)
+
+        # Resume: replay every tensor the checkpoint already finished,
+        # straight from its shard files - no recomputation.
+        start = checkpoint.next_index if checkpoint is not None else 0
+        if start:
+            for i in range(start):
+                meta = checkpoint.tensor_meta(i)
+                out_tensors.update(load_file(str(checkpoint.shard_path(i, ".safetensors"))))
+                kind = meta.get("kind")
+                base_key = meta.get("key", "")
+                if kind == "int4":
+                    stats.int4_count += 1
+                    stats.int4_layer_names.append(base_key)
+                    if meta.get("quant"):
+                        quant_map["layers"][base_key] = meta["quant"]
+                elif kind == "int8":
+                    stats.int8_count += 1
+                    if meta.get("quant"):
+                        quant_map["layers"][base_key] = meta["quant"]
+                else:
+                    stats.kept_count += 1
+                if meta.get("skipped_shape"):
+                    stats.skipped_shape_count += 1
 
         for i, key in enumerate(keys):
+            if i < start:
+                continue
+
             tensor = f.get_tensor(key)
             if progress_cb:
                 progress_cb(i + 1, stats.total, key)
+
+            # Tensor-boundary cooperation point: a started tensor always
+            # finishes, so checkpoint state stays consistent.
+            if control is not None:
+                control.wait_if_paused()
+                control.raise_if_cancelled()
 
             base_key = key[: -len(".weight")] if key.endswith(".weight") else key
 
@@ -177,31 +222,51 @@ def convert_int4_mixed(
                 and tensor.shape[1] % INT4_QUANT_GROUPSIZE == 0
             )
 
-            if wants_int4 and not int4_shape_ok:
+            skipped_shape = wants_int4 and not int4_shape_ok
+            if skipped_shape:
                 stats.skipped_shape_count += 1
+
+            key_tensors: dict[str, "torch.Tensor"] = {}
+            quant_entry: dict | None = None
+            kind = "kept"
 
             if int4_shape_ok:
                 qdata, params = TensorCoreConvRotW4A4Layout.quantize(
                     tensor.float(), convrot_groupsize=CONVROT_GROUPSIZE, quant_group_size=INT4_QUANT_GROUPSIZE,
                 )
                 for suffix, t in TensorCoreConvRotW4A4Layout.state_dict_tensors(qdata, params).items():
-                    out_tensors[key + suffix] = t.cpu()
-                quant_map["layers"][base_key] = {
+                    key_tensors[key + suffix] = t.cpu()
+                quant_entry = {
                     "format": "convrot_w4a4",
                     "convrot_groupsize": CONVROT_GROUPSIZE,
                     "quant_group_size": INT4_QUANT_GROUPSIZE,
                 }
                 stats.int4_count += 1
                 stats.int4_layer_names.append(base_key)
+                kind = "int4"
             elif not excluded and is_quantizable_shape and fallback_int8:
                 qdata, params = TensorWiseINT8Layout.quantize(tensor.float(), per_channel=True)
                 for suffix, t in TensorWiseINT8Layout.state_dict_tensors(qdata, params).items():
-                    out_tensors[key + suffix] = t.cpu()
-                quant_map["layers"][base_key] = {"format": "int8_tensorwise"}
+                    key_tensors[key + suffix] = t.cpu()
+                quant_entry = {"format": "int8_tensorwise"}
                 stats.int8_count += 1
+                kind = "int8"
             else:
-                out_tensors[key] = tensor.to(torch.bfloat16) if tensor.dtype.is_floating_point else tensor.cpu()
+                key_tensors[key] = tensor.to(torch.bfloat16) if tensor.dtype.is_floating_point else tensor.cpu()
                 stats.kept_count += 1
+
+            out_tensors.update(key_tensors)
+            if quant_entry is not None:
+                quant_map["layers"][base_key] = quant_entry
+
+            if checkpoint is not None:
+                # Shard first, manifest second: the manifest never references
+                # a shard that isn't fully written.
+                save_file(key_tensors, str(checkpoint.shard_path(i, ".safetensors")))
+                record_tensor(
+                    checkpoint, i, base_key, kind=kind,
+                    quant=quant_entry, skipped_shape=skipped_shape,
+                )
 
     metadata = {"converted_by": "quant-convert-gui (INT4 ConvRot via comfy_kitchen)"}
     if quant_map["layers"]:
@@ -220,13 +285,17 @@ def stream_int4_conversion(
     exclude_regex: str | None = None,
     fallback_int8: bool = True,
     device: str = "cpu",
+    control=None,
+    checkpoint: Checkpoint | None = None,
 ):
     """Generator wrapper around convert_int4_mixed for UIs: runs the (blocking)
     conversion in a background thread and yields text/progress events as it
     goes, mirroring quant_gui.runner.stream_conversion's interface.
 
-    Yields either ("log", text) or ("progress", current, total, key), and
-    finally either ("ok", stats) or ("fail", error_message).
+    Yields ("progress", current, total, key) while running, then exactly one
+    of ("ok", stats) / ("cancelled", message) / ("fail", error_message).
+    "cancelled" means the user hit Stop & save - checkpoint shards for every
+    finished tensor are on disk and the run can be resumed.
     """
     import queue
     import threading
@@ -242,9 +311,11 @@ def stream_int4_conversion(
             stats = convert_int4_mixed(
                 input_path, output_path, int4_layers_regex,
                 preset=preset, exclude_regex=exclude_regex, fallback_int8=fallback_int8,
-                device=device, progress_cb=progress_cb,
+                device=device, progress_cb=progress_cb, control=control, checkpoint=checkpoint,
             )
             q.put(("ok", stats))
+        except RunCancelled:
+            q.put(("cancelled", "Stopped by user - progress saved to the checkpoint."))
         except Exception as exc:  # noqa: BLE001 - surfaced to the UI, not swallowed
             q.put(("fail", str(exc)))
         finally:

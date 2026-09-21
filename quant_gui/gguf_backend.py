@@ -27,7 +27,9 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from .checkpoints import Checkpoint, record_tensor, set_total
 from .filters import get_model_filters
+from .run_control import RunCancelled
 
 MAX_TENSOR_DIMS = 4
 MAX_TENSOR_NAME_LENGTH = 127
@@ -223,7 +225,19 @@ def convert_to_gguf(
     preset: str = "none",
     exclude_regex: str | None = None,
     progress_cb=None,
-) -> GGUFConvertStats:
+    control=None,
+    checkpoint: Checkpoint | None = None,
+):
+    """Quantize `input_path` into a GGUF file at `output_path`.
+
+    Pause/resume: `control` (run_control.RunControl) lets the UI pause
+    between tensors or stop the run; `checkpoint` (checkpoints.Checkpoint)
+    saves every finished tensor's packed array to disk so a stopped run
+    resumes from the next tensor without re-quantizing - already-finished
+    tensors are re-added to the writer straight from the checkpoint shards.
+    (Tensors skipped for having >4 dims aren't checkpointed - they're
+    deterministically re-skipped on resume.)
+    """
     if not is_available():
         raise GGUFBackendError(f"gguf isn't installed. Install it with:\n  {install_hint()}")
     if quant_type not in QUANT_TYPE_CHOICES:
@@ -234,6 +248,7 @@ def convert_to_gguf(
         )
 
     import gguf
+    import numpy as np
     import torch
     from gguf import quants
     from safetensors import safe_open
@@ -261,15 +276,48 @@ def convert_to_gguf(
         qtype = getattr(gguf.GGMLQuantizationType, quant_type)
 
         stats = GGUFConvertStats(total=len(keys), arch=arch.arch)
+        if checkpoint is not None:
+            set_total(checkpoint, stats.total)
         writer = gguf.GGUFWriter(path=None, arch=arch.arch)
         writer.add_quantization_version(gguf.GGML_QUANT_VERSION)
         file_type = getattr(gguf.LlamaFileType, f"MOSTLY_{quant_type}", None)
         if file_type is not None:
             writer.add_file_type(file_type)
 
+        # Resume: re-add every tensor the checkpoint already finished, from
+        # its packed-array shard - no re-quantization. Indices with no shard
+        # are the deterministically-skipped >4-dim tensors.
+        start = checkpoint.next_index if checkpoint is not None else 0
+        if start:
+            for i in range(start):
+                meta = checkpoint.tensors.get(str(i))
+                if meta is None:
+                    stats.skipped_high_dim_count += 1
+                    continue
+                packed = np.load(str(checkpoint.shard_path(i, ".npy")))
+                writer.add_tensor(
+                    meta["key"], packed, raw_dtype=gguf.GGMLQuantizationType[meta["qtype"]],
+                )
+                kind = meta.get("kind")
+                if kind == "f32":
+                    stats.f32_kept_count += 1
+                elif kind == "fallback_f16":
+                    stats.fallback_f16_count += 1
+                else:
+                    stats.quantized_count += 1
+
         for i, key in enumerate(keys):
+            if i < start:
+                continue
+
             if progress_cb:
                 progress_cb(i + 1, stats.total, key)
+
+            # Tensor-boundary cooperation point: a started tensor always
+            # finishes, so checkpoint state stays consistent.
+            if control is not None:
+                control.wait_if_paused()
+                control.raise_if_cancelled()
 
             tensor = f.get_tensor(key)
             n_dims = tensor.dim()
@@ -291,8 +339,10 @@ def convert_to_gguf(
             this_qtype = gguf.GGMLQuantizationType.F32 if force_f32 else qtype
             if force_f32:
                 stats.f32_kept_count += 1
+                kind = "f32"
             else:
                 stats.quantized_count += 1
+                kind = "quantized"
 
             # Match city96/ComfyUI-GGUF's own dtype handling exactly: bf16 and
             # fp8 have no native numpy dtype, so upcast before quantizing.
@@ -312,6 +362,13 @@ def convert_to_gguf(
                 if not force_f32:
                     stats.quantized_count -= 1
                     stats.fallback_f16_count += 1
+                    kind = "fallback_f16"
+
+            if checkpoint is not None:
+                # Shard first, manifest second: the manifest never references
+                # a shard that isn't fully written.
+                np.save(str(checkpoint.shard_path(i, ".npy")), packed)
+                record_tensor(checkpoint, i, key, qtype=this_qtype.name, kind=kind)
 
             writer.add_tensor(key, packed, raw_dtype=this_qtype)
 
@@ -330,11 +387,15 @@ def stream_gguf_conversion(
     quant_type: str,
     preset: str = "none",
     exclude_regex: str | None = None,
+    control=None,
+    checkpoint: Checkpoint | None = None,
 ):
     """Generator wrapper mirroring int4_backend.stream_int4_conversion's
     interface: runs the (blocking) conversion in a background thread,
-    yielding ("progress", current, total, key) then ("ok", stats) or
-    ("fail", error_message)."""
+    yielding ("progress", current, total, key) while running, then exactly
+    one of ("ok", stats) / ("cancelled", message) / ("fail", error_message).
+    "cancelled" means the user hit Stop & save - checkpoint shards for every
+    finished tensor are on disk and the run can be resumed."""
     import queue
     import threading
 
@@ -349,8 +410,11 @@ def stream_gguf_conversion(
             stats = convert_to_gguf(
                 input_path, output_path, quant_type,
                 preset=preset, exclude_regex=exclude_regex, progress_cb=progress_cb,
+                control=control, checkpoint=checkpoint,
             )
             q.put(("ok", stats))
+        except RunCancelled:
+            q.put(("cancelled", "Stopped by user - progress saved to the checkpoint."))
         except Exception as exc:  # noqa: BLE001 - surfaced to the UI, not swallowed
             q.put(("fail", str(exc)))
         finally:

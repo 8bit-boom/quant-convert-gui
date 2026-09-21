@@ -28,10 +28,14 @@ from quant_gui.int4_backend import stream_int4_conversion, stream_install as str
 from quant_gui.int4_backend import is_available as int4_is_available
 from quant_gui.runner import stream_conversion
 from quant_gui.size_estimate import estimate_from_file, estimate_gguf_from_file, estimate_int4_mixed_from_file
+from quant_gui import checkpoints as ckpt
+from quant_gui import run_control
+from quant_gui.run_control import RunControl
 
 APP_DIR = Path(__file__).resolve().parent
 DOWNLOAD_DIR = APP_DIR / "downloads"
 OUTPUT_DIR = APP_DIR / "converted"
+CHECKPOINT_ROOT = ckpt.checkpoint_root(APP_DIR)
 LLAMACPP_DIR = lcpp.default_llamacpp_dir(APP_DIR)
 LLM_MODELS_DIR = APP_DIR / "llm_models"
 
@@ -351,6 +355,8 @@ def run_int4_convert(
     int4_fallback_int8: bool,
     exclude_layers: str,
     device: str,
+    checkpoint=None,
+    save_progress: bool = False,
 ):
     input_path = (input_path or "").strip()
     if not input_path:
@@ -373,44 +379,88 @@ def run_int4_convert(
         output_path = str(OUTPUT_DIR / f"{stem}-int4-mixed.safetensors")
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
 
+    if checkpoint is None and save_progress:
+        checkpoint = ckpt.create_checkpoint(
+            CHECKPOINT_ROOT, "int4",
+            params={
+                "input_path": input_path, "output_path": output_path,
+                "output_name": output_name, "auto_output": auto_output,
+                "int4_layers_regex": int4_layers_regex, "preset": preset_label_value,
+                "exclude_layers": exclude_layers, "fallback_int8": int4_fallback_int8,
+                "device": device,
+            },
+            output_path=output_path,
+        )
+
     log = f"Converting (INT4 ConvRot via comfy_kitchen, device={device or 'cpu'})\n"
     log += f"  input:  {input_path}\n  output: {output_path}\n"
     log += f"  INT4 layers regex: {int4_layers_regex or '(none — no layers go INT4)'}\n"
     log += f"  preset: {preset}\n\n"
+    if checkpoint is not None and checkpoint.completed_count:
+        log += (
+            f"⏯ Resuming: {checkpoint.completed_count}/{checkpoint.total} tensors already done "
+            f"- replaying them from the checkpoint, recomputing the rest.\n\n"
+        )
+    elif checkpoint is not None:
+        log += "💾 Resumable progress is being saved - you can Stop & resume this run at any point.\n\n"
     yield log, None, _progress_bar_html(0, "Starting INT4 conversion...")
 
-    result_path = None
-    for item in stream_int4_conversion(
-        input_path, output_path, (int4_layers_regex or "").strip() or None,
-        preset=preset, exclude_regex=(exclude_layers or "").strip() or None,
-        fallback_int8=int4_fallback_int8, device=(device or "cpu").strip() or "cpu",
-    ):
-        kind = item[0]
-        if kind == "progress":
-            _, current, total, key = item
-            bar = _progress_bar_html(current / total if total else 0, f"{current}/{total}: {key}")
-            log += f"({current}/{total}) {key}\n"
-            yield log, result_path, bar
-        elif kind == "ok":
-            stats = item[1]
-            result_path = output_path if Path(output_path).is_file() else None
-            log += (
-                f"\n✅ Conversion finished.\n"
-                f"  {stats.int4_count} layer(s) → INT4 ConvRot\n"
-                f"  {stats.int8_count} layer(s) → INT8 tensorwise (fallback)\n"
-                f"  {stats.kept_count} layer(s) kept at original/BF16 precision\n"
-            )
-            if stats.skipped_shape_count:
+    control = RunControl()
+    run_control.register(control)
+    try:
+        result_path = None
+        for item in stream_int4_conversion(
+            input_path, output_path, (int4_layers_regex or "").strip() or None,
+            preset=preset, exclude_regex=(exclude_layers or "").strip() or None,
+            fallback_int8=int4_fallback_int8, device=(device or "cpu").strip() or "cpu",
+            control=control, checkpoint=checkpoint,
+        ):
+            kind = item[0]
+            if kind == "progress":
+                _, current, total, key = item
+                bar = _progress_bar_html(current / total if total else 0, f"{current}/{total}: {key}")
+                log += f"({current}/{total}) {key}\n"
+                yield log, result_path, bar
+            elif kind == "ok":
+                stats = item[1]
+                result_path = output_path if Path(output_path).is_file() else None
                 log += (
-                    f"  ⚠️ {stats.skipped_shape_count} layer(s) matched the INT4 regex but their shape isn't "
-                    f"divisible by 256/64, so they fell back to INT8 instead.\n"
+                    f"\n✅ Conversion finished.\n"
+                    f"  {stats.int4_count} layer(s) → INT4 ConvRot\n"
+                    f"  {stats.int8_count} layer(s) → INT8 tensorwise (fallback)\n"
+                    f"  {stats.kept_count} layer(s) kept at original/BF16 precision\n"
                 )
-            if result_path:
-                log += f"Output: {result_path}\n"
-            yield log, result_path, _progress_bar_html(1.0, "Done")
-        elif kind == "fail":
-            log += f"\n❌ Conversion failed: {item[1]}\n"
-            yield log, None, _progress_bar_html(1.0, "Failed")
+                if stats.skipped_shape_count:
+                    log += (
+                        f"  ⚠️ {stats.skipped_shape_count} layer(s) matched the INT4 regex but their shape isn't "
+                        f"divisible by 256/64, so they fell back to INT8 instead.\n"
+                    )
+                if result_path:
+                    log += f"Output: {result_path}\n"
+                if checkpoint is not None:
+                    # The run completed - the full output file exists, so the
+                    # per-tensor shards are dead weight; clean them up.
+                    ckpt.delete_checkpoint(checkpoint.path.parent, checkpoint.id)
+                yield log, result_path, _progress_bar_html(1.0, "Done")
+            elif kind == "cancelled":
+                done = checkpoint.completed_count if checkpoint is not None else 0
+                total = checkpoint.total if checkpoint is not None else 0
+                frac = done / total if total else 0
+                log += (
+                    f"\n⏹ Stopped - progress saved ({done}/{total} tensors).\n"
+                    f"Resume it any time from the 'Resume a saved run' list below (even after closing the app).\n"
+                )
+                yield log, None, _progress_bar_html(frac, f"Paused at {done}/{total} - resume from checkpoint")
+            elif kind == "fail":
+                log += f"\n❌ Conversion failed: {item[1]}\n"
+                if checkpoint is not None and checkpoint.completed_count:
+                    log += (
+                        f"💡 {checkpoint.completed_count}/{checkpoint.total} finished tensors are in the "
+                        f"checkpoint - you can resume instead of starting over.\n"
+                    )
+                yield log, None, _progress_bar_html(1.0, "Failed")
+    finally:
+        run_control.register(None)
 
 
 def run_gguf_convert(
@@ -420,6 +470,8 @@ def run_gguf_convert(
     preset_label_value: str,
     gguf_quant_type: str,
     exclude_layers: str,
+    checkpoint=None,
+    save_progress: bool = False,
 ):
     input_path = (input_path or "").strip()
     if not input_path:
@@ -442,46 +494,87 @@ def run_gguf_convert(
         output_path = str(OUTPUT_DIR / f"{stem}-{gguf_quant_type}.gguf")
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
 
+    if checkpoint is None and save_progress:
+        checkpoint = ckpt.create_checkpoint(
+            CHECKPOINT_ROOT, "gguf",
+            params={
+                "input_path": input_path, "output_path": output_path,
+                "output_name": output_name, "auto_output": auto_output,
+                "quant_type": gguf_quant_type, "preset": preset_label_value,
+                "exclude_layers": exclude_layers,
+            },
+            output_path=output_path,
+        )
+
     log = f"Converting to GGUF ({gguf_quant_type} via the gguf package)\n"
     log += f"  input:  {input_path}\n  output: {output_path}\n"
     log += f"  preset: {preset}\n\n"
+    if checkpoint is not None and checkpoint.completed_count:
+        log += (
+            f"⏯ Resuming: {checkpoint.completed_count}/{checkpoint.total} tensors already done "
+            f"- reusing their packed data from the checkpoint, quantizing the rest.\n\n"
+        )
+    elif checkpoint is not None:
+        log += "💾 Resumable progress is being saved - you can Stop & resume this run at any point.\n\n"
     yield log, None, _progress_bar_html(0, "Starting GGUF conversion...")
 
-    result_path = None
-    for item in stream_gguf_conversion(
-        input_path, output_path, gguf_quant_type,
-        preset=preset, exclude_regex=(exclude_layers or "").strip() or None,
-    ):
-        kind = item[0]
-        if kind == "progress":
-            _, current, total, key = item
-            bar = _progress_bar_html(current / total if total else 0, f"{current}/{total}: {key}")
-            log += f"({current}/{total}) {key}\n"
-            yield log, result_path, bar
-        elif kind == "ok":
-            stats = item[1]
-            result_path = output_path if Path(output_path).is_file() else None
-            log += (
-                f"\n✅ Conversion finished. Detected architecture: {stats.arch}\n"
-                f"  {stats.quantized_count} layer(s) → {gguf_quant_type}\n"
-                f"  {stats.f32_kept_count} layer(s) kept F32 (1D / tiny / precision-sensitive)\n"
-            )
-            if stats.fallback_f16_count:
+    control = RunControl()
+    run_control.register(control)
+    try:
+        result_path = None
+        for item in stream_gguf_conversion(
+            input_path, output_path, gguf_quant_type,
+            preset=preset, exclude_regex=(exclude_layers or "").strip() or None,
+            control=control, checkpoint=checkpoint,
+        ):
+            kind = item[0]
+            if kind == "progress":
+                _, current, total, key = item
+                bar = _progress_bar_html(current / total if total else 0, f"{current}/{total}: {key}")
+                log += f"({current}/{total}) {key}\n"
+                yield log, result_path, bar
+            elif kind == "ok":
+                stats = item[1]
+                result_path = output_path if Path(output_path).is_file() else None
                 log += (
-                    f"  ⚠️ {stats.fallback_f16_count} layer(s) had a shape not divisible by 32 and fell "
-                    f"back to F16 instead of {gguf_quant_type}.\n"
+                    f"\n✅ Conversion finished. Detected architecture: {stats.arch}\n"
+                    f"  {stats.quantized_count} layer(s) → {gguf_quant_type}\n"
+                    f"  {stats.f32_kept_count} layer(s) kept F32 (1D / tiny / precision-sensitive)\n"
                 )
-            if stats.skipped_high_dim_count:
+                if stats.fallback_f16_count:
+                    log += (
+                        f"  ⚠️ {stats.fallback_f16_count} layer(s) had a shape not divisible by 32 and fell "
+                        f"back to F16 instead of {gguf_quant_type}.\n"
+                    )
+                if stats.skipped_high_dim_count:
+                    log += (
+                        f"  ⚠️ {stats.skipped_high_dim_count} tensor(s) with more than 4 dimensions were skipped "
+                        "entirely - GGUF can't represent them (see ComfyUI-GGUF's fix_5d_tensors.py).\n"
+                    )
+                if result_path:
+                    log += f"Output: {result_path}\n"
+                if checkpoint is not None:
+                    ckpt.delete_checkpoint(checkpoint.path.parent, checkpoint.id)
+                yield log, result_path, _progress_bar_html(1.0, "Done")
+            elif kind == "cancelled":
+                done = checkpoint.completed_count if checkpoint is not None else 0
+                total = checkpoint.total if checkpoint is not None else 0
+                frac = done / total if total else 0
                 log += (
-                    f"  ⚠️ {stats.skipped_high_dim_count} tensor(s) with more than 4 dimensions were skipped "
-                    "entirely - GGUF can't represent them (see ComfyUI-GGUF's fix_5d_tensors.py).\n"
+                    f"\n⏹ Stopped - progress saved ({done}/{total} tensors).\n"
+                    f"Resume it any time from the 'Resume a saved run' list below (even after closing the app).\n"
                 )
-            if result_path:
-                log += f"Output: {result_path}\n"
-            yield log, result_path, _progress_bar_html(1.0, "Done")
-        elif kind == "fail":
-            log += f"\n❌ Conversion failed: {item[1]}\n"
-            yield log, None, _progress_bar_html(1.0, "Failed")
+                yield log, None, _progress_bar_html(frac, f"Paused at {done}/{total} - resume from checkpoint")
+            elif kind == "fail":
+                log += f"\n❌ Conversion failed: {item[1]}\n"
+                if checkpoint is not None and checkpoint.completed_count:
+                    log += (
+                        f"💡 {checkpoint.completed_count}/{checkpoint.total} finished tensors are in the "
+                        f"checkpoint - you can resume instead of starting over.\n"
+                    )
+                yield log, None, _progress_bar_html(1.0, "Failed")
+    finally:
+        run_control.register(None)
 
 
 def llamacpp_status_markdown() -> str:
@@ -726,6 +819,7 @@ def run_convert(
     int4_layers_regex: str,
     int4_fallback_int8: bool,
     gguf_quant_type: str,
+    save_progress: bool,
 ):
     input_path = (input_local or "").strip() if source == "Local file path" else (input_hf or "").strip()
 
@@ -733,12 +827,14 @@ def run_convert(
         yield from run_int4_convert(
             input_path, output_name, auto_output, preset_label_value,
             int4_layers_regex, int4_fallback_int8, exclude_layers, device,
+            save_progress=save_progress,
         )
         return
 
     if fmt == "gguf":
         yield from run_gguf_convert(
             input_path, output_name, auto_output, preset_label_value, gguf_quant_type, exclude_layers,
+            save_progress=save_progress,
         )
         return
 
@@ -778,43 +874,198 @@ def run_convert(
     # "(2/6) Skipping tensor: blocks.0.firs.weight (Reason: krea2 skip)".
     tensor_progress_re = re.compile(r"\((\d+)/(\d+)\)\s*(Processing|Skipping)")
 
-    log = ""
-    result_path = None
-    bar = _progress_bar_html(0, "Starting ctq...")
-    for chunk in stream_conversion(args, python_executable=((python_exe or "").strip() or None)):
-        if chunk == "__CTQ_OK__":
-            found = opts.output_path
-            if not found:
-                m = re.search(r"Saved to[:\s]+(\S+\.safetensors)", log, re.IGNORECASE)
-                found = m.group(1) if m else None
-            result_path = found if found and Path(found).is_file() else None
-            log += "\n✅ Conversion finished.\n"
-            if result_path:
-                log += f"Output: {result_path}\n"
-            elif found:
-                log += f"Output (reported, not found on disk yet): {found}\n"
-            yield log, result_path, _progress_bar_html(1.0, "Done")
-        elif chunk.startswith("__CTQ_FAIL__"):
-            code = chunk.split(":", 1)[-1]
-            log += f"\n❌ ctq exited with code {code}.\n"
-            yield log, None, _progress_bar_html(1.0, "Failed")
-        else:
-            log += chunk
-            m = tensor_progress_re.search(chunk)
-            if m:
-                current, total, action = int(m.group(1)), int(m.group(2)), m.group(3)
-                layer = ""
-                if ":" in chunk:
-                    tail = chunk.split(":", 1)[-1].strip()
-                    layer = tail.split(" (")[0].strip()
-                if total:
-                    desc = f"{action} {current}/{total}: {layer}".rstrip(": ")
-                    bar = _progress_bar_html(current / total, desc)
-            yield log, result_path, bar
+    control = RunControl()
+    run_control.register(control)
+    try:
+        log = ""
+        result_path = None
+        bar = _progress_bar_html(0, "Starting ctq...")
+        for chunk in stream_conversion(args, python_executable=((python_exe or "").strip() or None), control=control):
+            if chunk == "__CTQ_OK__":
+                found = opts.output_path
+                if not found:
+                    m = re.search(r"Saved to[:\s]+(\S+\.safetensors)", log, re.IGNORECASE)
+                    found = m.group(1) if m else None
+                result_path = found if found and Path(found).is_file() else None
+                log += "\n✅ Conversion finished.\n"
+                if result_path:
+                    log += f"Output: {result_path}\n"
+                elif found:
+                    log += f"Output (reported, not found on disk yet): {found}\n"
+                yield log, result_path, _progress_bar_html(1.0, "Done")
+            elif chunk == "__CTQ_CANCELLED__":
+                if save_progress:
+                    ckpt.create_checkpoint(
+                        CHECKPOINT_ROOT, "ctq",
+                        params={
+                            "input_path": input_path,
+                            "args": args,
+                            "command": format_command(opts),
+                            "python_exe": (python_exe or "").strip(),
+                        },
+                        output_path=opts.output_path or "",
+                    )
+                    log += (
+                        "\n⏹ Stopped. A session snapshot was saved - 'Resume from checkpoint' below "
+                        "relaunches this exact conversion with one click.\n"
+                        "(ctq itself keeps no partial state, so resuming it restarts from the beginning.)\n"
+                    )
+                else:
+                    log += (
+                        "\n⏹ Stopped by user. ctq keeps no partial state, so nothing is resumable - "
+                        "re-run the conversion when ready.\n"
+                    )
+                yield log, None, bar
+            elif chunk.startswith("__CTQ_FAIL__"):
+                code = chunk.split(":", 1)[-1]
+                log += f"\n❌ ctq exited with code {code}.\n"
+                yield log, None, _progress_bar_html(1.0, "Failed")
+            else:
+                log += chunk
+                m = tensor_progress_re.search(chunk)
+                if m:
+                    current, total, action = int(m.group(1)), int(m.group(2)), m.group(3)
+                    layer = ""
+                    if ":" in chunk:
+                        tail = chunk.split(":", 1)[-1].strip()
+                        layer = tail.split(" (")[0].strip()
+                    if total:
+                        desc = f"{action} {current}/{total}: {layer}".rstrip(": ")
+                        bar = _progress_bar_html(current / total, desc)
+                yield log, result_path, bar
+    finally:
+        run_control.register(None)
 
 
 def refresh_env():
     return report_markdown(check_environment())
+
+
+def resume_ctq(cp):
+    """Relaunch a stopped ctq conversion from its saved session snapshot.
+
+    ctq is an opaque subprocess with no mid-run resume of its own, so this
+    restarts the conversion with the exact argument list the snapshot saved -
+    the value is not re-entering every setting by hand.
+    """
+    args = list(cp.params.get("args") or [])
+    if not args:
+        yield "That ctq snapshot has no stored command - can't resume.", None, ""
+        return
+
+    log = "Resuming ctq run from a session snapshot.\n"
+    log += f"  command: {cp.params.get('command') or ' '.join(args)}\n"
+    log += "  (ctq can't continue mid-conversion - this restarts the run with the exact saved settings.)\n\n"
+    yield log, None, _progress_bar_html(0, "Restarting ctq from snapshot...")
+    # Matches the same "(12/264) Processing (INT8): ..." lines as run_convert.
+    tensor_progress_re = re.compile(r"\((\d+)/(\d+)\)\s*(Processing|Skipping)")
+
+    control = RunControl()
+    run_control.register(control)
+    try:
+        result_path = None
+        bar = _progress_bar_html(0, "Starting ctq...")
+        for chunk in stream_conversion(
+            args, python_executable=(cp.params.get("python_exe") or None), control=control,
+        ):
+            if chunk == "__CTQ_OK__":
+                found = cp.output_path
+                if not found:
+                    m = re.search(r"Saved to[:\s]+(\S+\.safetensors)", log, re.IGNORECASE)
+                    found = m.group(1) if m else None
+                result_path = found if found and Path(found).is_file() else None
+                log += "\n✅ Conversion finished.\n"
+                if result_path:
+                    log += f"Output: {result_path}\n"
+                ckpt.delete_checkpoint(CHECKPOINT_ROOT, cp.id)
+                yield log, result_path, _progress_bar_html(1.0, "Done")
+            elif chunk == "__CTQ_CANCELLED__":
+                log += "\n⏹ Stopped again - the session snapshot is kept; resume it whenever.\n"
+                yield log, None, bar
+            elif chunk.startswith("__CTQ_FAIL__"):
+                code = chunk.split(":", 1)[-1]
+                log += f"\n❌ ctq exited with code {code}.\n"
+                yield log, None, _progress_bar_html(1.0, "Failed")
+            else:
+                log += chunk
+                m = tensor_progress_re.search(chunk)
+                if m:
+                    current, total, action = int(m.group(1)), int(m.group(2)), m.group(3)
+                    layer = ""
+                    if ":" in chunk:
+                        tail = chunk.split(":", 1)[-1].strip()
+                        layer = tail.split(" (")[0].strip()
+                    if total:
+                        desc = f"{action} {current}/{total}: {layer}".rstrip(": ")
+                        bar = _progress_bar_html(current / total, desc)
+                yield log, result_path, bar
+    finally:
+        run_control.register(None)
+
+
+def run_resume(checkpoint_id: str):
+    checkpoint_id = (checkpoint_id or "").strip()
+    if not checkpoint_id:
+        yield "Pick a saved checkpoint from the list first.", None, ""
+        return
+    try:
+        cp = ckpt.load_checkpoint(CHECKPOINT_ROOT, checkpoint_id)
+    except Exception as exc:  # noqa: BLE001 - surfaced to the UI
+        yield f"Couldn't read that checkpoint: {exc}", None, ""
+        return
+
+    if cp.finished:
+        yield "That checkpoint is already finished - its output file was written. Nothing to resume.", None, ""
+        return
+
+    if cp.backend == "int4":
+        p = cp.params
+        yield from run_int4_convert(
+            p.get("input_path", ""), p.get("output_name", ""), bool(p.get("auto_output", True)),
+            p.get("preset", ""), p.get("int4_layers_regex", ""), bool(p.get("fallback_int8", True)),
+            p.get("exclude_layers", ""), p.get("device", "cpu"), checkpoint=cp,
+        )
+        return
+    if cp.backend == "gguf":
+        p = cp.params
+        yield from run_gguf_convert(
+            p.get("input_path", ""), p.get("output_name", ""), bool(p.get("auto_output", True)),
+            p.get("preset", ""), p.get("quant_type", "Q8_0"), p.get("exclude_layers", ""),
+            checkpoint=cp,
+        )
+        return
+    if cp.backend == "ctq":
+        yield from resume_ctq(cp)
+        return
+    yield f"Unknown checkpoint type {cp.backend!r} - can't resume.", None, ""
+
+
+def on_pause_click():
+    ctl = run_control.current()
+    if ctl is None:
+        return gr.update(value="⏸ Pause / ▶ Resume"), "No conversion is running."
+    if ctl.toggle_pause():
+        return gr.update(value="▶ Resume"), "⏸ Paused (the current tensor finishes first). Click Resume to continue."
+    return gr.update(value="⏸ Pause / ▶ Resume"), "▶ Running."
+
+
+def on_stop_click():
+    ctl = run_control.current()
+    if ctl is None:
+        return gr.update(value="⏸ Pause / ▶ Resume"), "No conversion is running."
+    ctl.cancel()
+    return (
+        gr.update(value="⏸ Pause / ▶ Resume"),
+        "⏹ Stopping after the current tensor - progress is being saved...",
+    )
+
+
+def checkpoint_choices() -> list[tuple[str, str]]:
+    return [(ckpt.summary(cp), cp.id) for cp in ckpt.list_checkpoints(CHECKPOINT_ROOT)]
+
+
+def refresh_checkpoint_dd():
+    return gr.update(choices=checkpoint_choices(), value=None)
 
 
 CSS = """
@@ -1135,6 +1386,28 @@ with gr.Blocks(title="Quant Convert GUI") as demo:
                     estimate_md = gr.Markdown()
 
                     convert_btn = gr.Button("Convert", elem_id="convert-btn", variant="primary")
+
+                    save_progress = gr.Checkbox(
+                        value=True,
+                        label="Save resumable progress (Stop & resume later)",
+                        info="Writes per-tensor checkpoints while converting (some extra disk I/O). "
+                             "Pause/Resume works either way; without this, a stopped run can't be continued.",
+                    )
+                    with gr.Row():
+                        pause_btn = gr.Button("⏸ Pause / ▶ Resume")
+                        stop_btn = gr.Button("⏹ Stop & save progress")
+                    run_status_md = gr.Markdown()
+
+                    gr.Markdown(
+                        "#### Resume a saved run\n"
+                        "Conversions stopped mid-way (or interrupted) with saved progress show up here - "
+                        "even after closing and reopening the app. Pick one and it continues from exactly "
+                        "the tensor where it stopped."
+                    )
+                    checkpoint_dd = gr.Dropdown(label="Saved checkpoints", choices=[], interactive=True)
+                    with gr.Row():
+                        resume_btn = gr.Button("Resume from checkpoint", variant="primary")
+                        delete_checkpoint_btn = gr.Button("Delete selected")
 
                 with gr.Column(scale=2):
                     convert_progress = gr.HTML(value="")
@@ -1463,6 +1736,7 @@ with gr.Blocks(title="Quant Convert GUI") as demo:
     )
     refresh_local_models_btn.click(refresh_local_models, outputs=[local_models_dd])
     demo.load(refresh_local_models, outputs=[local_models_dd])
+    demo.load(refresh_checkpoint_dd, outputs=[checkpoint_dd])
 
     download_btn.click(do_hf_download, inputs=[input_hf_url, hf_token], outputs=[input_hf_local, download_status]).then(
         on_input_resolved, inputs=[input_hf_local, input_hf_url, preset_dd], outputs=[resolved_hint, preset_dd]
@@ -1571,13 +1845,28 @@ with gr.Blocks(title="Quant Convert GUI") as demo:
             custom_convrot, custom_convrot_group_size, custom_simple, fallback, fallback_simple,
             device, output_dtype, verbose,
             calib_samples, optimizer, num_iter, manual_seed, python_exe,
-            int4_layers_regex, int4_fallback_int8, gguf_quant_type,
+            int4_layers_regex, int4_fallback_int8, gguf_quant_type, save_progress,
         ],
         outputs=[log_box, result_file, convert_progress],
         # We render our own bar into convert_progress; gr.Progress()'s built-in
         # overlay otherwise blankets *every* output of this event (log_box and
         # result_file included) for the whole run and can get stuck once streaming ends.
         show_progress="hidden",
+    )
+
+    pause_btn.click(on_pause_click, outputs=[pause_btn, run_status_md])
+    stop_btn.click(on_stop_click, outputs=[pause_btn, run_status_md])
+
+    def on_delete_checkpoint(checkpoint_id):
+        if (checkpoint_id or "").strip():
+            ckpt.delete_checkpoint(CHECKPOINT_ROOT, checkpoint_id.strip())
+        return refresh_checkpoint_dd(), "Deleted."
+
+    resume_btn.click(
+        run_resume, inputs=[checkpoint_dd], outputs=[log_box, result_file, convert_progress],
+    ).then(refresh_checkpoint_dd, outputs=[checkpoint_dd])
+    delete_checkpoint_btn.click(
+        on_delete_checkpoint, inputs=[checkpoint_dd], outputs=[checkpoint_dd, run_status_md]
     )
 
     refresh_btn.click(refresh_env, outputs=[env_md])
@@ -1640,6 +1929,7 @@ with gr.Blocks(title="Quant Convert GUI") as demo:
 if __name__ == "__main__":
     DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    CHECKPOINT_ROOT.mkdir(parents=True, exist_ok=True)
     demo.queue().launch(
         server_name=os.environ.get("QUANT_GUI_HOST", "127.0.0.1"),
         server_port=int(os.environ.get("QUANT_GUI_PORT", "7860")),

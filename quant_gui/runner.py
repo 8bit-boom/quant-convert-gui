@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import importlib.util
+import os
 import shutil
+import signal
 import subprocess
 import sys
 from collections.abc import Iterator
@@ -50,12 +52,101 @@ def resolve_command(args: list[str], python_executable: str | None = None) -> li
     return [py, "-c", _INLINE_ENTRYPOINT, *args]
 
 
-def stream_conversion(args: list[str], python_executable: str | None = None) -> Iterator[str]:
+def _suspend_process(pid: int) -> None:
+    """Freeze every thread of the process (true pause, no state lost).
+
+    POSIX: SIGSTOP. Windows has no signal equivalent, so enumerate the
+    process's threads and SuspendThread() each one via ctypes.
+    Raises OSError if suspension isn't possible on this platform.
+    """
+    if os.name == "posix":
+        os.kill(pid, signal.SIGSTOP)
+        return
+    if os.name == "nt":
+        _windows_suspend(pid, suspend=True)
+        return
+    raise OSError(f"process suspension not supported on {os.name}")
+
+
+def _resume_process(pid: int) -> None:
+    if os.name == "posix":
+        os.kill(pid, signal.SIGCONT)
+        return
+    if os.name == "nt":
+        _windows_suspend(pid, suspend=False)
+        return
+    raise OSError(f"process suspension not supported on {os.name}")
+
+
+def _windows_suspend(pid: int, suspend: bool) -> None:
+    import ctypes
+    from ctypes import wintypes
+
+    TH32CS_SNAPTHREAD = 0x00000004
+    THREAD_SUSPEND_RESUME = 0x0002
+    INVALID_HANDLE_VALUE = wintypes.HANDLE(-1).value
+
+    class THREADENTRY32(ctypes.Structure):
+        _fields_ = [
+            ("dwSize", wintypes.DWORD),
+            ("cntUsage", wintypes.DWORD),
+            ("th32ThreadID", wintypes.DWORD),
+            ("th32OwnerProcessID", wintypes.DWORD),
+            ("tpBasePri", wintypes.LONG),
+            ("tpDeltaPri", wintypes.LONG),
+            ("dwFlags", wintypes.DWORD),
+        ]
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    snapshot = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0)
+    if snapshot == INVALID_HANDLE_VALUE:
+        raise OSError(f"CreateToolhelp32Snapshot failed (error {ctypes.get_last_error()})")
+
+    failures = 0
+    try:
+        entry = THREADENTRY32()
+        entry.dwSize = ctypes.sizeof(THREADENTRY32)
+        if not kernel32.Thread32First(snapshot, ctypes.byref(entry)):
+            raise OSError(f"Thread32First failed (error {ctypes.get_last_error()})")
+        while True:
+            if entry.th32OwnerProcessID == pid:
+                thread = kernel32.OpenThread(THREAD_SUSPEND_RESUME, False, entry.th32ThreadID)
+                if thread:
+                    try:
+                        result = kernel32.SuspendThread(thread) if suspend else kernel32.ResumeThread(thread)
+                        if result == 0xFFFFFFFF:
+                            failures += 1
+                    finally:
+                        kernel32.CloseHandle(thread)
+                else:
+                    failures += 1
+            if not kernel32.Thread32Next(snapshot, ctypes.byref(entry)):
+                break
+    finally:
+        kernel32.CloseHandle(snapshot)
+
+    if failures:
+        action = "suspend" if suspend else "resume"
+        raise OSError(f"failed to {action} {failures} thread(s) of pid {pid}")
+
+
+def stream_conversion(
+    args: list[str],
+    python_executable: str | None = None,
+    control=None,
+) -> Iterator[str]:
     """Yield stdout/stderr lines from the ctq process as they arrive.
 
     The final yielded line is one of:
       "__CTQ_OK__"           on success (return code 0)
       "__CTQ_FAIL__:<code>"  on non-zero exit
+      "__CTQ_CANCELLED__"    the run was stopped via `control` (Stop & save)
+
+    `control` (a run_control.RunControl) enables the GUI's pause/stop
+    buttons: pause freezes the whole ctq process between output lines
+    (SIGSTOP/SIGCONT, or thread suspension on Windows), stop terminates it.
+    ctq itself keeps no resumable state, so a stopped run's checkpoint is a
+    session snapshot (exact command + settings), not per-tensor progress.
     """
     cmd = resolve_command(args, python_executable)
     yield f"$ {' '.join(cmd)}\n"
@@ -74,11 +165,45 @@ def stream_conversion(args: list[str], python_executable: str | None = None) -> 
         return
 
     assert proc.stdout is not None
-    for line in proc.stdout:
-        yield line
+    suspended = False
+    cancelled = False
+    try:
+        for line in proc.stdout:
+            if control is not None and control.is_cancelled:
+                cancelled = True
+                # TerminateProcess works even on a suspended process; after
+                # SIGSTOP the pipe stops producing lines, so terminate first
+                # and let the loop drain to EOF below.
+                try:
+                    proc.terminate()
+                except OSError:
+                    pass
+            elif control is not None and control.is_paused and not suspended:
+                try:
+                    _suspend_process(proc.pid)
+                    suspended = True
+                    yield "(ctq process suspended - click Resume to continue)\n"
+                except OSError as exc:
+                    yield f"(couldn't suspend the ctq process: {exc} - it keeps running)\n"
+            elif control is not None and not control.is_paused and suspended:
+                try:
+                    _resume_process(proc.pid)
+                except OSError as exc:
+                    yield f"(couldn't resume the ctq process: {exc})\n"
+                suspended = False
+            yield line
+    finally:
+        if suspended:
+            try:
+                _resume_process(proc.pid)
+            except OSError:
+                pass
+
     code = proc.wait()
 
-    if code == 0:
+    if cancelled:
+        yield "__CTQ_CANCELLED__"
+    elif code == 0:
         yield "__CTQ_OK__"
     else:
         yield f"__CTQ_FAIL__:{code}"
