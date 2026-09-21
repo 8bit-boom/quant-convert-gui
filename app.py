@@ -598,11 +598,24 @@ def llamacpp_status_markdown() -> str:
 
     cloned = lcpp.is_cloned(LLAMACPP_DIR)
     venv_ready = lcpp.is_venv_ready(LLAMACPP_DIR)
+    tf_version = lcpp.venv_transformers_version(LLAMACPP_DIR) if venv_ready else None
+    tf_stale = venv_ready and lcpp.transformers_too_old(tf_version)
     quantize_built = lcpp.is_quantize_built(LLAMACPP_DIR)
     imatrix_built = lcpp.is_imatrix_built(LLAMACPP_DIR)
+    tf_line = (
+        f"**Python deps installed** (transformers/sentencepiece/gguf, in their own venv) — "
+        f"{ok(venv_ready)}"
+        + (f" `transformers {tf_version}`" if tf_version else "")
+        + (
+            f"\n\n⚠️ transformers {tf_version or 'unknown'} is too old for Gemma 3/4 tokenizers "
+            f"(crashes with `'list' object has no attribute 'keys'`) - re-run **2. Python deps** "
+            f"to upgrade to {lcpp.TRANSFORMERS_MIN_SPEC}."
+            if tf_stale else ""
+        )
+    )
     return (
         f"**llama.cpp cloned** — {ok(cloned)} `{LLAMACPP_DIR}`\n\n"
-        f"**Python deps installed** (transformers/sentencepiece/gguf, in their own venv) — {ok(venv_ready)}\n\n"
+        f"{tf_line}\n\n"
         f"**llama-quantize + llama-imatrix ready** (built from source, or official prebuilt binaries "
         f"downloaded - for real K-quants like Q4_K_M, and for imatrix/dynamic-"
         f"style calibrated quants) — {ok(quantize_built and imatrix_built)} "
@@ -758,6 +771,14 @@ def run_llm_convert(model_dir: str, output_name: str, outtype: str):
     if not lcpp.is_venv_ready(LLAMACPP_DIR):
         yield "llama.cpp's Python environment isn't set up yet - see the Setup section above.", None
         return
+    tf_version = lcpp.venv_transformers_version(LLAMACPP_DIR)
+    tf_warn = ""
+    if lcpp.transformers_too_old(tf_version):
+        tf_warn = (
+            f"⚠️ transformers {tf_version or 'unknown'} is installed; Gemma 3/4 models crash on the "
+            f"tokenizer step with this version ('list' object has no attribute 'keys'). "
+            f"Re-run Setup step 2 (Python deps) to upgrade to {lcpp.TRANSFORMERS_MIN_SPEC}.\n\n"
+        )
 
     LLM_MODELS_DIR.mkdir(parents=True, exist_ok=True)
     name = (output_name or "").strip()
@@ -767,7 +788,7 @@ def run_llm_convert(model_dir: str, output_name: str, outtype: str):
         stem = Path(model_dir).name
         output_path = str(OUTPUT_DIR / f"{stem}-{outtype}.gguf")
 
-    log = f"Converting {model_dir} to GGUF (outtype={outtype})\n  output: {output_path}\n\n"
+    log = f"Converting {model_dir} to GGUF (outtype={outtype})\n  output: {output_path}\n\n{tf_warn}"
     yield log, None
     result_path = None
     for line in lcpp.stream_convert_to_gguf(LLAMACPP_DIR, model_dir, output_path, outtype=outtype):

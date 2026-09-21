@@ -65,6 +65,15 @@ QUANT_TYPE_CHOICES = [
 
 REQUIRED_MODULES = ("gguf", "transformers", "sentencepiece")
 
+# llama.cpp's requirements-convert_hf_to_gguf.txt pins transformers==4.57.6,
+# which crashes on Gemma 3/4 tokenizers (their tokenizer_config ships
+# extra_special_tokens as a LIST, and 4.x's GemmaFastTokenizer does
+# `special_tokens.keys()` on it -> AttributeError: 'list' object has no
+# attribute 'keys'). transformers 5.x handles both forms, so setup
+# force-upgrades past llama.cpp's pin afterwards.
+TRANSFORMERS_MIN_VERSION = "5.0.0"
+TRANSFORMERS_MIN_SPEC = f"transformers>={TRANSFORMERS_MIN_VERSION}"
+
 DEFAULT_CALIBRATION_FILE = Path(__file__).resolve().parent / "data" / "default_calibration.txt"
 
 
@@ -117,6 +126,47 @@ def is_venv_ready(llamacpp_dir: Path) -> bool:
     except (OSError, subprocess.TimeoutExpired):
         return False
     return result.returncode == 0
+
+
+def _version_tuple(text: str) -> tuple[int, ...] | None:
+    """'5.17.0' -> (5, 17, 0); anything unparseable -> None."""
+    parts = (text or "").strip().split(".")
+    if not parts or not parts[0].isdigit():
+        return None
+    out = []
+    for p in parts:
+        digits = "".join(ch for ch in p if ch.isdigit())
+        if digits == "":
+            break
+        out.append(int(digits))
+    return tuple(out) if out else None
+
+
+def transformers_too_old(version: str | None) -> bool:
+    """True when `version` (or unparseable/None) is below TRANSFORMERS_MIN_VERSION."""
+    got = _version_tuple(version)
+    want = _version_tuple(TRANSFORMERS_MIN_VERSION)
+    if got is None or want is None:
+        return True
+    length = max(len(got), len(want))
+    return got + (0,) * (length - len(got)) < want + (0,) * (length - len(want))
+
+
+def venv_transformers_version(llamacpp_dir: Path) -> str | None:
+    """The venv's installed transformers version, or None when unreadable."""
+    py = _venv_python(llamacpp_dir)
+    if not py.is_file():
+        return None
+    try:
+        result = subprocess.run(
+            [str(py), "-c", "import transformers; print(transformers.__version__)"],
+            capture_output=True, text=True, timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+    return (result.stdout or "").strip() or None
 
 
 def is_quantize_built(llamacpp_dir: Path) -> bool:
@@ -190,7 +240,24 @@ def stream_setup_venv(llamacpp_dir: Path):
         yield f"\n❌ Installing dependencies failed (exit {r2.returncode}).\n"
         yield f"__FAIL__:{r2.returncode}"
         return
-    yield "\n✅ llama.cpp's Python environment is ready.\n"
+
+    # llama.cpp pins transformers==4.57.6, which crashes on Gemma 3/4
+    # tokenizers (extra_special_tokens list vs dict) - force >=5.
+    yield (
+        f"\nllama.cpp pins transformers 4.x, which crashes on Gemma 3/4 tokenizers - "
+        f"upgrading to {TRANSFORMERS_MIN_SPEC}.\n"
+    )
+    r3 = _ProcResult()
+    yield from _run_streamed(
+        [str(py), "-m", "pip", "install", "--upgrade", TRANSFORMERS_MIN_SPEC], result=r3,
+    )
+    if r3.returncode != 0:
+        yield (
+            f"\n⚠️ Couldn't upgrade transformers to {TRANSFORMERS_MIN_SPEC} (exit "
+            f"{r3.returncode}) - Gemma 3/4 conversions may fail on the tokenizer step.\n"
+        )
+    version = venv_transformers_version(llamacpp_dir)
+    yield f"\n✅ llama.cpp's Python environment is ready (transformers {version or 'unknown'}).\n"
     yield "__OK__"
 
 

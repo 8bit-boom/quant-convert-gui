@@ -12,6 +12,7 @@ from quant_gui.llamacpp_backend import (
     QUANT_TYPE_CHOICES,
     _imatrix_binary,
     _quantize_binary,
+    _version_tuple,
     _venv_python,
     is_cloned,
     is_imatrix_built,
@@ -23,6 +24,7 @@ from quant_gui.llamacpp_backend import (
     stream_generate_imatrix,
     stream_quantize,
     stream_setup_venv,
+    transformers_too_old,
 )
 
 
@@ -244,3 +246,75 @@ def test_stream_build_quantize_noop_when_binaries_present():
     events = list(stream_build_quantize(llamacpp_dir))
     assert events[-1] == "__OK__"
     assert any("already present" in e for e in events)
+
+
+# ---------------------------------------------------------------------------
+# transformers version floor (Gemma 3/4 tokenizer fix)
+# ---------------------------------------------------------------------------
+
+def test_version_tuple_parses_semver():
+    assert _version_tuple("5.17.0") == (5, 17, 0)
+    assert _version_tuple("4.57.6") == (4, 57, 6)
+    assert _version_tuple("5.0") == (5, 0)
+    assert _version_tuple("garbage") is None
+    assert _version_tuple("") is None
+
+
+def test_transformers_too_old_boundaries():
+    assert transformers_too_old("4.57.6") is True
+    assert transformers_too_old("4.99.99") is True
+    assert transformers_too_old("5.0.0") is False
+    assert transformers_too_old("5.17.0") is False
+    assert transformers_too_old(None) is True
+    assert transformers_too_old("not-a-version") is True
+
+
+def _fake_cloned_dir(tmp_path):
+    (tmp_path / "convert_hf_to_gguf.py").write_text("# stub")
+    scripts = tmp_path / ".venv" / ("Scripts" if platform.system() == "Windows" else "bin")
+    scripts.mkdir(parents=True)
+    (tmp_path / "requirements").mkdir()
+    (tmp_path / "requirements" / "requirements-convert_hf_to_gguf.txt").write_text("# stub")
+    return tmp_path
+
+
+def test_setup_venv_force_upgrades_transformers(tmp_path, monkeypatch):
+    import quant_gui.llamacpp_backend as lb
+
+    fake = _fake_cloned_dir(tmp_path)
+    commands = []
+
+    def fake_run_streamed(cmd, cwd=None, result=None):
+        commands.append(list(cmd))
+        if result is not None:
+            result.returncode = 0
+        yield from ()
+
+    monkeypatch.setattr(lb, "_run_streamed", fake_run_streamed)
+    monkeypatch.setattr(lb, "venv_transformers_version", lambda _d: "5.17.0")
+
+    events = list(lb.stream_setup_venv(fake))
+    assert events[-1] == "__OK__"
+    upgrades = [c for c in commands if "install" in c and any("transformers>=" in a for a in c)]
+    assert len(upgrades) == 1, f"expected exactly one transformers upgrade, got {commands}"
+    assert any("Gemma 3/4" in e for e in events)
+    assert any("transformers 5.17.0" in e for e in events)
+
+
+def test_setup_venv_ok_even_when_upgrade_fails(tmp_path, monkeypatch):
+    """A failed transformers upgrade must not brick setup - it only warns."""
+    import quant_gui.llamacpp_backend as lb
+
+    fake = _fake_cloned_dir(tmp_path)
+
+    def fake_run_streamed(cmd, cwd=None, result=None):
+        if result is not None:
+            result.returncode = 1 if any("transformers>=" in a for a in cmd) else 0
+        yield from ()
+
+    monkeypatch.setattr(lb, "_run_streamed", fake_run_streamed)
+    monkeypatch.setattr(lb, "venv_transformers_version", lambda _d: "4.57.6")
+
+    events = list(lb.stream_setup_venv(fake))
+    assert events[-1] == "__OK__"
+    assert any("Gemma 3/4 conversions may fail" in e for e in events)
