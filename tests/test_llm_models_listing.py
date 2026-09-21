@@ -166,3 +166,40 @@ def test_find_best_autodetect_note(monkeypatch, tmp_path):
     first = next(gen)[0]
     gen.close()
     assert "latest.gguf" in first
+
+
+def test_validate_guards(monkeypatch, tmp_path):
+    monkeypatch.setattr(app, "OUTPUT_DIR", tmp_path)  # empty: nothing to auto-detect
+    log, res = list(app.run_llm_validate("", "", "Q4_K_M", "", "99"))[0]
+    assert "step 6" in log
+    assert res is None
+
+
+def test_validate_requires_text_file(monkeypatch, tmp_path):
+    out = tmp_path / "out"
+    _touch(out / "model-smart.gguf")
+    monkeypatch.setattr(app, "OUTPUT_DIR", out)
+    log, res = list(app.run_llm_validate("", "", "Q4_K_M", "no/such.txt", "99"))[0]
+    assert "text" in log.lower()
+    assert res is None
+
+
+def test_validate_requires_perplexity_binary(monkeypatch, tmp_path):
+    out = tmp_path / "out"
+    _touch(out / "model-smart.gguf")
+    _touch(tmp_path / "held.txt")
+    monkeypatch.setattr(app, "OUTPUT_DIR", out)
+    monkeypatch.setattr(app.lcpp, "is_perplexity_built", lambda _d: False)
+    log, res = list(app.run_llm_validate("", "", "Q4_K_M", str(tmp_path / "held.txt"), "99"))[0]
+    assert "llama-perplexity" in log
+    assert res is None
+
+
+def test_newest_smart_gguf_prefers_smart(monkeypatch, tmp_path):
+    out = tmp_path / "out"
+    _touch(out / "plain.gguf")
+    smart = _touch(out / "model-smart.gguf")
+    monkeypatch.setattr(app, "OUTPUT_DIR", out)
+    assert app.newest_smart_gguf() == str(smart)
+    monkeypatch.setattr(app, "OUTPUT_DIR", tmp_path / "empty")
+    assert app.newest_smart_gguf() is None

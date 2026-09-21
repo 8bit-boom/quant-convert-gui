@@ -1158,6 +1158,125 @@ def run_llm_smart_tune(model_gguf: str, imatrix_file: str, mode: str, budget_gb:
             yield log, result_path
 
 
+def newest_smart_gguf(directory=None) -> str | None:
+    """Newest *.gguf with 'smart' in the name (tuner output), else None."""
+    directory = Path(OUTPUT_DIR if directory is None else directory)
+    if not directory.is_dir():
+        return None
+    candidates = [
+        p for p in directory.glob("*smart*.gguf")
+        if p.stat().st_size > 0
+    ]
+    return str(max(candidates, key=lambda p: p.stat().st_mtime)) if candidates else None
+
+
+def run_llm_validate(tuned_gguf: str, ref_gguf: str, baseline_type: str, text_file: str, ngl: str):
+    """Stage-3 validation: measure perplexity of the tuned file and a plain
+    baseline quant of the same reference on a held-out text, and compare."""
+    tuned_gguf = (tuned_gguf or "").strip()
+    if not tuned_gguf:
+        detected = newest_smart_gguf()
+        if detected:
+            tuned_gguf = detected
+    if not tuned_gguf or not Path(tuned_gguf).is_file():
+        yield ("No tuned GGUF given and none auto-detected - run step 6 (Tune + quantize) "
+               "first, or paste a .gguf path."), None
+        return
+    text_file = (text_file or "").strip()
+    if not text_file or not Path(text_file).is_file():
+        yield f"Held-out validation text not found: {text_file!r} - point at a .txt the calibration didn't use.", None
+        return
+    if not lcpp.is_perplexity_built(LLAMACPP_DIR):
+        yield ("llama-perplexity isn't available - re-download the prebuilt binaries "
+               "(Setup step 3), the release zip ships it."), None
+        return
+    if baseline_type not in lcpp.QUANT_TYPE_CHOICES:
+        yield f"Unknown baseline quant type: {baseline_type!r}.", None
+        return
+    try:
+        ngl_n = int((ngl or "").strip())
+    except ValueError:
+        ngl_n = 99
+
+    ref_gguf = (ref_gguf or "").strip()
+    auto_note = ""
+    if not ref_gguf:
+        detected = newest_model_gguf()
+        if detected and Path(detected).resolve() != Path(tuned_gguf).resolve():
+            ref_gguf = detected
+            auto_note = f"(auto-detected reference: {detected})\n"
+    if not ref_gguf or not Path(ref_gguf).is_file():
+        yield ("Reference GGUF not found - needed to build the baseline. Paste the F16/BF16 "
+               "file step 6 converted from."), None
+        return
+    if not lcpp.is_quantize_built(LLAMACPP_DIR):
+        yield "llama-quantize isn't built yet - see the Setup section above.", None
+        return
+
+    imatrix = newest_imatrix() or None
+
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    stem = Path(ref_gguf).stem
+    baseline_path = str(OUTPUT_DIR / f"{stem}-{baseline_type}.gguf")
+    log = (
+        f"Validation: {tuned_gguf}\n  vs baseline {baseline_type} of {ref_gguf}\n{auto_note}"
+        f"  text: {text_file}   gpu layers: {ngl_n}\n\n"
+    )
+    if not Path(baseline_path).is_file():
+        log += f"Baseline not built yet - quantizing {baseline_type}"
+        log += f" (with imatrix: {imatrix})\n" if imatrix else " (no imatrix found)\n"
+        yield log, None
+        ok = False
+        for line in lcpp.stream_quantize(
+            LLAMACPP_DIR, ref_gguf, baseline_path, baseline_type, imatrix_file=imatrix,
+        ):
+            if line == "__OK__":
+                ok = True
+            elif line.startswith("__FAIL__"):
+                yield log + "\n❌ Baseline quantization failed.\n", None
+                return
+            else:
+                log += line
+                yield log, tuned_gguf
+        if not ok:
+            yield log + "\n❌ Baseline quantization failed.\n", None
+            return
+    else:
+        log += f"Using existing baseline: {baseline_path}\n"
+
+    results: dict[str, float] = {}
+    for label, path in (("baseline", baseline_path), ("tuned", tuned_gguf)):
+        log += f"\nMeasuring perplexity: {label} ({Path(path).name})...\n"
+        yield log, tuned_gguf
+        chunk = ""
+        for line in lcpp.stream_perplexity(LLAMACPP_DIR, path, text_file, ngl=ngl_n):
+            if line == "__OK__":
+                break
+            if line.startswith("__FAIL__"):
+                yield log + f"\n❌ Perplexity run failed for {label}.\n", tuned_gguf
+                return
+            chunk += line
+            log += line
+            yield log, tuned_gguf
+        ppl = lcpp.parse_final_ppl(chunk)
+        if ppl is None:
+            yield log + f"\n❌ Couldn't parse a final PPL for {label}.\n", tuned_gguf
+            return
+        results[label] = ppl
+
+    b, t = results["baseline"], results["tuned"]
+    delta = (t - b) / b * 100
+    verdict = "better" if t < b else "worse" if t > b else "identical"
+    log += (
+        f"\n{'=' * 56}\n"
+        f"baseline ({baseline_type}): PPL {b:.4f}\n"
+        f"tuned:                      PPL {t:.4f}\n"
+        f"delta: {delta:+.2f}% ({verdict} - lower is better)\n"
+        f"{'=' * 56}\n"
+    )
+    yield log, tuned_gguf
+
+
 def run_convert(
     input_local: str,
     input_hf: str,
@@ -2182,6 +2301,32 @@ with gr.Blocks(title="Quant Convert GUI") as demo:
             with gr.Row():
                 llm_smart_output = gr.Textbox(label="Output filename (optional)", placeholder="auto")
                 llm_smart_btn = gr.Button("Tune + quantize", variant="primary")
+            gr.Markdown(
+                "#### Stage 3 validation — perplexity comparison\n"
+                "Measures perplexity of the tuned file and a plain baseline quant of the same "
+                "reference on a **held-out text** (something the calibration didn't see), with "
+                "llama-perplexity. Lower PPL wins; a small regression vs Q4_K_M is normal when "
+                "the budget forced aggressive downgrades - the point is to see exactly how much "
+                "you paid for the size."
+            )
+            with gr.Row():
+                llm_val_tuned = gr.Textbox(
+                    label="Tuned GGUF",
+                    placeholder="auto-detects the newest *smart*.gguf in the output folder",
+                )
+                llm_val_ref = gr.Textbox(
+                    label="Reference GGUF (for the baseline)",
+                    placeholder="auto-detects the newest model GGUF (F16/BF16)",
+                )
+            with gr.Row():
+                llm_val_baseline = gr.Dropdown(lcpp.QUANT_TYPE_CHOICES, value="Q4_K_M", label="Baseline quant")
+                llm_val_ngl = gr.Textbox(label="GPU layers", value="99",
+                                         info="99 = full offload on your RTX 5090; 0 = CPU")
+                llm_val_text = gr.Textbox(
+                    label="Held-out text file",
+                    placeholder="path to a .txt the calibration didn't use",
+                )
+            llm_val_btn = gr.Button("Compare perplexity")
 
             with gr.Row():
                 with gr.Column():
@@ -2631,6 +2776,11 @@ with gr.Blocks(title="Quant Convert GUI") as demo:
     llm_smart_btn.click(
         run_llm_smart_tune,
         inputs=[llm_smart_model, llm_smart_imatrix, llm_smart_mode, llm_smart_budget, llm_smart_output],
+        outputs=[llm_log, llm_result_file],
+    )
+    llm_val_btn.click(
+        run_llm_validate,
+        inputs=[llm_val_tuned, llm_val_ref, llm_val_baseline, llm_val_text, llm_val_ngl],
         outputs=[llm_log, llm_result_file],
     )
 

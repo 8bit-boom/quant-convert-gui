@@ -22,6 +22,8 @@ from quant_gui.llamacpp_backend import (
     stream_clone_or_update,
     stream_convert_to_gguf,
     stream_generate_imatrix,
+    parse_final_ppl,
+    stream_perplexity,
     stream_quantize,
     stream_setup_venv,
     transformers_too_old,
@@ -318,3 +320,35 @@ def test_setup_venv_ok_even_when_upgrade_fails(tmp_path, monkeypatch):
     events = list(lb.stream_setup_venv(fake))
     assert events[-1] == "__OK__"
     assert any("Gemma 3/4 conversions may fail" in e for e in events)
+
+
+# ---------------------------------------------------------------------------
+# llama-perplexity validation
+# ---------------------------------------------------------------------------
+
+def test_parse_final_ppl_extracts_value():
+    out = "perplexity: chunk 1, ppl = 14.2\nFinal estimate: PPL = 11.2345 +/- 0.5\n"
+    assert abs(parse_final_ppl(out) - 11.2345) < 1e-9
+
+
+def test_parse_final_ppl_takes_last_and_handles_noise():
+    out = "Final estimate: PPL = 99\nperplexity: calculating...\nfinal estimate: ppl = 7.5\n"
+    assert parse_final_ppl(out) == 7.5
+    assert parse_final_ppl("") is None
+    assert parse_final_ppl("no result here") is None
+
+
+def test_stream_perplexity_fails_fast_when_binary_missing(tmp_path):
+    events = list(stream_perplexity(tmp_path, "/m.gguf", "/t.txt"))
+    assert events[-1].startswith("__FAIL__")
+    assert any("llama-perplexity" in e for e in events)
+
+
+def test_stream_perplexity_requires_files(tmp_path):
+    binpath = tmp_path / "build" / "bin" / "llama-perplexity"
+    binpath.parent.mkdir(parents=True)
+    binpath.write_text("#!/bin/sh\n")
+    binpath.chmod(0o755)
+    events = list(stream_perplexity(tmp_path, "/no/model.gguf", "/no/text.txt"))
+    assert events[-1].startswith("__FAIL__")
+    assert any("Model GGUF not found" in e for e in events)

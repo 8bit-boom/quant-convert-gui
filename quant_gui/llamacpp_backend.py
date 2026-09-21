@@ -177,6 +177,53 @@ def is_imatrix_built(llamacpp_dir: Path) -> bool:
     return _imatrix_binary(llamacpp_dir) is not None
 
 
+def _perplexity_binary(llamacpp_dir: Path) -> Path | None:
+    return _find_binary(llamacpp_dir, "llama-perplexity")
+
+
+def is_perplexity_built(llamacpp_dir: Path) -> bool:
+    return _perplexity_binary(llamacpp_dir) is not None
+
+
+PPL_FINAL_RE = None  # compiled lazily to keep import cost at zero
+
+
+def parse_final_ppl(output: str) -> float | None:
+    """Extract the 'Final estimate: PPL = X' value from llama-perplexity output."""
+    import re
+
+    global PPL_FINAL_RE
+    if PPL_FINAL_RE is None:
+        PPL_FINAL_RE = re.compile(r"Final estimate:\s*PPL\s*=\s*([0-9]+(?:\.[0-9]+)?)", re.IGNORECASE)
+    matches = PPL_FINAL_RE.findall(output or "")
+    return float(matches[-1]) if matches else None
+
+
+def stream_perplexity(llamacpp_dir: Path, model_gguf: str, text_file: str, ngl: int | None = None):
+    """Run llama-perplexity on `text_file` against `model_gguf`, yielding log
+    lines followed by '__OK__' or '__FAIL__:<code>'. The final estimate line
+    is in the log; pull it with parse_final_ppl."""
+    binary = _perplexity_binary(Path(llamacpp_dir))
+    if binary is None:
+        yield "llama-perplexity isn't available - re-download the prebuilt binaries (Setup step 3), the release zip ships it.\n"
+        yield "__FAIL__:1"
+        return
+    if not Path(model_gguf).is_file():
+        yield f"Model GGUF not found: {model_gguf}\n"
+        yield "__FAIL__:1"
+        return
+    if not Path(text_file).is_file():
+        yield f"Validation text not found: {text_file}\n"
+        yield "__FAIL__:1"
+        return
+    cmd = [str(binary), "-m", model_gguf, "-f", str(text_file)]
+    if ngl is not None:
+        cmd += ["-ngl", str(ngl)]
+    r = _ProcResult()
+    yield from _run_streamed(cmd, result=r)
+    yield "__OK__" if r.returncode == 0 else f"__FAIL__:{r.returncode}"
+
+
 @dataclass
 class _ProcResult:
     returncode: int | None = None
