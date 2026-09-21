@@ -45,9 +45,10 @@ def test_find_best_end_to_end_selects_winner():
     if not ref or not Path(ref).is_file():
         pytest.skip("set GGUF_BENCH_REF_GGUF to an existing F16/BF16 GGUF")
 
-    last = _last(app.run_llm_find_best(ref, "", quants=["Q3_K_M"]))
+    last = _last(app.run_llm_find_best(ref, "", target_bpw="~4 bpw", quants=["Q3_K_M"]))
     log, file, quant_value, imatrix_update = last
     assert "Winner" in log and "Q3_K_M" in log
+    assert "~4 bpw" in log  # the requested target is reported
     assert file is None  # sweep discards intermediates
     assert quant_value == "Q3_K_M"  # pre-selects the dropdown
     assert quant_value in lcpp.QUANT_TYPE_CHOICES

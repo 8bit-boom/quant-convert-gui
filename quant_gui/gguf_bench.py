@@ -40,6 +40,24 @@ from pathlib import Path
 # without one, which is what Unsloth's recipe never does).
 DYNAMIC3_CANDIDATES = ["Q3_K_L", "Q3_K_M", "Q3_K_S", "IQ3_M", "IQ3_S", "IQ3_XS", "IQ3_XXS"]
 
+# Candidate sets per target bits-per-weight class (weight-space bpw of the
+# quant types, not model-level - embeddings shift the latter). Keys are the
+# labels the GUI shows; every entry must be a quant type a real
+# llama-quantize supports (mirrors llamacpp_backend.QUANT_TYPE_CHOICES).
+BPP_FAMILY_CANDIDATES = {
+    "~2 bpw": ["Q3_K_S", "Q2_K", "Q2_K_S", "IQ2_M", "IQ2_S", "IQ2_XS", "IQ2_XXS"],
+    "~3 bpw": DYNAMIC3_CANDIDATES,
+    "~4 bpw": ["Q4_K_M", "Q4_K_S", "Q4_1", "Q4_0", "IQ4_NL", "IQ4_XS"],
+    "~5 bpw": ["Q5_K_M", "Q5_K_S", "Q5_1", "Q5_0", "Q6_K"],
+}
+DEFAULT_BPP_TARGET = "~3 bpw"
+
+
+def family_candidates(target: str) -> list[str]:
+    """Candidate list for a target-size label; unknown labels fall back to
+    the ~3bpw family so a stale GUI value never empties the sweep."""
+    return list(BPP_FAMILY_CANDIDATES.get(target or "", DYNAMIC3_CANDIDATES))
+
 # Families with huge vocabularies (Gemma's 262k, Qwen's 151-256k) carry
 # token embeddings worth a large share of total params, which llama-quantize
 # otherwise keeps F16. `--token-embedding-type Q8_0` is the standard lever

@@ -203,6 +203,30 @@ def test_tune_sweep_qwen35_arch_key():
     assert tune["error_budget"] == 760_000_000
 
 
+# ---------------------------------------------------- target-size families
+
+
+def test_family_candidates_all_supported_by_llama_quantize():
+    from quant_gui import llamacpp_backend as lcpp
+
+    for target, quants in gb.BPP_FAMILY_CANDIDATES.items():
+        assert quants, f"{target} has no candidates"
+        unsupported = [q for q in quants if q not in lcpp.QUANT_TYPE_CHOICES]
+        assert not unsupported, f"{target}: not in llama-quantize list: {unsupported}"
+
+
+def test_family_candidates_unknown_target_falls_back():
+    assert gb.family_candidates("~99 bpw") == gb.DYNAMIC3_CANDIDATES
+    assert gb.family_candidates("") == gb.DYNAMIC3_CANDIDATES
+    assert gb.family_candidates(None) == gb.DYNAMIC3_CANDIDATES
+
+
+def test_family_candidates_returns_copies():
+    a = gb.family_candidates("~4 bpw")
+    a.append("MUTATED")
+    assert len(gb.family_candidates("~4 bpw")) == len(gb.BPP_FAMILY_CANDIDATES["~4 bpw"])
+
+
 # ------------------------------------------------- toolchain-gated benchmark
 
 

@@ -23,6 +23,7 @@ from quant_gui.gpu_profiles import GPU_PROFILE_BY_KEY, GPU_PROFILES, detect_prof
 from quant_gui.hf import HFUrlError, download as hf_download, download_repo as hf_download_repo, parse_hf_url
 from quant_gui.loop_timing import LoopPhaseTimer
 from quant_gui import llamacpp_backend as lcpp
+from quant_gui import gguf_bench as gb
 from quant_gui.gguf_backend import stream_gguf_conversion, stream_install as stream_gguf_install
 from quant_gui.gguf_backend import QUANT_TYPE_CHOICES as GGUF_QUANT_TYPE_CHOICES
 from quant_gui.gguf_backend import SUPPORTED_ARCH_NAMES as GGUF_SUPPORTED_ARCH_NAMES
@@ -797,15 +798,16 @@ def run_llm_quantize(input_gguf: str, output_name: str, quant_type: str, imatrix
             yield log, result_path
 
 
-def run_llm_find_best(input_gguf: str, imatrix_file: str, quants: list[str] | None = None):
-    """Sweep the ~3.0bpw quant family on `input_gguf` and pick the winner.
+def run_llm_find_best(input_gguf: str, imatrix_file: str, target_bpw: str = "", quants: list[str] | None = None):
+    """Sweep a target-size quant family on `input_gguf` and pick the winner.
 
-    Streams progress into the LLM log; the final yield returns the winning
-    quant type (pre-selects the Quant type dropdown) and the imatrix path
-    used (fills the imatrix box). If no imatrix is given but llama-imatrix is
-    built, one is generated first with the bundled default calibration -
-    imatrix is what makes the "Dynamic" recipes work, so the sweep is only
-    half-useful without it.
+    `target_bpw` selects the candidate set (~2/~3/~4/~5 bpw family);
+    `quants` overrides it (tests). Streams progress into the LLM log; the
+    final yield returns the winning quant type (pre-selects the Quant type
+    dropdown) and the imatrix path used (fills the imatrix box). If no
+    imatrix is given but llama-imatrix is built, one is generated first
+    with the bundled default calibration - imatrix is what makes the
+    "Dynamic" recipes work, so the sweep is only half-useful without it.
     """
     input_gguf = (input_gguf or "").strip()
     if not input_gguf or not Path(input_gguf).is_file():
@@ -819,7 +821,8 @@ def run_llm_find_best(input_gguf: str, imatrix_file: str, quants: list[str] | No
     import tempfile
     import threading
 
-    from quant_gui import gguf_bench as gb
+    if quants is None:
+        quants = gb.family_candidates(target_bpw)
 
     q: "_queue.Queue" = _queue.Queue()
     SENTINEL = object()
@@ -873,8 +876,8 @@ def run_llm_find_best(input_gguf: str, imatrix_file: str, quants: list[str] | No
     threading.Thread(target=worker, daemon=True).start()
 
     log = (
-        f"Finding the best ~3bpw quant setting for {input_gguf}\n"
-        f"  candidates: {', '.join(quants or gb.DYNAMIC3_CANDIDATES)}\n"
+        f"Finding the best {target_bpw or '~3 bpw'} quant setting for {input_gguf}\n"
+        f"  candidates: {', '.join(quants)}\n"
         "  measuring size, bits-per-weight, time, and reconstruction error vs this file\n\n"
     )
     yield log, None, gr.update(), gr.update()
@@ -1867,16 +1870,22 @@ with gr.Blocks(title="Quant Convert GUI") as demo:
                     "can supply your own.",
                 )
             llm_quantize_output_name = gr.Textbox(label="Output filename (optional)", placeholder="auto")
+            llm_target_bpw = gr.Radio(
+                list(gb.BPP_FAMILY_CANDIDATES.keys()), value=gb.DEFAULT_BPP_TARGET,
+                label="Target size",
+                info="Weight-space bits-per-weight class to sweep; model-level bpw runs higher "
+                "when a big vocabulary keeps embeddings heavy.",
+            )
             with gr.Row():
                 llm_quantize_btn = gr.Button("Quantize")
                 llm_find_best_btn = gr.Button("Find best quant (sweep)")
             gr.Markdown(
-                "**Find best quant** runs every ~3bpw candidate (Q3_K_L/M/S, IQ3_M/S/XS/XXS) through "
-                "llama-quantize on the input file — generating an imatrix first if none is given — and "
-                "measures size, time, and reconstruction error vs the input. The winner is pre-selected "
-                "in the Quant type dropdown; intermediate outputs are discarded. Big-vocab models (Gemma 4, "
-                "Qwen 3.5-3.8) automatically also get Q8_0 token-embedding variants. Weight-space error, "
-                "not perplexity — it ranks settings, it doesn't judge generation quality."
+                "**Find best quant** sweeps the target-size family through llama-quantize on the input "
+                "file — generating an imatrix first if none is given — and measures size, time, and "
+                "reconstruction error vs the input. The winner is pre-selected in the Quant type "
+                "dropdown; intermediate outputs are discarded. Big-vocab models (Gemma 4, Qwen 3.5-3.8) "
+                "automatically also get Q8_0 token-embedding variants. Weight-space error, not "
+                "perplexity — it ranks settings, it doesn't judge generation quality."
             )
 
             with gr.Row():
@@ -2310,7 +2319,7 @@ with gr.Blocks(title="Quant Convert GUI") as demo:
     )
     llm_find_best_btn.click(
         run_llm_find_best,
-        inputs=[llm_quantize_input, llm_quantize_imatrix],
+        inputs=[llm_quantize_input, llm_quantize_imatrix, llm_target_bpw],
         outputs=[llm_log, llm_result_file, llm_quant_type, llm_quantize_imatrix],
     )
 
