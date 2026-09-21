@@ -144,3 +144,74 @@ def test_cancelled_run_preserves_partial_output(monkeypatch, tmp_path):
     assert notices, "expected a partial-output preservation notice"
     assert not out.exists()  # renamed away, not left to be overwritten
     _time.sleep(0.1)  # let the OS reap the terminated child
+
+
+def test_ctq_supports_checkpoints_in_process_probe(monkeypatch):
+    # No ctq installed in this interpreter -> False without subprocesses.
+    monkeypatch.setattr(runner, "_has_convert_to_quant", lambda python_executable=None: False)
+    monkeypatch.setattr(runner.shutil, "which", lambda name: None)
+    monkeypatch.setattr(runner, "_checkpoint_support_cache", {})
+    assert runner.ctq_supports_checkpoints() is False
+
+    # ctq present and its checkpoint module importable -> True.
+    monkeypatch.setattr(runner, "_has_convert_to_quant", lambda python_executable=None: True)
+    monkeypatch.setattr(
+        runner.importlib.util, "find_spec",
+        lambda name: object() if name == "convert_to_quant.checkpoint" else None,
+    )
+    monkeypatch.setattr(runner, "_checkpoint_support_cache", {})
+    assert runner.ctq_supports_checkpoints() is True
+
+    # ctq present but the old build (no checkpoint module) -> False.
+    monkeypatch.setattr(runner.importlib.util, "find_spec", lambda name: None)
+    monkeypatch.setattr(runner, "_checkpoint_support_cache", {})
+    assert runner.ctq_supports_checkpoints() is False
+
+
+def test_stop_file_requests_checkpointed_stop(monkeypatch, tmp_path):
+    import time as _time
+
+    from quant_gui import run_control
+
+    stop_file = tmp_path / "stop.request"
+    script = (
+        f"import os, sys, time\n"
+        f"stop = {str(stop_file)!r}\n"
+        f"for i in range(500):\n"
+        f"    print('tick', flush=True)\n"
+        f"    if os.path.exists(stop):\n"
+        f"        print('saving progress', flush=True)\n"
+        f"        sys.exit(3)\n"
+        f"    time.sleep(0.01)\n"
+    )
+    monkeypatch.setattr(
+        runner, "resolve_command", lambda args, python_executable=None: [sys.executable, "-c", script],
+    )
+    ctl = run_control.RunControl()
+
+    lines = []
+    for line in runner.stream_conversion(
+        ["-i", "in.st", "--stop-file", str(stop_file)], control=ctl, stop_file=str(stop_file),
+    ):
+        lines.append(line)
+        if "tick" in line:
+            ctl.cancel()
+
+    assert lines[-1] == "__CTQ_STOPPED__"
+    assert "__CTQ_CANCELLED__" not in lines
+    assert any("stop requested" in ln for ln in lines), "expected a stop-request notice"
+    assert any("saving progress" in ln for ln in lines), "fake ctq should have seen the stop file"
+    assert not stop_file.exists(), "runner must consume the stop file after exit"
+    _time.sleep(0.1)  # let the OS reap the child
+
+
+def test_exit_code_3_without_cancel_is_reported_as_stopped(monkeypatch, tmp_path):
+    script = "import sys; print('bye', flush=True); sys.exit(3)"
+    monkeypatch.setattr(
+        runner, "resolve_command", lambda args, python_executable=None: [sys.executable, "-c", script],
+    )
+    stop_file = tmp_path / "stop.request"
+
+    lines = list(runner.stream_conversion(["-i", "in.st"], stop_file=str(stop_file)))
+
+    assert lines[-1] == "__CTQ_STOPPED__"

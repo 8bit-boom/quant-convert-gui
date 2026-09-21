@@ -130,6 +130,50 @@ def _windows_suspend(pid: int, suspend: bool) -> None:
         raise OSError(f"failed to {action} {failures} thread(s) of pid {pid}")
 
 
+_checkpoint_support_cache: dict[str | None, bool] = {}
+
+
+def ctq_supports_checkpoints(python_executable: str | None = None) -> bool:
+    """True when the ctq we would launch has native stop/resume checkpoints.
+
+    Probes for the ``convert_to_quant.checkpoint`` module added in the
+    checkpoint-resume release, without importing torch in this process.
+    Uses the same resolution rule as ``resolve_command``: the given (or
+    current) interpreter first, then a ``ctq --help`` scan for the
+    PATH-fallback case. Results are cached per interpreter.
+    """
+    key = (python_executable or "").strip() or None
+    if key in _checkpoint_support_cache:
+        return _checkpoint_support_cache[key]
+
+    ok = False
+    if _has_convert_to_quant(python_executable):
+        if key is None:
+            ok = importlib.util.find_spec("convert_to_quant.checkpoint") is not None
+        else:
+            try:
+                result = subprocess.run(
+                    [key, "-c", "import convert_to_quant.checkpoint"],
+                    capture_output=True, timeout=30,
+                )
+                ok = result.returncode == 0
+            except (OSError, subprocess.TimeoutExpired):
+                ok = False
+    else:
+        ctq_path = shutil.which("ctq")
+        if ctq_path:
+            try:
+                result = subprocess.run(
+                    [ctq_path, "--help"], capture_output=True, text=True, timeout=180,
+                )
+                ok = "--checkpoint-dir" in (result.stdout or "")
+            except (OSError, subprocess.TimeoutExpired):
+                ok = False
+
+    _checkpoint_support_cache[key] = ok
+    return ok
+
+
 def _extract_output_path(args: list[str]) -> str | None:
     """Find the ctq output file (-o/--output) in the CLI arg list."""
     best: str | None = None
@@ -174,6 +218,7 @@ def stream_conversion(
     args: list[str],
     python_executable: str | None = None,
     control=None,
+    stop_file: str | None = None,
 ) -> Iterator[str]:
     """Yield stdout/stderr lines from the ctq process as they arrive.
 
@@ -181,13 +226,19 @@ def stream_conversion(
       "__CTQ_OK__"           on success (return code 0)
       "__CTQ_FAIL__:<code>"  on non-zero exit
       "__CTQ_CANCELLED__"    the run was stopped via `control` (Stop & save)
+                             in legacy mode (no `stop_file`): ctq was
+                             terminated and any partial output preserved
+      "__CTQ_STOPPED__"      a checkpointed stop: ctq saved per-tensor
+                             progress and exited (code 3) - resume continues
+                             from the last completed tensor
 
     `control` (a run_control.RunControl) enables the GUI's pause/stop
     buttons: pause freezes the whole ctq process between output lines
-    (SIGSTOP/SIGCONT, or thread suspension on Windows), stop terminates it
-    (preserving any partial output file under a `.partial-<timestamp>` name).
-    ctq itself keeps no resumable state, so a stopped run's checkpoint is a
-    session snapshot (exact command + settings), not per-tensor progress.
+    (SIGSTOP/SIGCONT, or thread suspension on Windows). With `stop_file`
+    set, stop writes that file and ctq (checkpoint-aware build) exits
+    cleanly once the current tensor is done; without it, stop terminates
+    ctq immediately (legacy builds) and the partial output file is kept
+    under a `.partial-<timestamp>` name.
     """
     cmd = resolve_command(args, python_executable)
     yield f"$ {' '.join(cmd)}\n"
@@ -208,17 +259,34 @@ def stream_conversion(
     assert proc.stdout is not None
     suspended = False
     cancelled = False
+    stop_written = False
     try:
         for line in proc.stdout:
             if control is not None and control.is_cancelled:
                 cancelled = True
-                # TerminateProcess works even on a suspended process; after
-                # SIGSTOP the pipe stops producing lines, so terminate first
-                # and let the loop drain to EOF below.
-                try:
-                    proc.terminate()
-                except OSError:
-                    pass
+                if stop_file is not None:
+                    # Checkpoint-aware ctq: ask it to stop between tensors
+                    # instead of killing it mid-write.
+                    if not stop_written:
+                        stop_written = True
+                        try:
+                            with open(stop_file, "w"):
+                                pass
+                            yield "(stop requested - ctq finishes the current tensor, saves progress, then exits)\n"
+                        except OSError as exc:
+                            yield f"(couldn't write the stop file: {exc} - falling back to terminating ctq)\n"
+                            try:
+                                proc.terminate()
+                            except OSError:
+                                pass
+                else:
+                    # TerminateProcess works even on a suspended process; after
+                    # SIGSTOP the pipe stops producing lines, so terminate first
+                    # and let the loop drain to EOF below.
+                    try:
+                        proc.terminate()
+                    except OSError:
+                        pass
             elif control is not None and control.is_paused and not suspended:
                 try:
                     _suspend_process(proc.pid)
@@ -239,10 +307,20 @@ def stream_conversion(
                 _resume_process(proc.pid)
             except OSError:
                 pass
+        # Consume the stop request once the process is gone, so a resume
+        # doesn't stop instantly on a stale file.
+        if stop_file is not None:
+            try:
+                if os.path.exists(stop_file):
+                    os.unlink(stop_file)
+            except OSError:
+                pass
 
     code = proc.wait()
 
-    if cancelled:
+    if stop_file is not None and (code == 3 or cancelled):
+        yield "__CTQ_STOPPED__"
+    elif cancelled:
         backup = _preserve_partial_output(args)
         if backup:
             yield f"(partial output preserved: {backup} - resume restarts ctq from the beginning)\n"
