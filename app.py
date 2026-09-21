@@ -797,6 +797,117 @@ def run_llm_quantize(input_gguf: str, output_name: str, quant_type: str, imatrix
             yield log, result_path
 
 
+def run_llm_find_best(input_gguf: str, imatrix_file: str, quants: list[str] | None = None):
+    """Sweep the ~3.0bpw quant family on `input_gguf` and pick the winner.
+
+    Streams progress into the LLM log; the final yield returns the winning
+    quant type (pre-selects the Quant type dropdown) and the imatrix path
+    used (fills the imatrix box). If no imatrix is given but llama-imatrix is
+    built, one is generated first with the bundled default calibration -
+    imatrix is what makes the "Dynamic" recipes work, so the sweep is only
+    half-useful without it.
+    """
+    input_gguf = (input_gguf or "").strip()
+    if not input_gguf or not Path(input_gguf).is_file():
+        yield "Pick an input GGUF file first (the output of the conversion step above, or any existing .gguf file).", None, gr.update(), gr.update()
+        return
+    if not lcpp.is_quantize_built(LLAMACPP_DIR):
+        yield "llama-quantize isn't built yet - see the Setup section above.", None, gr.update(), gr.update()
+        return
+
+    import queue as _queue
+    import tempfile
+    import threading
+
+    from quant_gui import gguf_bench as gb
+
+    q: "_queue.Queue" = _queue.Queue()
+    SENTINEL = object()
+    state: dict = {}
+
+    def wlog(msg):
+        q.put(str(msg))
+
+    def worker():
+        try:
+            im = (imatrix_file or "").strip()
+            if not im and lcpp.is_imatrix_built(LLAMACPP_DIR):
+                cand = str(OUTPUT_DIR / f"{Path(input_gguf).stem}.bench.imatrix")
+                if Path(cand).is_file():
+                    im = cand
+                    wlog(f"Reusing previously generated imatrix: {cand}\n")
+                else:
+                    wlog("No imatrix given - generating one first with llama-imatrix (bundled default calibration)...\n")
+                    for line in lcpp.stream_generate_imatrix(
+                        LLAMACPP_DIR, input_gguf, cand, calibration_file=None, chunks=16,
+                    ):
+                        if line == "__OK__":
+                            break
+                        if line.startswith("__FAIL__"):
+                            wlog(f"imatrix generation failed ({line}) - sweeping without imatrix.\n")
+                            break
+                    if Path(cand).is_file():
+                        im = cand
+            if not im:
+                wlog("⚠️ No imatrix available - sweeping without it. IQ-quant results will be degraded or fail.\n")
+            out_dir = Path(tempfile.mkdtemp(prefix="quant-sweep-"))
+            try:
+                state["result"] = gb.run_sweep(
+                    ref_gguf=input_gguf,
+                    imatrix_file=im or None,
+                    out_dir=out_dir,
+                    quantize_bin=lcpp._quantize_binary(LLAMACPP_DIR),
+                    quants=quants,
+                    error_budget_params=300_000_000,
+                    log=wlog,
+                )
+                state["imatrix"] = im
+            finally:
+                import shutil as _shutil
+
+                _shutil.rmtree(out_dir, ignore_errors=True)
+        except Exception as exc:  # noqa: BLE001 - surfaced in the log, not swallowed
+            state["error"] = str(exc)
+        finally:
+            q.put(SENTINEL)
+
+    threading.Thread(target=worker, daemon=True).start()
+
+    log = (
+        f"Finding the best ~3bpw quant setting for {input_gguf}\n"
+        f"  candidates: {', '.join(quants or gb.DYNAMIC3_CANDIDATES)}\n"
+        "  measuring size, bits-per-weight, time, and reconstruction error vs this file\n\n"
+    )
+    yield log, None, gr.update(), gr.update()
+    while True:
+        item = q.get()
+        if item is SENTINEL:
+            break
+        log += item + "\n"
+        yield log, None, gr.update(), gr.update()
+
+    if "error" in state:
+        log += f"\n❌ Sweep failed: {state['error']}\n"
+        yield log, None, gr.update(), gr.update()
+        return
+    result = state["result"]
+    im = state.get("imatrix", "")
+    log += "\n" + gb.format_report(result) + "\n"
+    try:
+        picks = gb.best_settings(result)
+    except ValueError as exc:
+        log += f"\n❌ No usable results: {exc}\n"
+        yield log, None, gr.update(), gr.update()
+        return
+    winner = picks["best_value"]
+    log += (
+        f"\n🏆 Winner: {winner.label} — pre-selected in the Quant type dropdown.\n"
+        f"   (best quality: {picks['best_quality'].label}, smallest: {picks['smallest'].label})\n"
+        "   Now just pick an output filename and hit Quantize.\n"
+    )
+    yield log, None, winner.quant, gr.update(value=im) if im else gr.update()
+
+
 def run_convert(
     input_local: str,
     input_hf: str,
@@ -1757,7 +1868,16 @@ with gr.Blocks(title="Quant Convert GUI") as demo:
                     "can supply your own.",
                 )
             llm_quantize_output_name = gr.Textbox(label="Output filename (optional)", placeholder="auto")
-            llm_quantize_btn = gr.Button("Quantize")
+            with gr.Row():
+                llm_quantize_btn = gr.Button("Quantize")
+                llm_find_best_btn = gr.Button("Find best quant (sweep)")
+            gr.Markdown(
+                "**Find best quant** runs every ~3bpw candidate (Q3_K_L/M/S, IQ3_M/S/XS/XXS) through "
+                "llama-quantize on the input file — generating an imatrix first if none is given — and "
+                "measures size, time, and reconstruction error vs the input. The winner is pre-selected "
+                "in the Quant type dropdown; intermediate outputs are discarded. Weight-space error, not "
+                "perplexity — it ranks settings, it doesn't judge generation quality."
+            )
 
             with gr.Row():
                 with gr.Column():
@@ -2187,6 +2307,11 @@ with gr.Blocks(title="Quant Convert GUI") as demo:
             llm_quantize_imatrix, llm_quantize_tensor_types,
         ],
         outputs=[llm_log, llm_result_file],
+    )
+    llm_find_best_btn.click(
+        run_llm_find_best,
+        inputs=[llm_quantize_input, llm_quantize_imatrix],
+        outputs=[llm_log, llm_result_file, llm_quant_type, llm_quantize_imatrix],
     )
 
 
