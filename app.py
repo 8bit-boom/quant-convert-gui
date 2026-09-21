@@ -635,6 +635,67 @@ def run_llamacpp_setup_step(step: str, jobs: str):
             yield log, gr.update()
 
 
+def llm_downloaded_models(models_dir=None, hf_cache=None) -> list[str]:
+    """Model directories downloaded through this tab plus whatever sits in the
+    Hugging Face cache - so a model fetched in any session (by this app, by
+    another tool, gated or not) shows up in the picker without re-downloading.
+    Only dirs that actually look like HF models (config.json) are listed.
+    """
+    models_dir = Path(LLM_MODELS_DIR if models_dir is None else models_dir)
+    hf_cache = Path(hf_cache) if hf_cache is not None else Path.home() / ".cache" / "huggingface" / "hub"
+    out: list[str] = []
+    if models_dir.is_dir():
+        for d in sorted(models_dir.iterdir()):
+            if d.is_dir() and (d / "config.json").is_file():
+                out.append(str(d))
+    if hf_cache.is_dir():
+        for repo in sorted(hf_cache.iterdir()):
+            if not repo.is_dir() or not repo.name.startswith("models--"):
+                continue
+            snaps = repo / "snapshots"
+            if not snaps.is_dir():
+                continue
+            for s in sorted(snaps.iterdir()):
+                if s.is_dir() and (s / "config.json").is_file():
+                    out.append(str(s))
+    seen: set[str] = set()
+    dedup: list[str] = []
+    for p in out:
+        if p not in seen:
+            seen.add(p)
+            dedup.append(p)
+    return dedup
+
+
+def newest_model_gguf(directory=None) -> str | None:
+    """Newest real model .gguf in `directory` (imatrix outputs excluded by
+    name, since those also carry a .gguf extension)."""
+    directory = Path(OUTPUT_DIR if directory is None else directory)
+    if not directory.is_dir():
+        return None
+    candidates = [
+        p for p in directory.glob("*.gguf")
+        if "imatrix" not in p.name.lower() and p.stat().st_size > 0
+    ]
+    return str(max(candidates, key=lambda p: p.stat().st_mtime)) if candidates else None
+
+
+def newest_imatrix(directory=None) -> str | None:
+    """Newest imatrix file (`.imatrix` or `.imatrix.gguf`) in `directory`."""
+    directory = Path(OUTPUT_DIR if directory is None else directory)
+    if not directory.is_dir():
+        return None
+    candidates = [p for p in directory.glob("*.imatrix*") if p.stat().st_size > 0]
+    return str(max(candidates, key=lambda p: p.stat().st_mtime)) if candidates else None
+
+
+def _resolve_calibration(calib_mode: str, calibration_file: str) -> str:
+    """Auto mode -> '' (backend substitutes its bundled default); Custom -> the given path."""
+    if (calib_mode or "").strip().lower().startswith("auto"):
+        return ""
+    return (calibration_file or "").strip()
+
+
 def run_llm_download(source: str, repo_id: str, local_dir: str, token: str):
     if source == "Local directory":
         path = (local_dir or "").strip()
@@ -722,10 +783,20 @@ def run_llm_convert(model_dir: str, output_name: str, outtype: str):
             yield log, result_path
 
 
-def run_llm_generate_imatrix(model_gguf: str, calibration_file: str, output_name: str):
+def run_llm_generate_imatrix(model_gguf: str, calib_mode: str, calibration_file: str, output_name: str):
     model_gguf = (model_gguf or "").strip()
+    auto_note = ""
+    if not model_gguf:
+        detected = newest_model_gguf()
+        if detected:
+            model_gguf = detected
+            auto_note = f"(auto-detected newest model GGUF: {detected})\n"
     if not model_gguf or not Path(model_gguf).is_file():
-        yield "Pick an input GGUF file first (the output of the conversion step above, or any existing .gguf file).", None
+        yield (
+            "No model GGUF given and none auto-detected in the output folder - convert in step 3 "
+            "first, or paste any .gguf path.",
+            None,
+        )
         return
     if not lcpp.is_imatrix_built(LLAMACPP_DIR):
         yield "llama-imatrix isn't built yet - see the Setup section above.", None
@@ -738,8 +809,11 @@ def run_llm_generate_imatrix(model_gguf: str, calibration_file: str, output_name
     else:
         output_path = str(OUTPUT_DIR / f"{Path(model_gguf).stem}.imatrix.gguf")
 
-    calib = (calibration_file or "").strip()
-    log = f"Generating importance matrix for {model_gguf}\n"
+    calib = _resolve_calibration(calib_mode, calibration_file)
+    log = f"Generating importance matrix for {model_gguf}\n{auto_note}"
+    if calib_mode and not (calib_mode or "").strip().lower().startswith("auto") and not calib:
+        yield "Pick a calibration file, or switch Calibration back to Auto (bundled default).", None
+        return
     log += f"  calibration: {calib or 'bundled default (quant_gui/data/default_calibration.txt)'}\n"
     log += f"  output: {output_path}\n\n"
     yield log, None
@@ -759,12 +833,29 @@ def run_llm_generate_imatrix(model_gguf: str, calibration_file: str, output_name
 
 def run_llm_quantize(input_gguf: str, output_name: str, quant_type: str, imatrix_file: str, tensor_type_file: str):
     input_gguf = (input_gguf or "").strip()
+    auto_note = ""
+    if not input_gguf:
+        detected = newest_model_gguf()
+        if detected:
+            input_gguf = detected
+            auto_note = f"(auto-detected newest model GGUF: {detected})\n"
     if not input_gguf or not Path(input_gguf).is_file():
-        yield f"Pick an input GGUF file first (the output of the conversion step above, or any existing .gguf file).", None
+        yield (
+            "No input GGUF given and none auto-detected in the output folder - convert in step 3 "
+            "first, or paste any .gguf path.",
+            None,
+        )
         return
     if not lcpp.is_quantize_built(LLAMACPP_DIR):
         yield "llama-quantize isn't built yet - see the Setup section above.", None
         return
+
+    imatrix_file = (imatrix_file or "").strip()
+    if not imatrix_file:
+        detected_im = newest_imatrix()
+        if detected_im:
+            imatrix_file = detected_im
+            auto_note += f"(auto-detected imatrix: {detected_im})\n"
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     name = (output_name or "").strip()
@@ -774,9 +865,10 @@ def run_llm_quantize(input_gguf: str, output_name: str, quant_type: str, imatrix
         stem = Path(input_gguf).stem
         output_path = str(OUTPUT_DIR / f"{stem}-{quant_type}.gguf")
 
-    log = f"Quantizing {input_gguf} -> {quant_type}\n  output: {output_path}\n"
-    if (imatrix_file or "").strip():
-        log += f"  imatrix: {imatrix_file.strip()}\n"
+    log = f"Quantizing {input_gguf} -> {quant_type}\n{auto_note}"
+    log += f"  output: {output_path}\n"
+    if imatrix_file:
+        log += f"  imatrix: {imatrix_file}\n"
     if (tensor_type_file or "").strip():
         log += f"  tensor-type overrides: {tensor_type_file.strip()}\n"
     log += "\n"
@@ -811,6 +903,12 @@ def run_llm_find_best(input_gguf: str, imatrix_file: str, target_bpw: str = "", 
     "Dynamic" recipes work, so the sweep is only half-useful without it.
     """
     input_gguf = (input_gguf or "").strip()
+    auto_note = ""
+    if not input_gguf:
+        detected = newest_model_gguf()
+        if detected:
+            input_gguf = detected
+            auto_note = f"(auto-detected newest model GGUF: {detected})\n"
     if not input_gguf or not Path(input_gguf).is_file():
         yield "Pick an input GGUF file first (the output of the conversion step above, or any existing .gguf file).", None, gr.update(), gr.update()
         return
@@ -878,6 +976,7 @@ def run_llm_find_best(input_gguf: str, imatrix_file: str, target_bpw: str = "", 
 
     log = (
         f"Finding the best {target_bpw or '~3 bpw'} quant setting for {input_gguf}\n"
+        f"{auto_note}"
         f"  candidates: {', '.join(quants)}\n"
         "  measuring size, bits-per-weight, time, and reconstruction error vs this file\n\n"
     )
@@ -1817,6 +1916,12 @@ with gr.Blocks(title="Quant Convert GUI") as demo:
             )
             llm_download_btn = gr.Button("Download model")
             llm_model_dir = gr.Textbox(label="Resolved model directory", interactive=False)
+            llm_model_dd = gr.Dropdown(
+                choices=llm_downloaded_models(), value=None, interactive=True,
+                label="Downloaded models",
+                info="Everything downloaded through this tab or found in the Hugging Face cache - "
+                "pick one to fill the model directory above.",
+            )
 
             gr.Markdown("### 3. Convert to GGUF")
             with gr.Row():
@@ -1837,13 +1942,19 @@ with gr.Blocks(title="Quant Convert GUI") as demo:
                 "(per their own docs). Uses a small bundled generic calibration text by default; paste your "
                 "own file below for better results on a specific domain."
             )
+            llm_calib_mode = gr.Radio(
+                ["Auto (bundled generic calibration)", "Custom calibration file"],
+                value="Auto (bundled generic calibration)", label="Calibration",
+                info="Auto runs llama-imatrix on a small bundled generic text - the same default the "
+                "find-best sweep uses. Custom is better for a specific domain.",
+            )
             with gr.Row():
                 llm_imatrix_model = gr.Textbox(
-                    label="Model GGUF (F16/BF16)", placeholder="auto-filled from step 3, or paste any .gguf path",
+                    label="Model GGUF (F16/BF16)",
+                    placeholder="auto-filled from step 3; if empty, the newest GGUF in the output folder is used",
                 )
                 llm_imatrix_calibration = gr.Textbox(
-                    label="Calibration text file (optional)",
-                    placeholder="leave blank to use the bundled generic default",
+                    label="Custom calibration text file", placeholder="/path/to/calibration.txt", visible=False,
                 )
             llm_imatrix_output_name = gr.Textbox(label="Output filename (optional)", placeholder="auto")
             llm_imatrix_btn = gr.Button("Generate importance matrix")
@@ -1855,7 +1966,8 @@ with gr.Blocks(title="Quant Convert GUI") as demo:
             )
             with gr.Row():
                 llm_quantize_input = gr.Textbox(
-                    label="Input GGUF", placeholder="auto-filled from step 3, or paste any .gguf path",
+                    label="Input GGUF",
+                    placeholder="auto-filled from step 3; if empty, the newest GGUF in the output folder is used",
                 )
                 llm_quant_type = gr.Dropdown(lcpp.QUANT_TYPE_CHOICES, value="Q4_K_M", label="Quant type")
             with gr.Row():
@@ -2104,6 +2216,7 @@ with gr.Blocks(title="Quant Convert GUI") as demo:
     refresh_local_models_btn.click(refresh_local_models, outputs=[local_models_dd])
     demo.load(refresh_local_models, outputs=[local_models_dd])
     demo.load(refresh_checkpoint_dd, outputs=[checkpoint_dd])
+    demo.load(lambda: gr.update(choices=llm_downloaded_models()), outputs=[llm_model_dd])
 
     download_btn.click(do_hf_download, inputs=[input_hf_url, hf_token], outputs=[input_hf_local, download_status]).then(
         on_input_resolved, inputs=[input_hf_local, input_hf_url, preset_dd], outputs=[resolved_hint, preset_dd]
@@ -2291,6 +2404,15 @@ with gr.Blocks(title="Quant Convert GUI") as demo:
     llm_download_btn.click(
         run_llm_download, inputs=[llm_source, llm_repo_id, llm_local_dir, llm_hf_token],
         outputs=[llm_log, llm_model_dir],
+    ).then(
+        lambda: gr.update(choices=llm_downloaded_models()), outputs=[llm_model_dd],
+    )
+    llm_model_dd.change(
+        lambda v: v if v else gr.update(), inputs=[llm_model_dd], outputs=[llm_model_dir],
+    )
+    llm_calib_mode.change(
+        lambda m: gr.update(visible=(m or "").startswith("Custom")),
+        inputs=[llm_calib_mode], outputs=[llm_imatrix_calibration],
     )
 
     def carry_over_result(result_path):
@@ -2307,7 +2429,8 @@ with gr.Blocks(title="Quant Convert GUI") as demo:
         carry_over_result_x2, inputs=[llm_result_file], outputs=[llm_imatrix_model, llm_quantize_input],
     )
     llm_imatrix_btn.click(
-        run_llm_generate_imatrix, inputs=[llm_imatrix_model, llm_imatrix_calibration, llm_imatrix_output_name],
+        run_llm_generate_imatrix,
+        inputs=[llm_imatrix_model, llm_calib_mode, llm_imatrix_calibration, llm_imatrix_output_name],
         outputs=[llm_log, llm_result_file],
     ).then(carry_over_result, inputs=[llm_result_file], outputs=[llm_quantize_imatrix])
     llm_quantize_btn.click(
