@@ -377,6 +377,31 @@ Advanced ctq flags (exclude-layers regex, device override, calibration
 settings, etc.) are available under **Advanced options** for power users;
 everyone else can ignore them.
 
+## Pausing & resuming
+
+Conversions can run for hours, so the Convert tab has progress controls:
+
+- **⏸ Pause / ▶ Resume** freezes the running conversion (the whole ctq
+  process is suspended — SIGSTOP/SIGCONT on Linux, thread suspension on
+  Windows) and continues it exactly where it was. The app needs to stay
+  open for this.
+- **⏹ Stop & save progress** (with *Save resumable progress* checked)
+  stops the run after the current tensor and writes a **checkpoint** to the
+  `checkpoints/` folder: every finished tensor's data plus a manifest.
+  INT4 ConvRot and GGUF conversions can then be **resumed from exactly the
+  tensor where they stopped**, even after closing and reopening the app —
+  finished tensors are replayed from the checkpoint instead of being
+  recomputed, and the completed output is identical to an uninterrupted
+  run (covered by unit tests). Checkpoints are cleaned up automatically
+  once a run finishes; unfinished ones can also be deleted from the
+  **Saved checkpoints** list.
+- `ctq` itself (FP8/INT8/NVFP4/MXFP8) is an opaque subprocess with no
+  mid-run resume of its own, so stopping it saves a **session snapshot**
+  (the exact command plus all your settings); resuming relaunches that
+  identical conversion with one click instead of re-entering everything.
+  Any partially written output file is kept under a
+  `*.partial-<timestamp>` name rather than left to be overwritten.
+
 ## Project layout
 
 - `install.bat` / `install.sh`, `run.bat` / `run.sh`, `update.bat` /
@@ -387,7 +412,13 @@ everyone else can ignore them.
 - `app.py` — the Gradio UI.
 - `quant_gui/cli_builder.py` — turns GUI state into `ctq` CLI arguments (pure
   function, unit-testable without a GUI).
-- `quant_gui/runner.py` — runs `ctq` as a subprocess and streams its output.
+- `quant_gui/runner.py` — runs `ctq` as a subprocess and streams its output;
+  also implements process suspension for the Pause button.
+- `quant_gui/run_control.py` — the pause/cancel switches the Pause/Stop
+  buttons flip on whichever conversion is currently running.
+- `quant_gui/checkpoints.py` — on-disk checkpoints (manifest + per-tensor
+  shards) that make Stop-&-resume possible; ctq runs store a session
+  snapshot instead (see [Pausing & resuming](#pausing--resuming)).
 - `quant_gui/env_check.py` — detects ctq/PyTorch/CUDA/GPU availability.
 - `quant_gui/gpu_profiles.py` — GPU-generation-to-format recommendations.
 - `quant_gui/hf.py` — downloads a single file, or a whole repo (for LLMs),
