@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
+import time
 from pathlib import Path
 
 import gradio as gr
@@ -26,6 +28,7 @@ from quant_gui.gguf_backend import SUPPORTED_ARCH_NAMES as GGUF_SUPPORTED_ARCH_N
 from quant_gui.gguf_backend import is_available as gguf_is_available
 from quant_gui.int4_backend import stream_int4_conversion, stream_install as stream_int4_install
 from quant_gui.int4_backend import is_available as int4_is_available
+from quant_gui import runner
 from quant_gui.runner import stream_conversion
 from quant_gui.size_estimate import estimate_from_file, estimate_gguf_from_file, estimate_int4_mixed_from_file
 from quant_gui import checkpoints as ckpt
@@ -874,19 +877,38 @@ def run_convert(
     # "(2/6) Skipping tensor: blocks.0.firs.weight (Reason: krea2 skip)".
     tensor_progress_re = re.compile(r"\((\d+)/(\d+)\)\s*(Processing|Skipping)")
 
+    # Native stop/resume: when the installed ctq supports checkpoints, a
+    # stopped run saves per-tensor progress and resume continues from the
+    # last finished tensor. Older ctq builds fall back to the legacy stop
+    # (terminate + session snapshot that restarts from the beginning).
+    native_cp_dir = None
+    stop_file = None
+    if save_progress and runner.ctq_supports_checkpoints((python_exe or "").strip() or None):
+        native_cp_dir = CHECKPOINT_ROOT / f"ctq-native-{time.strftime('%Y%m%d-%H%M%S')}-{os.getpid()}"
+        stop_file = native_cp_dir / "stop.request"
+        native_cp_dir.mkdir(parents=True, exist_ok=True)
+        args = args + ["--checkpoint-dir", str(native_cp_dir), "--stop-file", str(stop_file)]
+
     control = RunControl()
     run_control.register(control)
     try:
         log = ""
         result_path = None
         bar = _progress_bar_html(0, "Starting ctq...")
-        for chunk in stream_conversion(args, python_executable=((python_exe or "").strip() or None), control=control):
+        for chunk in stream_conversion(
+            args,
+            python_executable=((python_exe or "").strip() or None),
+            control=control,
+            stop_file=str(stop_file) if stop_file else None,
+        ):
             if chunk == "__CTQ_OK__":
                 found = opts.output_path
                 if not found:
                     m = re.search(r"Saved to[:\s]+(\S+\.safetensors)", log, re.IGNORECASE)
                     found = m.group(1) if m else None
                 result_path = found if found and Path(found).is_file() else None
+                if native_cp_dir and native_cp_dir.exists():
+                    shutil.rmtree(native_cp_dir, ignore_errors=True)
                 log += "\n✅ Conversion finished.\n"
                 if result_path:
                     log += f"Output: {result_path}\n"
@@ -916,6 +938,46 @@ def run_convert(
                         "re-run the conversion when ready.\n"
                     )
                 yield log, None, bar
+            elif chunk == "__CTQ_STOPPED__":
+                # Checkpoint-aware ctq exited cleanly (code 3) with per-tensor
+                # progress saved. Keep a session snapshot pointing at the
+                # native checkpoint dir so resume continues mid-run.
+                if save_progress:
+                    done, total = 0, 0
+                    manifest = (native_cp_dir / "manifest.json") if native_cp_dir else None
+                    if manifest is not None and manifest.is_file():
+                        try:
+                            import json
+
+                            m = json.loads(manifest.read_text(encoding="utf-8"))
+                            done, total = len(m.get("entries", [])), int(m.get("total", 0))
+                        except (ValueError, OSError):
+                            pass
+                    ckpt.create_checkpoint(
+                        CHECKPOINT_ROOT, "ctq",
+                        params={
+                            "input_path": input_path,
+                            "args": args,
+                            "command": format_command(opts),
+                            "python_exe": (python_exe or "").strip(),
+                            "checkpoint_dir": str(native_cp_dir) if native_cp_dir else "",
+                        },
+                        output_path=opts.output_path or "",
+                    )
+                    if native_cp_dir:
+                        where = f"tensor {done}/{total}" if total else f"{done} tensors in"
+                        log += (
+                            f"\n⏹ Stopped. Per-tensor progress saved ({where}) - "
+                            "'Resume from checkpoint' below continues from the last finished tensor.\n"
+                        )
+                    else:
+                        log += (
+                            "\n⏹ Stopped. A session snapshot was saved - 'Resume from checkpoint' below "
+                            "relaunches this exact conversion with one click.\n"
+                        )
+                else:
+                    log += "\n⏹ Stopped by user.\n"
+                yield log, None, bar
             elif chunk.startswith("__CTQ_FAIL__"):
                 code = chunk.split(":", 1)[-1]
                 log += f"\n❌ ctq exited with code {code}.\n"
@@ -941,22 +1003,58 @@ def refresh_env():
     return report_markdown(check_environment())
 
 
+def _without_checkpoint_flags(args: list[str]) -> list[str]:
+    """Strip --checkpoint-dir/--stop-file pairs (re-added fresh on resume)."""
+    out: list[str] = []
+    skip_next = False
+    for a in args:
+        if skip_next:
+            skip_next = False
+            continue
+        if a in ("--checkpoint-dir", "--stop-file"):
+            skip_next = True
+            continue
+        if a.startswith("--checkpoint-dir=") or a.startswith("--stop-file="):
+            continue
+        out.append(a)
+    return out
+
+
 def resume_ctq(cp):
     """Relaunch a stopped ctq conversion from its saved session snapshot.
 
-    ctq is an opaque subprocess with no mid-run resume of its own, so this
-    restarts the conversion with the exact argument list the snapshot saved -
-    the value is not re-entering every setting by hand.
+    With a checkpoint-aware ctq build this is a true resume: the snapshot's
+    ``checkpoint_dir`` holds per-tensor progress, so ctq continues from the
+    last finished tensor. With older ctq builds it relaunches the exact
+    argument list the snapshot saved (restart from the beginning, but no
+    re-entering every setting by hand).
     """
-    args = list(cp.params.get("args") or [])
+    args = _without_checkpoint_flags(list(cp.params.get("args") or []))
     if not args:
         yield "That ctq snapshot has no stored command - can't resume.", None, ""
         return
 
+    checkpoint_dir = (cp.params.get("checkpoint_dir") or "").strip()
+    stop_file = None
+    if checkpoint_dir and runner.ctq_supports_checkpoints(cp.params.get("python_exe") or None):
+        stop_file = str(Path(checkpoint_dir) / "stop.request")
+        # A stale stop file from the previous stop would kill the resume
+        # instantly; the runner also cleans it up when ctq exits.
+        try:
+            if os.path.exists(stop_file):
+                os.unlink(stop_file)
+        except OSError:
+            pass
+        args = args + ["--checkpoint-dir", checkpoint_dir, "--stop-file", stop_file]
+        resume_msg = "ctq resumes from its saved per-tensor checkpoint."
+    else:
+        checkpoint_dir = ""
+        resume_msg = "ctq can't continue mid-conversion - this restarts the run with the exact saved settings."
+
     log = "Resuming ctq run from a session snapshot.\n"
     log += f"  command: {cp.params.get('command') or ' '.join(args)}\n"
-    log += "  (ctq can't continue mid-conversion - this restarts the run with the exact saved settings.)\n\n"
-    yield log, None, _progress_bar_html(0, "Restarting ctq from snapshot...")
+    log += f"  ({resume_msg})\n\n"
+    yield log, None, _progress_bar_html(0, "Resuming ctq...")
     # Matches the same "(12/264) Processing (INT8): ..." lines as run_convert.
     tensor_progress_re = re.compile(r"\((\d+)/(\d+)\)\s*(Processing|Skipping)")
 
@@ -966,7 +1064,10 @@ def resume_ctq(cp):
         result_path = None
         bar = _progress_bar_html(0, "Starting ctq...")
         for chunk in stream_conversion(
-            args, python_executable=(cp.params.get("python_exe") or None), control=control,
+            args,
+            python_executable=(cp.params.get("python_exe") or None),
+            control=control,
+            stop_file=stop_file,
         ):
             if chunk == "__CTQ_OK__":
                 found = cp.output_path
@@ -978,7 +1079,12 @@ def resume_ctq(cp):
                 if result_path:
                     log += f"Output: {result_path}\n"
                 ckpt.delete_checkpoint(CHECKPOINT_ROOT, cp.id)
+                if checkpoint_dir:
+                    shutil.rmtree(checkpoint_dir, ignore_errors=True)
                 yield log, result_path, _progress_bar_html(1.0, "Done")
+            elif chunk == "__CTQ_STOPPED__":
+                log += "\n⏹ Stopped again - progress is kept; resume it whenever.\n"
+                yield log, None, bar
             elif chunk == "__CTQ_CANCELLED__":
                 log += "\n⏹ Stopped again - the session snapshot is kept; resume it whenever.\n"
                 yield log, None, bar

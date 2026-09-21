@@ -395,12 +395,14 @@ Conversions can run for hours, so the Convert tab has progress controls:
   run (covered by unit tests). Checkpoints are cleaned up automatically
   once a run finishes; unfinished ones can also be deleted from the
   **Saved checkpoints** list.
-- `ctq` itself (FP8/INT8/NVFP4/MXFP8) is an opaque subprocess with no
-  mid-run resume of its own, so stopping it saves a **session snapshot**
-  (the exact command plus all your settings); resuming relaunches that
-  identical conversion with one click instead of re-entering everything.
-  Any partially written output file is kept under a
-  `*.partial-<timestamp>` name rather than left to be overwritten.
+- `ctq` itself (FP8/INT8/NVFP4/MXFP8) runs as a subprocess. With a
+  checkpoint-aware ctq build (one that supports `--checkpoint-dir`), stopping
+  saves **per-tensor progress** and *Resume from checkpoint* continues from
+  the last finished tensor — the same true-resume semantics as INT4/GGUF.
+  With older ctq builds, stopping saves a **session snapshot** (the exact
+  command plus all your settings) and resume relaunches that identical
+  conversion with one click; any partially written output file is kept under
+  a `*.partial-<timestamp>` name rather than left to be overwritten.
 
 ## Project layout
 
