@@ -21,6 +21,7 @@ from quant_gui.env_check import check_environment, report_markdown
 from quant_gui.filters import preset_choices, preset_highprec_regex, preset_label, suggest_preset
 from quant_gui.gpu_profiles import GPU_PROFILE_BY_KEY, GPU_PROFILES, detect_profile_key
 from quant_gui.hf import HFUrlError, download as hf_download, download_repo as hf_download_repo, parse_hf_url
+from quant_gui.loop_timing import LoopPhaseTimer
 from quant_gui import llamacpp_backend as lcpp
 from quant_gui.gguf_backend import stream_gguf_conversion, stream_install as stream_gguf_install
 from quant_gui.gguf_backend import QUANT_TYPE_CHOICES as GGUF_QUANT_TYPE_CHOICES
@@ -914,6 +915,7 @@ def run_convert(
 
     control = RunControl()
     run_control.register(control)
+    loop_timer = LoopPhaseTimer()
     try:
         log = ""
         result_path = None
@@ -932,6 +934,7 @@ def run_convert(
                 result_path = found if found and Path(found).is_file() else None
                 if native_cp_dir and native_cp_dir.exists():
                     shutil.rmtree(native_cp_dir, ignore_errors=True)
+                log += "\n" + loop_timer.finish() + "\n"
                 log += "\n✅ Conversion finished.\n"
                 if result_path:
                     log += f"Output: {result_path}\n"
@@ -1007,6 +1010,10 @@ def run_convert(
                 yield log, None, _progress_bar_html(1.0, "Failed")
             else:
                 log += chunk
+                for line in chunk.splitlines():
+                    note = loop_timer.feed(line)
+                    if note:
+                        log += note + "\n"
                 m = tensor_progress_re.search(chunk)
                 if m:
                     current, total, action = int(m.group(1)), int(m.group(2)), m.group(3)
@@ -1083,6 +1090,7 @@ def resume_ctq(cp):
 
     control = RunControl()
     run_control.register(control)
+    loop_timer = LoopPhaseTimer()
     try:
         result_path = None
         bar = _progress_bar_html(0, "Starting ctq...")
@@ -1098,6 +1106,7 @@ def resume_ctq(cp):
                     m = re.search(r"Saved to[:\s]+(\S+\.safetensors)", log, re.IGNORECASE)
                     found = m.group(1) if m else None
                 result_path = found if found and Path(found).is_file() else None
+                log += "\n" + loop_timer.finish() + "\n"
                 log += "\n✅ Conversion finished.\n"
                 if result_path:
                     log += f"Output: {result_path}\n"
@@ -1117,6 +1126,10 @@ def resume_ctq(cp):
                 yield log, None, _progress_bar_html(1.0, "Failed")
             else:
                 log += chunk
+                for line in chunk.splitlines():
+                    note = loop_timer.feed(line)
+                    if note:
+                        log += note + "\n"
                 m = tensor_progress_re.search(chunk)
                 if m:
                     current, total, action = int(m.group(1)), int(m.group(2)), m.group(3)
