@@ -320,7 +320,8 @@ into the project's own `.venv`.
 ```bash
 git clone <this repo>
 cd quant-convert-gui
-pip install -r requirements.txt
+pip install -r requirements.txt   # pulls ctq from the 8bit-boom main branch
+                                  # (native stop/resume checkpoint support)
 
 # PyTorch is deliberately not in requirements.txt — install the build that
 # matches your GPU from https://pytorch.org/get-started/locally/, e.g.:
@@ -330,6 +331,13 @@ pip install torch --index-url https://download.pytorch.org/whl/cu128
 pip install -U triton          # Linux
 pip install -U "triton-windows<3.7"   # Windows
 ```
+
+> ctq note: `requirements.txt` installs `convert-to-quant` from
+> [8bit-boom/convert_to_quant](https://github.com/8bit-boom/convert_to_quant)
+> `@main` rather than PyPI, because that build carries the `--checkpoint-dir`
+> / `--stop-file` stop-and-resume support the Pause/Stop/Resume buttons use.
+> Stock PyPI ctq works too — the GUI detects the missing support and Stop
+> falls back to the legacy terminate + restart-from-scratch snapshot.
 
 Minimum: Python 3.10+, PyTorch 2.8+, CUDA 12.8+ for FP8/INT8. NVFP4/MXFP8
 additionally need Python 3.12+, PyTorch 2.10+, CUDA 13.0+, and

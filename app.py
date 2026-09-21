@@ -1528,7 +1528,11 @@ with gr.Blocks(title="Quant Convert GUI") as demo:
             env_md = gr.Markdown(report_markdown(_initial_env))
             refresh_btn = gr.Button("Re-check environment")
             gr.Markdown(
-                "**Install ctq:**\n```bash\npip install convert-to-quant\n"
+                "**Install ctq** (the 8bit-boom main build — it has the native stop/resume "
+                "checkpoint support the Pause/Stop/Resume buttons use; plain PyPI "
+                "`convert-to-quant` works too but resumes restart from scratch):\n"
+                "```bash\n"
+                "pip install git+https://github.com/8bit-boom/convert_to_quant@main\n"
                 "# then install PyTorch separately for your GPU, e.g.\n"
                 "pip install torch --index-url https://download.pytorch.org/whl/cu128\n"
                 "pip install -U triton   # optional, speeds up INT8 kernels\n```"

@@ -144,6 +144,24 @@ def install_requirements() -> bool:
     return pip_install(["-r", str(req_file)])
 
 
+def ensure_checkpoint_capable_ctq() -> None:
+    """Make sure the installed ctq has native stop/resume checkpoints.
+
+    requirements.txt pins the 8bit-boom main build, but a user may have
+    upstream convert-to-quant installed from PyPI (which lacks
+    convert_to_quant.checkpoint) — the GUI then silently falls back to
+    restart-from-scratch resumes. Detect that and force the right build.
+    """
+    importlib.invalidate_caches()
+    if importlib.util.find_spec("convert_to_quant.checkpoint") is not None:
+        return
+    print("Installed ctq has no checkpoint support - installing the 8bit-boom main build...")
+    pip_install([
+        "--force-reinstall", "--no-deps",
+        "git+https://github.com/8bit-boom/convert_to_quant@main",
+    ])
+
+
 def print_final_report() -> None:
     sys.path.insert(0, str(REPO_ROOT))
     try:
@@ -169,6 +187,8 @@ def main() -> int:
     if not install_requirements():
         print("\n!! Installing requirements.txt failed - see the error above.")
         return 1
+
+    ensure_checkpoint_capable_ctq()
 
     print_final_report()
     print("\nSetup complete. Run run.bat (Windows) or run.sh (Linux/Mac) to start the app.")
