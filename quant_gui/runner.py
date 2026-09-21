@@ -292,6 +292,10 @@ def stream_conversion(
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
+            # ctq/tqdm emit UTF-8 box/bar glyphs (e.g. "━"); decoding with the
+            # Windows locale codec (cp1252) crashes on those bytes.
+            encoding="utf-8",
+            errors="replace",
             bufsize=1,
         )
     except FileNotFoundError as exc:
