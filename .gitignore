@@ -8,4 +8,7 @@ llm_models/
 llama.cpp/
 *.safetensors
 *.gguf
+*.imatrix
 run_history.json
+llama.cpp/
+gguf_bench_tmp/
