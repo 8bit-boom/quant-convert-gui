@@ -399,6 +399,8 @@ Conversions can run for hours, so the Convert tab has progress controls:
   mid-run resume of its own, so stopping it saves a **session snapshot**
   (the exact command plus all your settings); resuming relaunches that
   identical conversion with one click instead of re-entering everything.
+  Any partially written output file is kept under a
+  `*.partial-<timestamp>` name rather than left to be overwritten.
 
 ## Project layout
 

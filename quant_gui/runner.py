@@ -130,6 +130,46 @@ def _windows_suspend(pid: int, suspend: bool) -> None:
         raise OSError(f"failed to {action} {failures} thread(s) of pid {pid}")
 
 
+def _extract_output_path(args: list[str]) -> str | None:
+    """Find the ctq output file (-o/--output) in the CLI arg list."""
+    best: str | None = None
+    best_index: int | None = None
+    for flag in ("-o", "--output"):
+        for i, arg in enumerate(args):
+            value: str | None = None
+            if arg == flag and i + 1 < len(args):
+                value = args[i + 1]
+            elif arg.startswith(flag + "="):
+                value = arg.split("=", 1)[1]
+            if value is not None and (best_index is None or i < best_index):
+                best, best_index = value, i
+    return best
+
+
+def _preserve_partial_output(args: list[str]) -> str | None:
+    """Rename ctq's partially-written output to a timestamped .partial file.
+
+    ctq (FP8/INT8/NVFP4/MXFP8) writes its output incrementally; when a run
+    is stopped, the partial file is kept rather than left in place to be
+    overwritten by the next resume attempt. Returns the backup path, or
+    None when there is nothing worth keeping (or the rename failed).
+    """
+    import datetime
+
+    out = _extract_output_path(args)
+    if not out:
+        return None
+    try:
+        if not os.path.isfile(out) or os.path.getsize(out) == 0:
+            return None
+        stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+        backup = f"{out}.partial-{stamp}"
+        os.replace(out, backup)
+        return backup
+    except OSError:
+        return None
+
+
 def stream_conversion(
     args: list[str],
     python_executable: str | None = None,
@@ -144,7 +184,8 @@ def stream_conversion(
 
     `control` (a run_control.RunControl) enables the GUI's pause/stop
     buttons: pause freezes the whole ctq process between output lines
-    (SIGSTOP/SIGCONT, or thread suspension on Windows), stop terminates it.
+    (SIGSTOP/SIGCONT, or thread suspension on Windows), stop terminates it
+    (preserving any partial output file under a `.partial-<timestamp>` name).
     ctq itself keeps no resumable state, so a stopped run's checkpoint is a
     session snapshot (exact command + settings), not per-tensor progress.
     """
@@ -202,6 +243,9 @@ def stream_conversion(
     code = proc.wait()
 
     if cancelled:
+        backup = _preserve_partial_output(args)
+        if backup:
+            yield f"(partial output preserved: {backup} - resume restarts ctq from the beginning)\n"
         yield "__CTQ_CANCELLED__"
     elif code == 0:
         yield "__CTQ_OK__"
