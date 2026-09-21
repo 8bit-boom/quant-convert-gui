@@ -174,6 +174,49 @@ def ctq_supports_checkpoints(python_executable: str | None = None) -> bool:
     return ok
 
 
+_perf_flag_support_cache: dict[str | None, bool] = {}
+
+
+def ctq_supports_perf_flags(python_executable: str | None = None) -> bool:
+    """True when the ctq we would launch accepts the GPU perf flags.
+
+    Probes for the ``convert_to_quant.utils.debounced_gc`` module added in
+    the perf release (--fast_math / --loss_sync_batch / --snapshot_interval /
+    --compile_loop), without importing torch in this process. Uses the same
+    resolution rule as ``ctq_supports_checkpoints``; cached per interpreter.
+    """
+    key = (python_executable or "").strip() or None
+    if key in _perf_flag_support_cache:
+        return _perf_flag_support_cache[key]
+
+    ok = False
+    if _has_convert_to_quant(python_executable):
+        if key is None:
+            ok = importlib.util.find_spec("convert_to_quant.utils.debounced_gc") is not None
+        else:
+            try:
+                result = subprocess.run(
+                    [key, "-c", "import convert_to_quant.utils.debounced_gc"],
+                    capture_output=True, timeout=30,
+                )
+                ok = result.returncode == 0
+            except (OSError, subprocess.TimeoutExpired):
+                ok = False
+    else:
+        ctq_path = shutil.which("ctq")
+        if ctq_path:
+            try:
+                result = subprocess.run(
+                    [ctq_path, "--help"], capture_output=True, text=True, timeout=180,
+                )
+                ok = "--fast_math" in (result.stdout or "")
+            except (OSError, subprocess.TimeoutExpired):
+                ok = False
+
+    _perf_flag_support_cache[key] = ok
+    return ok
+
+
 def _extract_output_path(args: list[str]) -> str | None:
     """Find the ctq output file (-o/--output) in the CLI arg list."""
     best: str | None = None

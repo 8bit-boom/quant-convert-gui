@@ -215,3 +215,25 @@ def test_exit_code_3_without_cancel_is_reported_as_stopped(monkeypatch, tmp_path
     lines = list(runner.stream_conversion(["-i", "in.st"], stop_file=str(stop_file)))
 
     assert lines[-1] == "__CTQ_STOPPED__"
+
+
+def test_ctq_supports_perf_flags_in_process_probe(monkeypatch):
+    # No ctq installed in this interpreter -> False without subprocesses.
+    monkeypatch.setattr(runner, "_has_convert_to_quant", lambda python_executable=None: False)
+    monkeypatch.setattr(runner.shutil, "which", lambda name: None)
+    monkeypatch.setattr(runner, "_perf_flag_support_cache", {})
+    assert runner.ctq_supports_perf_flags() is False
+
+    # ctq present and its debounced_gc module importable (perf build) -> True.
+    monkeypatch.setattr(runner, "_has_convert_to_quant", lambda python_executable=None: True)
+    monkeypatch.setattr(
+        runner.importlib.util, "find_spec",
+        lambda name: object() if name == "convert_to_quant.utils.debounced_gc" else None,
+    )
+    monkeypatch.setattr(runner, "_perf_flag_support_cache", {})
+    assert runner.ctq_supports_perf_flags() is True
+
+    # ctq present but an older build (no debounced_gc module) -> False.
+    monkeypatch.setattr(runner.importlib.util, "find_spec", lambda name: None)
+    monkeypatch.setattr(runner, "_perf_flag_support_cache", {})
+    assert runner.ctq_supports_perf_flags() is False

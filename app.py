@@ -182,6 +182,10 @@ def build_options(
     optimizer: str,
     num_iter: float,
     manual_seed: float,
+    fast_math: bool,
+    loss_sync_batch: str,
+    snapshot_interval: str,
+    compile_loop: bool,
 ) -> ConvertOptions:
     simple = quality_mode == "simple"
 
@@ -230,6 +234,10 @@ def build_options(
         optimizer=optimizer,
         num_iter=int(num_iter),
         manual_seed=int(manual_seed),
+        fast_math=fast_math,
+        loss_sync_batch=int(loss_sync_batch) if str(loss_sync_batch or "").strip() else 1,
+        snapshot_interval=int(snapshot_interval) if str(snapshot_interval or "").strip() else 1,
+        compile_loop=compile_loop,
     )
 
 
@@ -818,6 +826,10 @@ def run_convert(
     optimizer: str,
     num_iter: float,
     manual_seed: float,
+    fast_math: bool,
+    loss_sync_batch: str,
+    snapshot_interval: str,
+    compile_loop: bool,
     python_exe: str,
     int4_layers_regex: str,
     int4_fallback_int8: bool,
@@ -860,11 +872,22 @@ def run_convert(
             custom_convrot_group_size=custom_convrot_group_size, custom_simple=custom_simple,
             fallback=fallback, fallback_simple=fallback_simple, device=device, output_dtype=output_dtype,
             verbose=verbose, calib_samples=calib_samples, optimizer=optimizer, num_iter=num_iter,
-            manual_seed=manual_seed,
+            manual_seed=manual_seed, fast_math=fast_math, loss_sync_batch=loss_sync_batch,
+            snapshot_interval=snapshot_interval, compile_loop=compile_loop,
         )
         args = build_args(opts)
     except OptionsError as exc:
         yield f"Can't build a valid command: {exc}", None, ""
+        return
+
+    if opts.uses_perf_flags and not runner.ctq_supports_perf_flags((python_exe or "").strip() or None):
+        yield (
+            "The installed ctq doesn't support the GPU speed flags — update it with:\n"
+            "  pip install --upgrade git+https://github.com/8bit-boom/convert_to_quant@main\n"
+            "(or uncheck the GPU speed options and try again.)",
+            None,
+            "",
+        )
         return
 
     if opts.output_path:
@@ -1474,6 +1497,35 @@ with gr.Blocks(title="Quant Convert GUI") as demo:
                                 info="Fixes the random seed used to pick calibration samples, for reproducible "
                                 "conversions. -1 picks a new seed each run.",
                             )
+                        gr.Markdown(
+                            "**GPU speed (opt-in, Learned mode only)** — measured on an RTX 5090. "
+                            "Everything here is off by default; outputs stay byte-identical with default settings."
+                        )
+                        with gr.Row():
+                            fast_math = gr.Checkbox(
+                                value=False, label="Fast math (TF32 + bf16)",
+                                info="~4.7x faster optimizer iterations on NVIDIA GPUs. Internal math at reduced "
+                                "precision, but measured output error ratio 1.000 — visually identical quants.",
+                            )
+                            loss_sync_batch = gr.Dropdown(
+                                ["1", "4", "8", "16"], value="1", label="Loss sync every K iters",
+                                info="CUDA only: read the optimizer loss back once per K iterations instead of "
+                                "every one. K=8 measured ~6x faster wall-clock. LR/early-stop decisions lag up to "
+                                "K-1 iterations — tiny drift possible (~4e-4 relative at K=8).",
+                            )
+                        with gr.Row():
+                            snapshot_interval = gr.Dropdown(
+                                ["1", "4", "8", "16"], value="1", label="Snapshot every N improvements",
+                                info="How often the best-so-far tensor is cloned during optimization (1 = every "
+                                "improvement, the original behavior). Higher values cut per-iteration copy overhead.",
+                            )
+                            compile_loop = gr.Checkbox(
+                                value=False, label="Compile optimizer loop (triton)",
+                                info="JIT-compile the optimizer's forward pass with torch.compile: ~5% steady-state "
+                                "gain but a 1-3 s compile warmup per tensor shape. Only worth enabling for large "
+                                "models with many same-shaped layers. Requires triton installed.",
+                            )
+                        gpu_perf_notice = gr.Markdown(visible=False)
                         python_exe = gr.Textbox(
                             label="Python executable running ctq (optional)",
                             placeholder="leave blank to use this app's Python / the ctq command on PATH",
@@ -1888,6 +1940,7 @@ with gr.Blocks(title="Quant Convert GUI") as demo:
         custom_convrot_group_size, custom_simple, fallback, fallback_simple,
         device, output_dtype, verbose,
         calib_samples, optimizer, num_iter, manual_seed,
+        fast_math, loss_sync_batch, snapshot_interval, compile_loop,
     ]
     # Names for preview_inputs[3:] (the build_options-ordered "rest" slice), so
     # code that needs one specific field doesn't have to hand-count positions.
@@ -1900,6 +1953,7 @@ with gr.Blocks(title="Quant Convert GUI") as demo:
             "custom_convrot_group_size", "custom_simple", "fallback", "fallback_simple",
             "device", "output_dtype", "verbose",
             "calib_samples", "optimizer", "num_iter", "manual_seed",
+            "fast_math", "loss_sync_batch", "snapshot_interval", "compile_loop",
         ])
     }
     assert len(preview_field_index) == len(preview_inputs) - 3
@@ -1908,6 +1962,30 @@ with gr.Blocks(title="Quant Convert GUI") as demo:
         comp.change(refresh_preview, inputs=preview_inputs, outputs=[command_preview])
 
     fmt_value.change(refresh_preview, inputs=preview_inputs, outputs=[command_preview])
+
+    def refresh_gpu_perf_notice(fast_math_v, loss_sync_batch_v, snapshot_interval_v, compile_loop_v, python_exe_v):
+        flags_on = (
+            bool(fast_math_v)
+            or bool(compile_loop_v)
+            or str(loss_sync_batch_v or "1") != "1"
+            or str(snapshot_interval_v or "1") != "1"
+        )
+        if not flags_on:
+            return gr.update(visible=False)
+        if runner.ctq_supports_perf_flags((python_exe_v or "").strip() or None):
+            return gr.update(visible=False)
+        return gr.update(
+            visible=True,
+            value="⚠️ The ctq this app would launch doesn't support the GPU speed flags. Update it with: "
+            "`pip install --upgrade git+https://github.com/8bit-boom/convert_to_quant@main`",
+        )
+
+    for comp in (fast_math, loss_sync_batch, snapshot_interval, compile_loop, python_exe):
+        comp.change(
+            refresh_gpu_perf_notice,
+            inputs=[fast_math, loss_sync_batch, snapshot_interval, compile_loop, python_exe],
+            outputs=[gpu_perf_notice],
+        )
 
     def do_estimate(*args):
         input_local_v, input_hf_local_v, source_v = args[0], args[1], args[2]
@@ -1954,7 +2032,8 @@ with gr.Blocks(title="Quant Convert GUI") as demo:
             save_metadata, low_memory, exclude_layers, custom_layers, custom_type, custom_scaling_mode,
             custom_convrot, custom_convrot_group_size, custom_simple, fallback, fallback_simple,
             device, output_dtype, verbose,
-            calib_samples, optimizer, num_iter, manual_seed, python_exe,
+            calib_samples, optimizer, num_iter, manual_seed, fast_math, loss_sync_batch,
+            snapshot_interval, compile_loop, python_exe,
             int4_layers_regex, int4_fallback_int8, gguf_quant_type, save_progress,
         ],
         outputs=[log_box, result_file, convert_progress],
