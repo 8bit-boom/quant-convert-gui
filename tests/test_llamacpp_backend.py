@@ -185,3 +185,62 @@ def test_stream_quantize_includes_imatrix_flag_in_command(tmp_path):
         tmp_path, "/in.gguf", "/out.gguf", "Q4_K_M", imatrix_file="/some/imatrix.gguf",
     ))
     assert "--imatrix /some/imatrix.gguf" in events[0]
+
+
+# ---------------------------------------------------- prebuilt binary download
+
+
+from quant_gui.llamacpp_backend import choose_prebuilt_assets  # noqa: E402
+
+B11070_ASSETS = [
+    "cudart-llama-bin-win-cuda-12.4-x64.zip",
+    "cudart-llama-bin-win-cuda-13.4-x64.zip",
+    "llama-b11070-bin-win-cpu-arm64.zip",
+    "llama-b11070-bin-win-cpu-x64.zip",
+    "llama-b11070-bin-win-cuda-12.4-x64.zip",
+    "llama-b11070-bin-win-cuda-13.4-x64.zip",
+    "llama-b11070-bin-win-vulkan-x64.zip",
+]
+
+
+def test_choose_prebuilt_assets_prefers_newest_cuda_with_cudart():
+    picked = choose_prebuilt_assets(B11070_ASSETS, use_cuda=True)
+    assert picked == {
+        "main": "llama-b11070-bin-win-cuda-13.4-x64.zip",
+        "cudart": "cudart-llama-bin-win-cuda-13.4-x64.zip",
+    }
+
+
+def test_choose_prebuilt_assets_cpu_picks_cpu_without_cudart():
+    picked = choose_prebuilt_assets(B11070_ASSETS, use_cuda=False)
+    assert picked == {"main": "llama-b11070-bin-win-cpu-x64.zip", "cudart": None}
+
+
+def test_choose_prebuilt_assets_falls_back_to_cpu_when_no_cuda_pair():
+    assets = ["llama-b1-bin-win-cuda-12.4-x64.zip", "llama-b1-bin-win-cpu-x64.zip"]
+    # no cudart package for 12.4 -> CUDA choice unusable -> CPU fallback
+    assert choose_prebuilt_assets(assets, use_cuda=True)["main"].endswith("cpu-x64.zip")
+
+
+def test_choose_prebuilt_assets_ignores_arm64_and_non_zip():
+    assets = ["llama-b1-bin-win-cpu-arm64.zip", "notes.txt", "llama-b1-bin-win-cpu-x64.zip"]
+    assert choose_prebuilt_assets(assets, use_cuda=True)["main"].endswith("cpu-x64.zip")
+
+
+def test_choose_prebuilt_assets_none_when_nothing_fits():
+    assert choose_prebuilt_assets(["llama-b1-bin-ubuntu-x64.zip"], use_cuda=True) is None
+    assert choose_prebuilt_assets([], use_cuda=False) is None
+
+
+def test_stream_build_quantize_noop_when_binaries_present():
+    """On machines with the real toolchain installed the 'already present'
+    fast path is covered by the suite run itself; everywhere else this
+    skips."""
+    from quant_gui.llamacpp_backend import is_imatrix_built, is_quantize_built
+
+    llamacpp_dir = Path(__file__).resolve().parent.parent / "llama.cpp"
+    if not (is_cloned(llamacpp_dir) and is_quantize_built(llamacpp_dir) and is_imatrix_built(llamacpp_dir)):
+        pytest.skip("local llama.cpp binaries not installed")
+    events = list(stream_build_quantize(llamacpp_dir))
+    assert events[-1] == "__OK__"
+    assert any("already present" in e for e in events)

@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import os
 import platform
+import shutil
 import subprocess
 import sys
 from dataclasses import dataclass, field
@@ -193,12 +194,207 @@ def stream_setup_venv(llamacpp_dir: Path):
     yield "__OK__"
 
 
-def stream_build_quantize(llamacpp_dir: Path, jobs: int | None = None):
+def stream_build_quantize(llamacpp_dir: Path, jobs: int | None = None, prefer: str | None = None):
+    """Make llama-quantize + llama-imatrix available, by the best means the
+    machine supports:
+
+    1. Already present (built or previously downloaded) - done.
+    2. ``prefer='source'`` or a working cmake+compiler toolchain - build
+       from source (needs cmake and a C/C++ toolchain installed).
+    3. Otherwise - download the official prebuilt Windows binaries for the
+       cloned llama.cpp's exact release tag (plus the matching cudart
+       package when an NVIDIA GPU is present) and unpack them where the
+       rest of this module looks for built binaries.
+
+    Yields log lines, then "__OK__" or "__FAIL__:<code>".
+    """
+    llamacpp_dir = Path(llamacpp_dir)
     if not is_cloned(llamacpp_dir):
         yield "llama.cpp isn't cloned yet - clone it first.\n"
         yield "__FAIL__:1"
         return
+    if _quantize_binary(llamacpp_dir) is not None and _imatrix_binary(llamacpp_dir) is not None:
+        yield "llama-quantize and llama-imatrix are already present - nothing to do.\n"
+        yield "__OK__"
+        return
 
+    prefer = (prefer or "auto").lower()
+    if prefer == "source" or (prefer == "auto" and _toolchain_available()):
+        yield from _stream_build_from_source(llamacpp_dir, jobs=jobs)
+        return
+    if platform.system() == "Windows":
+        yield "No cmake/C++ toolchain found - downloading official prebuilt binaries instead.\n"
+        yield "(Set one up and use prefer='source' to compile from source.)\n"
+        yield from _stream_download_prebuilt(llamacpp_dir)
+        return
+    yield (
+        "No cmake/C++ toolchain found, and prebuilt downloads are only wired up for Windows. "
+        "Install cmake + a C/C++ compiler (build-essential / Xcode CLT / VS Build Tools) and retry.\n"
+    )
+    yield "__FAIL__:1"
+
+
+def _toolchain_available() -> bool:
+    return shutil.which("cmake") is not None
+
+
+def local_build_tag(llamacpp_dir: Path) -> str | None:
+    """The llama.cpp release tag of this clone (e.g. 'b11070'), via git describe."""
+    try:
+        r = subprocess.run(
+            ["git", "-C", str(llamacpp_dir), "describe", "--tags", "--always"],
+            capture_output=True, text=True, timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if r.returncode != 0:
+        return None
+    tag = (r.stdout or "").strip()
+    return tag or None
+
+
+def choose_prebuilt_assets(assets: list[str], use_cuda: bool) -> dict | None:
+    """Pick the download URLs-to-be from a release's asset names.
+
+    Returns {"main": name, "cudart": name|None} or None when nothing fits.
+    Prefers the newest CUDA flavour when use_cuda and a matching cudart
+    package exists; falls back to the CPU build.
+    """
+    win = [a for a in assets if a.endswith(".zip") and "-bin-win-" in a and "arm64" not in a]
+    cudavers = sorted(
+        {a.split("-cuda-")[1].split("-")[0] for a in win if "-cuda-" in a},
+        key=lambda v: [int(x) for x in v.split(".")],
+        reverse=True,
+    )
+    if use_cuda:
+        for cv in cudavers:
+            main = next(
+                (a for a in win if f"-bin-win-cuda-{cv}-x64" in a and not a.startswith("cudart-")),
+                None,
+            )
+            cudart = next((a for a in win if a.startswith("cudart-") and f"-cuda-{cv}-x64" in a), None)
+            if main and cudart:
+                return {"main": main, "cudart": cudart}
+    main = next((a for a in win if "-bin-win-cpu-x64" in a), None)
+    if main:
+        return {"main": main, "cudart": None}
+    return None
+
+
+def _nvidia_gpu_present() -> bool:
+    return shutil.which("nvidia-smi") is not None
+
+
+def _stream_download_prebuilt(llamacpp_dir: Path, use_cuda: bool | None = None):
+    """Download + unpack official prebuilt llama.cpp binaries for this clone's tag."""
+    import json
+    import urllib.request
+    import zipfile
+
+    if use_cuda is None:
+        use_cuda = _nvidia_gpu_present()
+
+    tag = local_build_tag(llamacpp_dir)
+    api = "https://api.github.com/repos/ggml-org/llama.cpp/releases"
+    release = None
+    if tag:
+        try:
+            with urllib.request.urlopen(f"{api}/tags/{tag}", timeout=30) as r:
+                release = json.loads(r.read().decode("utf-8"))
+            yield f"Found GitHub release {tag} matching this clone.\n"
+        except Exception:  # noqa: BLE001 - fall through to latest release
+            release = None
+    if release is None:
+        yield (
+            f"No GitHub release for tag {tag!r} (or unreachable) - using the latest release; "
+            "binaries may be a bit newer than the cloned scripts.\n"
+        )
+        try:
+            with urllib.request.urlopen(f"{api}/latest", timeout=30) as r:
+                release = json.loads(r.read().decode("utf-8"))
+        except Exception as exc:  # noqa: BLE001
+            yield f"Couldn't reach GitHub releases: {exc}\n"
+            yield "__FAIL__:1"
+            return
+
+    assets = [a["name"] for a in release.get("assets", [])]
+    picked = choose_prebuilt_assets(assets, use_cuda=use_cuda)
+    if picked is None:
+        yield f"Release {release.get('tag_name')} has no Windows x64 binaries to download.\n"
+        yield "__FAIL__:1"
+        return
+    yield f"Release {release.get('tag_name')}: downloading {picked['main']}"
+    yield f" (GPU detected: CUDA build + cudart package)\n" if picked["cudart"] else " (CPU build)\n"
+
+    dest = llamacpp_dir / "build" / "bin" / "Release"
+    dest.mkdir(parents=True, exist_ok=True)
+    tmp_dir = llamacpp_dir / "build" / ".prebuilt-download"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        for name in [picked["main"], picked["cudart"]]:
+            if not name:
+                continue
+            url = next(a["browser_download_url"] for a in release["assets"] if a["name"] == name)
+            target = tmp_dir / name
+            yield f"  {name} ...\n"
+            try:
+                with urllib.request.urlopen(url, timeout=60) as r, open(target, "wb") as f:
+                    total = int(r.headers.get("Content-Length") or 0)
+                    got, since = 0, 0
+                    while True:
+                        chunk = r.read(1 << 20)
+                        if not chunk:
+                            break
+                        f.write(chunk)
+                        got += len(chunk)
+                        since += len(chunk)
+                        if since >= 25 * (1 << 20):
+                            since = 0
+                            pct = f" {got/1e6:.0f}/{total/1e6:.0f} MB" if total else f" {got/1e6:.0f} MB"
+                            yield f"    ...{pct}\n"
+            except Exception as exc:  # noqa: BLE001
+                yield f"  download failed: {exc}\n"
+                yield "__FAIL__:1"
+                return
+            yield "    unpacking...\n"
+            try:
+                with zipfile.ZipFile(target) as zf:
+                    zf.extractall(dest)
+            except zipfile.BadZipFile as exc:
+                yield f"  corrupt download: {exc}\n"
+                yield "__FAIL__:1"
+                return
+            target.unlink()
+    finally:
+        try:
+            tmp_dir.rmdir()
+        except OSError:
+            pass
+
+    q = _quantize_binary(llamacpp_dir)
+    i = _imatrix_binary(llamacpp_dir)
+    if q is None or i is None:
+        yield "Unpack finished but llama-quantize/llama-imatrix still not found.\n"
+        yield "__FAIL__:1"
+        return
+    try:
+        # --version isn't a real flag: exit 0/1 with usage text still proves
+        # the binary and its DLLs load; a missing cudart DLL would give a
+        # large Windows status code or fail to launch at all.
+        r = subprocess.run([str(q), "--version"], capture_output=True, timeout=60)
+        launched_ok = r.returncode in (0, 1)
+    except (OSError, subprocess.TimeoutExpired):
+        launched_ok = False
+    if not launched_ok:
+        yield "llama-quantize is present but failed to launch - a runtime DLL is probably missing.\n"
+        yield "__FAIL__:1"
+        return
+    yield "✅ Prebuilt binaries installed and verified runnable (llama-quantize + llama-imatrix).\n"
+    yield "__OK__"
+
+
+def _stream_build_from_source(llamacpp_dir: Path, jobs: int | None = None):
+    """Compile llama-quantize + llama-imatrix from source (cmake path)."""
     build_dir = llamacpp_dir / "build"
     jobs = jobs or (os.cpu_count() or 4)
 

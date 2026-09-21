@@ -603,7 +603,8 @@ def llamacpp_status_markdown() -> str:
     return (
         f"**llama.cpp cloned** — {ok(cloned)} `{LLAMACPP_DIR}`\n\n"
         f"**Python deps installed** (transformers/sentencepiece/gguf, in their own venv) — {ok(venv_ready)}\n\n"
-        f"**llama-quantize + llama-imatrix built** (for real K-quants like Q4_K_M, and for imatrix/dynamic-"
+        f"**llama-quantize + llama-imatrix ready** (built from source, or official prebuilt binaries "
+        f"downloaded - for real K-quants like Q4_K_M, and for imatrix/dynamic-"
         f"style calibrated quants) — {ok(quantize_built and imatrix_built)} "
         + ("_optional - skip this if F16/BF16/Q8_0 is enough for you_" if not (quantize_built and imatrix_built) else "")
     )
@@ -1794,7 +1795,7 @@ with gr.Blocks(title="Quant Convert GUI") as demo:
             with gr.Row():
                 llamacpp_clone_btn = gr.Button("Clone / update llama.cpp")
                 llamacpp_venv_btn = gr.Button("Install Python deps")
-                llamacpp_build_btn = gr.Button("Build llama-quantize + llama-imatrix (optional, for K-quants)")
+                llamacpp_build_btn = gr.Button("Get llama-quantize + llama-imatrix (build or download)")
             llamacpp_build_jobs = gr.Textbox(
                 label="Build parallelism (optional)", placeholder="defaults to CPU core count",
             )
