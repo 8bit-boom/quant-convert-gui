@@ -95,6 +95,31 @@ class LoopPhaseTimer:
             )
         return "\n".join(l for l in lines if l)
 
+    def stats(self) -> dict:
+        """JSON-able per-tensor breakdown for run-history persistence.
+
+        ``seconds`` is the tqdm-bracket estimate (sub-second phases are
+        counted as 0.5). Empty when no optimizer loop was seen.
+        """
+        total_s = sum(t[1] for t in self._tensors)
+        total_iters = sum(max(1, t[2]) for t in self._tensors)
+        return {
+            "tensor_count": len(self._tensors),
+            "total_seconds": round(total_s, 3),
+            "total_iters": total_iters,
+            "avg_ms_per_iter": round(1000.0 * total_s / max(1, total_iters), 3),
+            "tensors": [
+                {
+                    "name": t[0],
+                    "seconds": round(t[1], 3),
+                    "iters": t[2],
+                    "total_iters": t[3],
+                    "ms_per_iter": round(1000.0 * t[1] / max(1, t[2]), 3),
+                }
+                for t in self._tensors
+            ],
+        }
+
     def _close_current(self) -> str | None:
         if self._current_name is None:
             return None

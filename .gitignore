@@ -8,3 +8,4 @@ llm_models/
 llama.cpp/
 *.safetensors
 *.gguf
+run_history.json

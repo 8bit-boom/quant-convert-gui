@@ -34,12 +34,14 @@ from quant_gui.runner import stream_conversion
 from quant_gui.size_estimate import estimate_from_file, estimate_gguf_from_file, estimate_int4_mixed_from_file
 from quant_gui import checkpoints as ckpt
 from quant_gui import run_control
+from quant_gui import run_history as rh
 from quant_gui.run_control import RunControl
 
 APP_DIR = Path(__file__).resolve().parent
 DOWNLOAD_DIR = APP_DIR / "downloads"
 OUTPUT_DIR = APP_DIR / "converted"
 CHECKPOINT_ROOT = ckpt.checkpoint_root(APP_DIR)
+RUN_HISTORY = APP_DIR / rh.HISTORY_NAME
 LLAMACPP_DIR = lcpp.default_llamacpp_dir(APP_DIR)
 LLM_MODELS_DIR = APP_DIR / "llm_models"
 
@@ -935,6 +937,17 @@ def run_convert(
                 if native_cp_dir and native_cp_dir.exists():
                     shutil.rmtree(native_cp_dir, ignore_errors=True)
                 log += "\n" + loop_timer.finish() + "\n"
+                try:
+                    hist_key = str(Path(result_path or opts.output_path or input_path).resolve())
+                except OSError:
+                    hist_key = result_path or opts.output_path or input_path
+                log += _record_run_history(
+                    key=hist_key,
+                    input_path=input_path,
+                    output_path=result_path or opts.output_path or "",
+                    command=format_command(opts),
+                    loop_timer=loop_timer,
+                )
                 log += "\n✅ Conversion finished.\n"
                 if result_path:
                     log += f"Output: {result_path}\n"
@@ -1033,6 +1046,41 @@ def refresh_env():
     return report_markdown(check_environment())
 
 
+def _record_run_history(
+    *, key: str, input_path: str, output_path: str, command: str,
+    loop_timer: LoopPhaseTimer, resumed: bool = False,
+) -> str:
+    """Persist this run's loop stats; return a '[loop]' comparison line.
+
+    Compares against the most recent prior run of the same conversion so
+    the GPU speed flags' effect is visible across conversions, not just
+    inside one log. History is best-effort: any I/O error yields "".
+    """
+    try:
+        loop = loop_timer.stats()
+        stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        rh.record(
+            RUN_HISTORY,
+            {
+                "timestamp": stamp,
+                "key": key,
+                "input": input_path,
+                "output": output_path,
+                "command": command,
+                "resumed": resumed,
+                "loop": loop,
+            },
+        )
+        prev = rh.previous(rh.load(RUN_HISTORY), key, before=stamp)
+        if prev:
+            line = rh.comparison_line(prev, loop)
+            if line:
+                return line + "\n"
+    except OSError:
+        pass
+    return ""
+
+
 def _without_checkpoint_flags(args: list[str]) -> list[str]:
     """Strip --checkpoint-dir/--stop-file pairs (re-added fresh on resume)."""
     out: list[str] = []
@@ -1107,6 +1155,20 @@ def resume_ctq(cp):
                     found = m.group(1) if m else None
                 result_path = found if found and Path(found).is_file() else None
                 log += "\n" + loop_timer.finish() + "\n"
+                try:
+                    hist_key = str(Path(
+                        result_path or cp.output_path or cp.params.get("input_path") or ""
+                    ).resolve())
+                except OSError:
+                    hist_key = result_path or cp.output_path or str(cp.params.get("input_path") or "")
+                log += _record_run_history(
+                    key=hist_key,
+                    input_path=str(cp.params.get("input_path") or ""),
+                    output_path=result_path or cp.output_path or "",
+                    command=str(cp.params.get("command") or " ".join(args)),
+                    loop_timer=loop_timer,
+                    resumed=True,
+                )
                 log += "\n✅ Conversion finished.\n"
                 if result_path:
                     log += f"Output: {result_path}\n"
