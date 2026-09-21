@@ -1031,6 +1031,133 @@ def run_llm_find_best(input_gguf: str, imatrix_file: str, target_bpw: str = "", 
     yield log, None, winner.quant, gr.update(value=im) if im else gr.update()
 
 
+def run_llm_smart_tune(model_gguf: str, imatrix_file: str, mode: str, budget_gb: str, output_name: str):
+    """Stage 1-3 of the smart tuner: score sensitivity -> assign under budget
+    -> write tensor-type file -> quantize with it. Stage 1 runs in a worker
+    thread (pure-Python quantization is CPU-heavy); progress streams here."""
+    import queue as _queue
+    import threading
+
+    from quant_gui import smart_quant as sq
+
+    model_gguf = (model_gguf or "").strip()
+    auto_note = ""
+    if not model_gguf:
+        detected = newest_model_gguf()
+        if detected:
+            model_gguf = detected
+            auto_note = f"(auto-detected newest model GGUF: {detected})\n"
+    if not model_gguf or not Path(model_gguf).is_file():
+        yield "No model GGUF given and none auto-detected in the output folder - convert in step 3 first, or paste any .gguf path.", None
+        return
+    imatrix_file = (imatrix_file or "").strip()
+    if not imatrix_file:
+        detected_im = newest_imatrix()
+        if detected_im:
+            imatrix_file = detected_im
+            auto_note += f"(auto-detected imatrix: {detected_im})\n"
+    if not imatrix_file or not Path(imatrix_file).is_file():
+        yield "No imatrix given and none auto-detected - generate one in step 4 first (Auto calibration is fine).", None
+        return
+    if not lcpp.is_quantize_built(LLAMACPP_DIR):
+        yield "llama-quantize isn't built yet - see the Setup section above.", None
+        return
+    try:
+        budget = float((budget_gb or "").strip()) * 1e9
+    except ValueError:
+        budget = 0.0
+    if budget <= 0:
+        yield f"Size budget must be a positive number of GB, got {budget_gb!r}.", None
+        return
+
+    use_k_ladder = (mode or "").lower().startswith("k-ladder")
+    log = (
+        f"Smart per-tensor tuning: {model_gguf}\n{auto_note}"
+        f"  imatrix: {imatrix_file}\n"
+        f"  mode: {mode}   budget: {budget / 1e9:.2f} GB\n\n"
+        "Stage 1 - imatrix-weighted sensitivity ranking (pure Python, CPU-bound)...\n"
+    )
+    yield log, None
+
+    q: "_queue.Queue" = _queue.Queue()
+    SENTINEL = object()
+    state: dict = {}
+
+    def worker():
+        try:
+            scores = sq.score_model(
+                model_gguf, imatrix_file,
+                progress=lambda m: q.put(str(m) + "\n"),
+            )
+            state["scores"] = scores
+        except Exception as exc:  # noqa: BLE001 - surfaced in the log
+            state["error"] = str(exc)
+        finally:
+            q.put(SENTINEL)
+
+    threading.Thread(target=worker, daemon=True).start()
+    while True:
+        item = q.get()
+        if item is SENTINEL:
+            break
+        log += item
+        yield log, None
+    if "error" in state:
+        yield log + f"\n❌ Scoring failed: {state['error']}\n", None
+        return
+
+    scores = state["scores"]
+    scored = [s for s in scores if not s.skipped and s.err]
+    n_moe = len([s for s in scored if s.is_moe])
+    log += f"\nscored {len(scored)} tensors ({n_moe} MoE expert stacks).\nStage 2 - assignment under budget...\n"
+    yield log, None
+
+    try:
+        if use_k_ladder:
+            assignment, report = sq.assign_k_ladder(scores, int(budget))
+            base_ftype = "Q4_K_M"
+        else:
+            assignment, report = sq.assign_legacy(scores, int(budget))
+            base_ftype = "Q4_0"
+    except sq.SmartQuantError as exc:
+        yield log + f"\n❌ Assignment failed: {exc}\n", None
+        return
+    for line in report:
+        log += f"  {line}\n"
+    for line in sq.moe_expert_report(scores):
+        log += f"  MoE: {line}\n"
+
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    stem = Path(model_gguf).stem
+    tt_path = OUTPUT_DIR / f"{stem}.tensor-types.txt"
+    tt_path.write_text(sq.emit_tensor_type_file(assignment), encoding="utf-8")
+    log += f"\nStage 3 - tensor-type file: {tt_path}\nquantizing with llama-quantize (base {base_ftype})...\n"
+    yield log, None
+
+    name = (output_name or "").strip()
+    if name:
+        output_path = str(OUTPUT_DIR / name) if not os.path.isabs(name) and os.sep not in name else name
+    else:
+        suffix = "smart" if use_k_ladder else "smart-legacy"
+        output_path = str(OUTPUT_DIR / f"{stem}-{suffix}.gguf")
+    result_path = None
+    for line in lcpp.stream_quantize(
+        LLAMACPP_DIR, model_gguf, output_path, base_ftype,
+        imatrix_file=imatrix_file, tensor_type_file=str(tt_path),
+    ):
+        if line == "__OK__":
+            result_path = output_path if Path(output_path).is_file() else None
+            size_gb = Path(output_path).stat().st_size / 1e9 if result_path else 0.0
+            log += f"\n✅ Done. Output: {result_path or output_path} ({size_gb:.2f} GB)\n"
+            yield log, result_path
+        elif line.startswith("__FAIL__"):
+            log += "\n❌ Quantization failed (see log above).\n"
+            yield log, None
+        else:
+            log += line
+            yield log, result_path
+
+
 def run_convert(
     input_local: str,
     input_hf: str,
@@ -1999,9 +2126,9 @@ with gr.Blocks(title="Quant Convert GUI") as demo:
                 llm_quantize_tensor_types = gr.Textbox(
                     label="Per-layer type overrides (optional, advanced)",
                     placeholder="path to a tensor-type-file, e.g. lines like 'blk.0.attn_k.weight=Q8_0'",
-                    info="The real mechanism behind manual \"dynamic\" per-layer mixing - this app doesn't "
-                    "generate one automatically (Unsloth's own per-model choices aren't published), but you "
-                    "can supply your own.",
+                    info="The real mechanism behind manual \"dynamic\" per-layer mixing. Step 6 below "
+                    "generates one automatically from imatrix-weighted sensitivity; paste any such file "
+                    "here to quantize with it directly.",
                 )
             llm_quantize_output_name = gr.Textbox(label="Output filename (optional)", placeholder="auto")
             llm_target_bpw = gr.Radio(
@@ -2021,6 +2148,40 @@ with gr.Blocks(title="Quant Convert GUI") as demo:
                 "automatically also get Q8_0 token-embedding variants. Weight-space error, not "
                 "perplexity — it ranks settings, it doesn't judge generation quality."
             )
+
+            gr.Markdown(
+                "### 6. Smart per-tensor tuning (Dynamic-quant style)\n"
+                "Three stages: **(1)** rank every tensor's quantization sensitivity using your imatrix "
+                "as the activation-importance weight (minutes, pure Python — no GPU needed); "
+                "**(2)** greedily assign per-tensor types under a size budget — the K-ladder mode maps "
+                "sensitivity onto q3_k/q4_k/q5_k/q6_k, the legacy mode uses exactly-measured q4_0/q5_0/"
+                "q8_0 errors; **(3)** write a llama-quantize `--tensor-type-file` and quantize with it. "
+                "Embeddings, the output tensor and MoE routers are never dropped below the floor."
+            )
+            with gr.Row():
+                llm_smart_model = gr.Textbox(
+                    label="Model GGUF (F16/BF16 reference)",
+                    placeholder="auto-detects the newest model GGUF in the output folder",
+                )
+                llm_smart_imatrix = gr.Textbox(
+                    label="Importance matrix",
+                    placeholder="auto-detects the newest imatrix in the output folder",
+                )
+            with gr.Row():
+                llm_smart_mode = gr.Radio(
+                    ["K-ladder (rank-mapped)", "Legacy (exact-scored)"], value="K-ladder (rank-mapped)",
+                    label="Assignment mode",
+                    info="K-ladder produces llama.cpp-friendly q3_k..q6_k mixes sized to your budget; "
+                    "legacy uses only pure-Python-measurable types with exact errors.",
+                )
+                llm_smart_budget = gr.Textbox(
+                    label="Size budget (GB)", value="8.0",
+                    info="Target total file size. The tuner downgrades insensitive tensors and "
+                    "upgrades sensitive ones until the estimate fits.",
+                )
+            with gr.Row():
+                llm_smart_output = gr.Textbox(label="Output filename (optional)", placeholder="auto")
+                llm_smart_btn = gr.Button("Tune + quantize", variant="primary")
 
             with gr.Row():
                 with gr.Column():
@@ -2466,6 +2627,11 @@ with gr.Blocks(title="Quant Convert GUI") as demo:
         run_llm_find_best,
         inputs=[llm_quantize_input, llm_quantize_imatrix, llm_target_bpw],
         outputs=[llm_log, llm_result_file, llm_quant_type, llm_quantize_imatrix],
+    )
+    llm_smart_btn.click(
+        run_llm_smart_tune,
+        inputs=[llm_smart_model, llm_smart_imatrix, llm_smart_mode, llm_smart_budget, llm_smart_output],
+        outputs=[llm_log, llm_result_file],
     )
 
 

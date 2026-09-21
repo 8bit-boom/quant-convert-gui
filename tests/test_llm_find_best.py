@@ -18,7 +18,9 @@ def _last(gen):
     return item
 
 
-def test_find_best_requires_input_file():
+def test_find_best_requires_input_file(monkeypatch, tmp_path):
+    # empty output dir: nothing to auto-detect -> must ask for an input file
+    monkeypatch.setattr(app, "OUTPUT_DIR", tmp_path)
     yields = list(app.run_llm_find_best("", ""))
     assert len(yields) == 1
     log, file, quant_update, imatrix_update = yields[0]
@@ -26,7 +28,8 @@ def test_find_best_requires_input_file():
     assert file is None
 
 
-def test_find_best_rejects_missing_file():
+def test_find_best_rejects_missing_file(monkeypatch, tmp_path):
+    monkeypatch.setattr(app, "OUTPUT_DIR", tmp_path)
     log, file, _, _ = list(app.run_llm_find_best("no/such/model.gguf", ""))[0]
     assert "Pick an input GGUF" in log
     assert file is None
