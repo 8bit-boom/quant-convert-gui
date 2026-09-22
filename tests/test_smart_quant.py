@@ -208,7 +208,7 @@ def test_sensitive_detection():
 
 def test_k_ladder_upgrades_most_sensitive():
     # 5 identical-shape tensors, distinct sensitivities; generous budget
-    shapes = (256, 8)
+    shapes = (8, 256)
     scores = [
         _mk_score(f"blk.{i}.attn_q.weight", shapes, err={"q4_0": 0.001 * (i + 1)})
         for i in range(5)
@@ -224,7 +224,7 @@ def test_k_ladder_upgrades_most_sensitive():
 
 
 def test_k_ladder_downgrades_least_sensitive_when_over_budget():
-    shapes = (256, 8)
+    shapes = (8, 256)
     scores = [
         _mk_score(f"blk.{i}.attn_q.weight", shapes, err={"q4_0": 0.001 * (i + 1)})
         for i in range(5)
@@ -232,13 +232,17 @@ def test_k_ladder_downgrades_least_sensitive_when_over_budget():
     base = sq.type_bytes(shapes, "q4_k")
     budget = 5 * base - (base - sq.type_bytes(shapes, "q3_k"))  # force one downgrade
     assignment, _ = sq.assign_k_ladder(scores, budget)
-    downgraded = {n for n, t in assignment.items() if t == "q3_k"}
+    base_i = sq.K_LADDER.index("q4_k")
+    downgraded = {n for n, t in assignment.items() if sq.K_LADDER.index(t) < base_i}
     assert "blk.0.attn_q.weight" in downgraded
-    assert "blk.4.attn_q.weight" not in downgraded
+    # water-fill spreads downgrades round-robin: nobody sits above the most
+    # sensitive tensor, and the least sensitive move at least as far down
+    idx = {n: sq.K_LADDER.index(t) for n, t in assignment.items()}
+    assert idx["blk.0.attn_q.weight"] <= idx["blk.4.attn_q.weight"]
 
 
 def test_k_ladder_pins_sensitive():
-    shapes = (256, 8)
+    shapes = (8, 256)
     scores = [
         _mk_score("token_embd.weight", shapes, err={"q4_0": 999.0}),
         _mk_score("blk.0.attn_q.weight", shapes, err={"q4_0": 0.001}),
@@ -248,7 +252,7 @@ def test_k_ladder_pins_sensitive():
 
 
 def test_k_ladder_counts_skipped_existing_bytes():
-    shapes = (256, 8)
+    shapes = (8, 256)
     s_skip = _mk_score("already.quant", shapes, skipped="already Q4_K", )
     s_skip.existing_bytes = 12345
     s = _mk_score("blk.0.attn_q.weight", shapes, err={"q4_0": 0.01})
@@ -257,7 +261,7 @@ def test_k_ladder_counts_skipped_existing_bytes():
 
 
 def test_legacy_assignment_uses_best_ratio():
-    shapes = (256, 8)
+    shapes = (8, 256)
     # unambiguous ratios: big_drop's q8_0 drop-per-byte beats everything else
     big_drop = _mk_score("blk.0.attn_q.weight", shapes,
                          err={"q4_0": 0.10, "q5_0": 0.099, "q8_0": 0.001})
@@ -304,3 +308,21 @@ def test_sensitive_name_does_not_match_attn_output():
     assert not sq.is_sensitive_name("blk.0.attn_output.weight")
     assert not sq.is_sensitive_name("blk.0.attn_q.weight")
     assert not _mk_score("blk.0.attn_output.weight", (64, 32)).is_sensitive
+
+
+def test_k_ladder_never_assigns_256_block_rung_to_704_channels():
+    # Gemma-4 ffn_down_exps has 704 channels: q*_k / iq4_xs would silently
+    # fall back to Q4_0 inside llama-quantize, wrecking the size model.
+    scores = [
+        _mk_score("blk.0.ffn_down_exps.weight", (8, 64, 704), err={"q4_0": 0.01}),
+        _mk_score("blk.0.ffn_down.weight", (8, 2112), err={"q4_0": 0.02}),
+        _mk_score("blk.0.attn_q.weight", (8, 2816), err={"q4_0": 0.5}),
+    ]
+    assignment, _ = sq.assign_k_ladder(scores, 10**9)
+    blocked_256 = {t for t, b in sq.TYPE_BLOCK.items() if b == 256}
+    for name in ("blk.0.ffn_down_exps.weight", "blk.0.ffn_down.weight"):
+        assert assignment[name] not in blocked_256, assignment[name]
+    # 2816-channel tensors keep full ladder access (unlimited budget -> top rung)
+    assert assignment["blk.0.attn_q.weight"] == "q8_0"
+    # and allowed_rungs itself agrees
+    assert not (set(sq.allowed_rungs((8, 64, 704))) & blocked_256)

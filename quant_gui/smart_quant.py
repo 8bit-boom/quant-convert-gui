@@ -66,12 +66,32 @@ import numpy as np
 
 # Candidate types the pure-Python gguf.quants path can quantize AND
 # dequantize (verified by probing every GGMLQuantizationType). K-quants and
-# IQ-quants are dequantize-only there, so k-ladder mode ranks by these and
+# IQ-quants are dequantize-only there, so the ladder ranks by these and
 # maps by rank instead of measuring K-quant errors directly.
 SCORABLE_TYPES = ("q4_0", "q5_0", "q8_0")
 
-# K-quant ladder for rank-mapped assignment (atomic types only).
-K_LADDER = ("q3_k", "q4_k", "q5_k", "q6_k")
+# Master ladder for rank-mapped assignment (atomic types only), ordered by
+# approximate bits-per-weight. Per tensor, rungs whose super-block does not
+# divide the tensor's channel count are filtered out - llama-quantize would
+# otherwise silently fall back (e.g. q3_k on a 704-channel ffn_down becomes
+# Q4_0, which destroyed the size model of the first smart-quant generation).
+K_LADDER = ("q3_k", "iq4_xs", "q4_0", "iq4_nl", "q4_k", "q5_k", "q6_k", "q8_0")
+
+# super-block size (channels per block) each type requires
+TYPE_BLOCK = {
+    "q2_k": 256, "q3_k": 256, "q4_k": 256, "q5_k": 256, "q6_k": 256, "q8_k": 256,
+    "iq2_xxs": 256, "iq2_xs": 256, "iq2_s": 256, "iq3_xxs": 256, "iq3_s": 256,
+    "iq3_m": 256, "iq4_xs": 256, "iq4_nl": 32,
+    "q4_0": 32, "q4_1": 32, "q5_0": 32, "q5_1": 32, "q8_0": 32,
+}
+
+
+def allowed_rungs(shape: tuple[int, ...]) -> list[str]:
+    """Ladder rungs valid for a channels-last tensor shape (256-block rungs
+    need channels % 256 == 0, 32-block rungs need % 32)."""
+    ch = int(shape[-1]) if shape else 0
+    rungs = [t for t in K_LADDER if ch % TYPE_BLOCK.get(t, 32) == 0]
+    return rungs or ["f16"]
 
 # Never let these fall below the floor, whatever the ranking says
 # (standard practice - Unsloth / ik_llama.cpp "Chess" quants do the same).
@@ -399,16 +419,16 @@ def assign_k_ladder(
     base_type: str = "q4_k",
     floor_type: str = DEFAULT_FLOOR,
 ) -> tuple[dict[str, str], list[str]]:
-    """Rank tensors by measured q4_0 sensitivity, then water-fill the
-    q3_k/q4_k/q5_k/q6_k ladder around `base_type` until the estimated file
-    size meets `budget_bytes`.
+    """Rank tensors by measured q4_0 sensitivity, then water-fill each
+    tensor's personal rung ladder (block-compatible types only) around
+    `base_type` until the estimated file size meets `budget_bytes`.
 
-    Over budget: least-sensitive movable tensors step down the ladder
-    (q4_k -> q3_k) until it fits. Under budget: most-sensitive tensors step
-    up (q4_k -> q5_k -> q6_k) while headroom allows. Sensitive tensors
-    (embeddings/output/router) are pinned at floor_type and never move.
-    K-quant per-type errors are not pure-Python measurable, so the ladder
-    mapping is rank-based, not error-scored; sizes are exact.
+    Over budget: least-sensitive movable tensors step down their ladder
+    until it fits. Under budget: most-sensitive tensors step up while
+    headroom allows. Sensitive tensors (embeddings/output/router) are
+    pinned at floor_type (highest compatible rung) and never move.
+    K/IQ-quant per-type errors are not pure-Python measurable, so the
+    ladder mapping is rank-based, not error-scored; sizes are exact.
     """
     report: list[str] = []
     scored = [s for s in scores if not s.skipped and s.err]
@@ -417,19 +437,34 @@ def assign_k_ladder(
     primary = next(iter(scored[0].err), "q4_0")
     sens = {s.name: s.err.get(primary, 0.0) for s in scored}
 
-    base_idx = K_LADDER.index(base_type) if base_type in K_LADDER else 1
-    cur: dict[str, int] = {}
+    base_idx = K_LADDER.index(base_type) if base_type in K_LADDER else K_LADDER.index("q4_k")
+    floor_idx = K_LADDER.index(floor_type) if floor_type in K_LADDER else K_LADDER.index("q6_k")
+
+    # personal rung list per tensor, block-compatible rungs only
+    rungs: dict[str, list[str]] = {}
     for s in scores:
         if s.skipped:
             continue
-        cur[s.name] = base_idx
-    pinned = {s.name for s in scores if not s.skipped and s.is_sensitive}
+        rungs[s.name] = [t for t in K_LADDER if t in set(allowed_rungs(s.shape))]
+
+    def highest_not_above(personal: list[str], idx: int) -> str:
+        eligible = [t for t in personal if K_LADDER.index(t) <= idx]
+        return eligible[-1] if eligible else personal[0]
+
+    cur: dict[str, str] = {
+        name: highest_not_above(personal, base_idx)
+        for name, personal in rungs.items()
+    }
+
+    # sensitive tensors are pinned at the floor rung (best compatible rung
+    # not above floor_type) and never move
+    pinned = {s.name for s in scored if s.is_sensitive}
     for name in pinned:
-        cur[name] = K_LADDER.index(floor_type) if floor_type in K_LADDER else len(K_LADDER) - 1
+        cur[name] = highest_not_above(rungs[name], floor_idx)
 
     def total_size() -> int:
         return sum(
-            (s.existing_bytes if s.skipped else type_bytes(s.shape, K_LADDER[cur[s.name]]))
+            (s.existing_bytes if s.skipped else type_bytes(s.shape, cur[s.name]))
             for s in scores
         )
 
@@ -438,43 +473,52 @@ def assign_k_ladder(
         key=lambda s: sens[s.name],
     )
 
+    def step(name: str, direction: int) -> bool:
+        personal = rungs[name]
+        pos = personal.index(cur[name])
+        nxt_pos = pos + direction
+        if 0 <= nxt_pos < len(personal):
+            cur[name] = personal[nxt_pos]
+            return True
+        return False
+
     # Downgrade pass: walk least-sensitive first, one ladder step per touch.
     size = total_size()
     down_rounds = 0
-    while size > budget_bytes and down_rounds < base_idx:
+    while size > budget_bytes and down_rounds < len(K_LADDER):
         moved = False
         for s in movable:
             if size <= budget_bytes:
                 break
-            if cur[s.name] > 0:
-                cur[s.name] -= 1
+            old = cur[s.name]
+            if step(s.name, -1):
                 size = total_size()
-                moved = True
+                moved = moved or cur[s.name] != old
         if not moved:
             break
         down_rounds += 1
 
     # Upgrade pass: walk most-sensitive first, one ladder step per touch.
-    max_idx = len(K_LADDER) - 1
     up_rounds = 0
-    while size < budget_bytes and up_rounds < max_idx - base_idx:
+    while size < budget_bytes and up_rounds < len(K_LADDER):
         moved = False
         for s in reversed(movable):
-            if cur[s.name] < max_idx:
-                nxt = cur[s.name] + 1
-                new_size = total_size() - type_bytes(s.shape, K_LADDER[cur[s.name]]) + type_bytes(s.shape, K_LADDER[nxt])
+            old = cur[s.name]
+            if cur[s.name] == old and step(s.name, +1):
+                new_size = total_size()
                 if new_size > budget_bytes:
+                    step(s.name, -1)  # revert
                     continue
-                cur[s.name] = nxt
                 size = new_size
                 moved = True
         if not moved:
             break
         up_rounds += 1
 
-    assignment = {name: K_LADDER[idx] for name, idx in cur.items()}
-    n_up = sum(1 for s in movable if cur[s.name] > base_idx)
-    n_down = sum(1 for s in movable if cur[s.name] < base_idx)
+    assignment = dict(cur)
+    idx_of = {name: K_LADDER.index(t) for name, t in cur.items()}
+    n_up = sum(1 for s in movable if idx_of[s.name] > base_idx)
+    n_down = sum(1 for s in movable if idx_of[s.name] < base_idx)
     report.append(
         f"assignment: {n_up} tensors upgraded, {n_down} downgraded, "
         f"estimated size {size / 1e9:.2f} GB (budget {budget_bytes / 1e9:.2f} GB)"
@@ -482,14 +526,14 @@ def assign_k_ladder(
     if size > budget_bytes:
         report.append(
             "⚠️ could not reach the budget even with every movable tensor at "
-            f"{K_LADDER[0]} - raise the budget or accept a larger file."
+            "its lowest compatible rung - raise the budget or accept a larger file."
         )
     movable_names = {s.name for s in movable}
-    top_up = sorted((n for n in cur if n in movable_names and cur[n] > base_idx),
+    top_up = sorted((n for n in cur if n in movable_names and idx_of[n] > base_idx),
                     key=lambda n: -sens[n])[:5]
     if top_up:
         report.append("most upgraded: " + ", ".join(f"{n}->{assignment[n]}" for n in top_up))
-    top_down = sorted((n for n in cur if n in movable_names and cur[n] < base_idx),
+    top_down = sorted((n for n in cur if n in movable_names and idx_of[n] < base_idx),
                       key=lambda n: sens[n])[:5]
     if top_down:
         report.append("most downgraded: " + ", ".join(f"{n}->{assignment[n]}" for n in top_down))
