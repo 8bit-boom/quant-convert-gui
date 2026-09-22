@@ -1031,7 +1031,7 @@ def run_llm_find_best(input_gguf: str, imatrix_file: str, target_bpw: str = "", 
     yield log, None, winner.quant, gr.update(value=im) if im else gr.update()
 
 
-def run_llm_smart_tune(model_gguf: str, imatrix_file: str, mode: str, budget_gb: str, output_name: str):
+def run_llm_smart_tune(model_gguf: str, imatrix_file: str, mode: str, target_size: str, budget_gb: str, output_name: str):
     """Stage 1-3 of the smart tuner: score sensitivity -> assign under budget
     -> write tensor-type file -> quantize with it. Stage 1 runs in a worker
     thread (pure-Python quantization is CPU-heavy); progress streams here."""
@@ -1066,6 +1066,18 @@ def run_llm_smart_tune(model_gguf: str, imatrix_file: str, mode: str, budget_gb:
         budget = float((budget_gb or "").strip()) * 1e9
     except ValueError:
         budget = 0.0
+    family_note = ""
+    if (target_size or "").strip().lower() != "custom":
+        # target-size selector drives the budget: family file-bpw x params / 8
+        try:
+            params = sq.count_params(model_gguf)
+            budget = float(sq.family_budget_bytes(target_size, params))
+            family_note = (
+                f"  target: {target_size} ({sq.FAMILY_FILE_BPW.get(target_size):.2f} file bpw "
+                f"x {params / 1e9:.1f}B params)\n"
+            )
+        except Exception as exc:  # noqa: BLE001 - fall back to the textbox budget
+            family_note = f"  (could not size {target_size!r} from the model: {exc}; using the GB box)\n"
     if budget <= 0:
         yield f"Size budget must be a positive number of GB, got {budget_gb!r}.", None
         return
@@ -1074,6 +1086,7 @@ def run_llm_smart_tune(model_gguf: str, imatrix_file: str, mode: str, budget_gb:
     log = (
         f"Smart per-tensor tuning: {model_gguf}\n{auto_note}"
         f"  imatrix: {imatrix_file}\n"
+        f"{family_note}"
         f"  mode: {mode}   budget: {budget / 1e9:.2f} GB\n\n"
         "Stage 1 - imatrix-weighted sensitivity ranking (pure Python, CPU-bound)...\n"
     )
@@ -2293,14 +2306,24 @@ with gr.Blocks(title="Quant Convert GUI") as demo:
                     info="K-ladder produces llama.cpp-friendly q3_k..q6_k mixes sized to your budget; "
                     "legacy uses only pure-Python-measurable types with exact errors.",
                 )
+                llm_smart_target = gr.Radio(
+                    list(gb.BPP_FAMILY_CANDIDATES.keys()) + ["Custom"],
+                    value="~4 bpw",
+                    label="Target size (Dynamic 3.0 preset)",
+                    info="One-click preset: the budget is computed from the model's parameter count at "
+                    "the family's file bits-per-weight. MoE models get the two-zone recipe - Q8_0-level "
+                    "attention/shared FFN, IQ-quantized experts (beats Unsloth UD-IQ4_XS at equal size "
+                    "on gemma-4-26B). 'Custom' uses the GB box.",
+                )
+            with gr.Row():
                 llm_smart_budget = gr.Textbox(
-                    label="Size budget (GB)", value="8.0",
+                    label="Size budget (GB, used with Custom)", value="13.5",
                     info="Target total file size. The tuner downgrades insensitive tensors and "
                     "upgrades sensitive ones until the estimate fits.",
                 )
-            with gr.Row():
                 llm_smart_output = gr.Textbox(label="Output filename (optional)", placeholder="auto")
-                llm_smart_btn = gr.Button("Tune + quantize", variant="primary")
+            with gr.Row():
+                llm_smart_btn = gr.Button("Tune + quantize (Dynamic 3.0)", variant="primary")
             gr.Markdown(
                 "#### Stage 3 validation — perplexity comparison\n"
                 "Measures perplexity of the tuned file and a plain baseline quant of the same "
@@ -2775,7 +2798,7 @@ with gr.Blocks(title="Quant Convert GUI") as demo:
     )
     llm_smart_btn.click(
         run_llm_smart_tune,
-        inputs=[llm_smart_model, llm_smart_imatrix, llm_smart_mode, llm_smart_budget, llm_smart_output],
+        inputs=[llm_smart_model, llm_smart_imatrix, llm_smart_mode, llm_smart_target, llm_smart_budget, llm_smart_output],
         outputs=[llm_log, llm_result_file],
     )
     llm_val_btn.click(

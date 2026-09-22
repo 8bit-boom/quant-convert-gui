@@ -326,3 +326,13 @@ def test_k_ladder_never_assigns_256_block_rung_to_704_channels():
     assert assignment["blk.0.attn_q.weight"] == "q8_0"
     # and allowed_rungs itself agrees
     assert not (set(sq.allowed_rungs((8, 64, 704))) & blocked_256)
+
+
+def test_family_budget_bytes_math():
+    # budget = file_bpw * params / 8; unknown labels fall back to ~4 bpw
+    assert sq.family_budget_bytes("~4 bpw", 8) == int(4.3 * 8 / 8)
+    assert sq.family_budget_bytes("~3 bpw", 8_000_000_000) == int(3.3 * 8e9 / 8)
+    assert sq.family_budget_bytes("bogus", 8) == sq.family_budget_bytes("~4 bpw", 8)
+    for fam, bpw in sq.FAMILY_FILE_BPW.items():
+        got = sq.family_budget_bytes(fam, 25_233_000_000)
+        assert abs(got / 25.233e9 * 8 - bpw) < 1e-9

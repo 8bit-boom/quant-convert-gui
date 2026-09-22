@@ -111,6 +111,37 @@ def is_sensitive_name(name: str) -> bool:
 
 DEFAULT_FLOOR = "q6_k"
 
+# Target *file* bits-per-weight for the GUI target-size selector. These sit
+# at the size-optimized end of each family (the IQ*_S / Q4_K lower edge),
+# matching where the two-zone MoE assignment lands in practice: "~4 bpw"
+# reproduces the Unsloth UD-IQ4_XS class (4.30 file bpw for gemma-4-26B,
+# which this tuner beat at equal size).
+FAMILY_FILE_BPW = {
+    "~2 bpw": 2.3,
+    "~3 bpw": 3.3,
+    "~4 bpw": 4.3,
+    "~5 bpw": 5.5,
+}
+
+
+def count_params(gguf_path: str | Path) -> int:
+    """Total parameter count (sum of tensor elements) from the GGUF header.
+
+    Header-only read - no tensor data is touched, so a 50 GB reference is
+    scanned in milliseconds. This is the same denominator llama.cpp reports
+    for bits-per-weight."""
+    from gguf import GGUFReader
+
+    reader = GGUFReader(str(gguf_path))
+    return int(sum(int(np.prod(t.shape)) for t in reader.tensors))
+
+
+def family_budget_bytes(family: str, params: int) -> int:
+    """Size budget in bytes for a target-size family label and a model's
+    parameter count. Unknown labels fall back to the ~4 bpw class."""
+    bpw = FAMILY_FILE_BPW.get(family, FAMILY_FILE_BPW["~4 bpw"])
+    return int(bpw * params / 8)
+
 
 class SmartQuantError(RuntimeError):
     pass
