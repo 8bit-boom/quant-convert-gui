@@ -227,6 +227,15 @@ def test_family_candidates_returns_copies():
     assert len(gb.family_candidates("~4 bpw")) == len(gb.BPP_FAMILY_CANDIDATES["~4 bpw"])
 
 
+def test_family_for_bpw_maps_sweep_winner_to_size_class():
+    assert gb.family_for_bpw(2.1) == "~2 bpw"
+    assert gb.family_for_bpw(2.7) == "~3 bpw"
+    assert gb.family_for_bpw(3.9) == "~4 bpw"  # top of the ~3 family lands in ~4's class
+    assert gb.family_for_bpw(4.31) == "~4 bpw"  # UD-IQ4_XS-class file
+    assert gb.family_for_bpw(4.7) == "~5 bpw"
+    assert gb.family_for_bpw(6.5) == "~5 bpw"
+
+
 # ------------------------------------------------- toolchain-gated benchmark
 
 

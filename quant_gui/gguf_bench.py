@@ -58,6 +58,18 @@ def family_candidates(target: str) -> list[str]:
     the ~3bpw family so a stale GUI value never empties the sweep."""
     return list(BPP_FAMILY_CANDIDATES.get(target or "", DYNAMIC3_CANDIDATES))
 
+
+def family_for_bpw(bpw: float) -> str:
+    """Target-size family label for a measured bits-per-weight, so a sweep
+    winner can be handed to the Dynamic tuner at the right size class."""
+    if bpw < 2.7:
+        return "~2 bpw"
+    if bpw < 3.7:
+        return "~3 bpw"
+    if bpw < 4.7:
+        return "~4 bpw"
+    return "~5 bpw"
+
 # Families with huge vocabularies (Gemma's 262k, Qwen's 151-256k) carry
 # token embeddings worth a large share of total params, which llama-quantize
 # otherwise keeps F16. `--token-embedding-type Q8_0` is the standard lever

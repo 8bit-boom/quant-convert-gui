@@ -336,3 +336,46 @@ def test_family_budget_bytes_math():
     for fam, bpw in sq.FAMILY_FILE_BPW.items():
         got = sq.family_budget_bytes(fam, 25_233_000_000)
         assert abs(got / 25.233e9 * 8 - bpw) < 1e-9
+
+
+def _has_two_zone(report: list[str]) -> bool:
+    return any("two-zone" in line for line in report)
+
+
+def test_dense_model_uses_uniform_layout():
+    # no 3-D expert stacks -> uniform water-fill from base, nobody at q8_0
+    shapes = (8, 256)
+    scores = [
+        _mk_score(f"blk.{i}.attn_q.weight", shapes, err={"q4_0": 0.001 * (i + 1)})
+        for i in range(5)
+    ]
+    base = sq.type_bytes(shapes, "q4_k")
+    assignment, report = sq.assign_k_ladder(scores, 5 * base)
+    assert not _has_two_zone(report)
+    assert set(assignment.values()) == {"q4_k"}
+
+
+def test_moe_model_uses_two_zone_when_experts_dominate():
+    # small attention weights + big expert stacks -> non-experts start at q8_0
+    attn = _mk_score("blk.0.attn_q.weight", (8, 256), err={"q4_0": 0.5})
+    exps = _mk_score("blk.0.ffn_gate_up_exps.weight", (4, 64, 256), err={"q4_0": 0.01})
+    # exact-fit budget: attn @ q8_0 + expert @ q4_k -> no upgrade headroom
+    budget = sq.type_bytes((8, 256), "q8_0") + sq.type_bytes((4, 64, 256), "q4_k")
+    assignment, report = sq.assign_k_ladder([attn, exps], budget)
+    assert _has_two_zone(report)
+    assert assignment["blk.0.attn_q.weight"] == "q8_0"
+    # expert stays at base: no headroom to upgrade
+    assert assignment["blk.0.ffn_gate_up_exps.weight"] == "q4_k"
+
+
+def test_moe_falls_back_to_uniform_when_nonexperts_are_fat():
+    # fat dense weights: q8_0 on all non-experts would exceed 55% of budget
+    # -> uniform layout, non-experts start at base like everyone else
+    big = (64, 256)
+    attn = _mk_score("blk.0.attn_q.weight", big, err={"q4_0": 0.5})
+    exps = _mk_score("blk.0.ffn_gate_up_exps.weight", (4, 64, 256), err={"q4_0": 0.01})
+    base = sq.type_bytes(big, "q4_k")
+    budget = int(2.5 * base)  # q8_0 on `attn` alone is ~1.9x base -> >55%
+    assignment, report = sq.assign_k_ladder([attn, exps], budget)
+    assert not _has_two_zone(report)
+    assert assignment["blk.0.attn_q.weight"] != "q8_0"

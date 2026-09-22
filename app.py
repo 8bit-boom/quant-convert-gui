@@ -1028,7 +1028,36 @@ def run_llm_find_best(input_gguf: str, imatrix_file: str, target_bpw: str = "", 
         f"   (best quality: {picks['best_quality'].label}, smallest: {picks['smallest'].label})\n"
         "   Now just pick an output filename and hit Quantize.\n"
     )
+    global _LAST_SWEEP
+    _LAST_SWEEP = {
+        "model": input_gguf,
+        "imatrix": im or "",
+        "winner_quant": winner.quant,
+        "winner_bpw": float(getattr(winner, "bpw", 0.0) or 0.0),
+        "family": gb.family_for_bpw(float(getattr(winner, "bpw", 0.0) or 0.0)),
+    }
+    log += "   Or hit 'Tune winner (Dynamic 3.0)' in step 6 to per-tensor-tune at this size.\n"
     yield log, None, winner.quant, gr.update(value=im) if im else gr.update()
+
+
+_LAST_SWEEP: dict = {}
+
+
+def run_llm_tune_winner(output_name: str):
+    """Hand the last sweep winner to the Dynamic tuner: same model + imatrix,
+    budget from the winner's bits-per-weight family, K-ladder assignment."""
+    sweep = dict(_LAST_SWEEP)
+    if not sweep.get("model"):
+        yield "Run 'Find best quant (sweep)' first - there is no winner to tune yet.", None
+        return
+    name = (output_name or "").strip()
+    if not name:
+        stem = Path(sweep["model"]).stem
+        name = f"{stem}-dynamic3-{sweep['winner_quant'].lower()}.gguf"
+    yield from run_llm_smart_tune(
+        sweep["model"], sweep.get("imatrix", ""),
+        "K-ladder (rank-mapped)", sweep["family"], "", name,
+    )
 
 
 def run_llm_smart_tune(model_gguf: str, imatrix_file: str, mode: str, target_size: str, budget_gb: str, output_name: str):
@@ -2324,6 +2353,14 @@ with gr.Blocks(title="Quant Convert GUI") as demo:
                 llm_smart_output = gr.Textbox(label="Output filename (optional)", placeholder="auto")
             with gr.Row():
                 llm_smart_btn = gr.Button("Tune + quantize (Dynamic 3.0)", variant="primary")
+                llm_tune_winner_btn = gr.Button("Tune winner (Dynamic 3.0)")
+            gr.Markdown(
+                "**Tune winner** takes the last 'Find best quant (sweep)' result and re-runs it "
+                "through the per-tensor tuner: same model and imatrix, budget set to the winner's "
+                "bits-per-weight family, K-ladder assignment. On MoE models this upgrades the "
+                "sweep's single uniform type to a two-zone mix (Q8_0-level attention/shared FFN, "
+                "IQ-quantized experts) at the same file size."
+            )
             gr.Markdown(
                 "#### Stage 3 validation — perplexity comparison\n"
                 "Measures perplexity of the tuned file and a plain baseline quant of the same "
@@ -2799,6 +2836,11 @@ with gr.Blocks(title="Quant Convert GUI") as demo:
     llm_smart_btn.click(
         run_llm_smart_tune,
         inputs=[llm_smart_model, llm_smart_imatrix, llm_smart_mode, llm_smart_target, llm_smart_budget, llm_smart_output],
+        outputs=[llm_log, llm_result_file],
+    )
+    llm_tune_winner_btn.click(
+        run_llm_tune_winner,
+        inputs=[llm_smart_output],
         outputs=[llm_log, llm_result_file],
     )
     llm_val_btn.click(

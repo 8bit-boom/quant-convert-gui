@@ -458,8 +458,12 @@ def assign_k_ladder(
     until it fits. Under budget: most-sensitive tensors step up while
     headroom allows. Sensitive tensors (embeddings/output/router) are
     pinned at floor_type (highest compatible rung) and never move.
-    K/IQ-quant per-type errors are not pure-Python measurable, so the
-    ladder mapping is rank-based, not error-scored; sizes are exact.
+    MoE models use a two-zone layout (attention/shared-FFN start at the
+    top of their ladder, experts carry the average), gated on the non-
+    expert q8_0 mass actually fitting in the budget - dense models fall
+    back to uniform water-fill from base_type. K/IQ-quant per-type errors
+    are not pure-Python measurable, so the ladder mapping is rank-based,
+    not error-scored; sizes are exact.
     """
     report: list[str] = []
     scored = [s for s in scores if not s.skipped and s.err]
@@ -517,15 +521,31 @@ def assign_k_ladder(
         key=lambda s: sens[s.name],
     )
 
-    # MoE two-zone strategy (matches what Unsloth Dynamic quants do): expert
+    # MoE two-zone strategy (matches what Unsloth Dynamic quants do), gated
+    # on the model actually having an expert-heavy parameter layout: expert
     # tensors are the vast majority of parameters, so they carry the bpw
     # average and start at base_type; attention / shared-FFN weights are few
     # but dominate output quality, so they start at the TOP of their ladder
-    # (q8_0) and only give way if the budget cannot be met otherwise.
-    experts = [s for s in movable if "_exps" in s.name]
-    non_experts = [s for s in movable if "_exps" not in s.name]
-    for s in non_experts:
-        cur[s.name] = rungs[s.name][-1]
+    # (q8_0) and only give way if the budget cannot be met otherwise. On
+    # dense models (or MoE with a fat non-expert share) q8_0 everywhere would
+    # blow the budget, so everyone starts at base_type (uniform water-fill).
+    experts = [s for s in movable if s.is_moe]
+    non_experts = [s for s in movable if not s.is_moe]
+    ne_q8_bytes = sum(
+        type_bytes(s.shape, rungs[s.name][-1]) for s in non_experts
+    ) if non_experts else 0
+    two_zone = bool(experts) and ne_q8_bytes <= 0.55 * budget_bytes
+    report.append(
+        f"layout: {len(experts)} MoE expert stacks, {len(non_experts)} other weights; "
+        + (f"two-zone (non-expert @ q8_0 = {ne_q8_bytes / 1e9:.2f} GB, "
+           f"{100 * ne_q8_bytes / budget_bytes:.0f}% of budget)"
+           if two_zone else
+           "uniform (non-expert @ q8_0 would take "
+           f"{100 * ne_q8_bytes / max(budget_bytes, 1):.0f}% of budget)")
+    )
+    if two_zone:
+        for s in non_experts:
+            cur[s.name] = rungs[s.name][-1]
 
     def step(name: str, direction: int) -> bool:
         personal = rungs[name]
