@@ -75,7 +75,7 @@ SCORABLE_TYPES = ("q4_0", "q5_0", "q8_0")
 # divide the tensor's channel count are filtered out - llama-quantize would
 # otherwise silently fall back (e.g. q3_k on a 704-channel ffn_down becomes
 # Q4_0, which destroyed the size model of the first smart-quant generation).
-K_LADDER = ("q3_k", "iq4_xs", "q4_0", "iq4_nl", "q4_k", "q5_k", "q6_k", "q8_0")
+K_LADDER = ("iq3_xxs", "iq3_s", "iq4_xs", "q4_0", "iq4_nl", "q4_k", "q5_k", "q6_k", "q8_0")
 
 # super-block size (channels per block) each type requires
 TYPE_BLOCK = {
@@ -440,10 +440,16 @@ def assign_k_ladder(
     base_idx = K_LADDER.index(base_type) if base_type in K_LADDER else K_LADDER.index("q4_k")
     floor_idx = K_LADDER.index(floor_type) if floor_type in K_LADDER else K_LADDER.index("q6_k")
 
-    # personal rung list per tensor, block-compatible rungs only
+    # personal rung list per tensor, block-compatible rungs only. 1-D
+    # norm/scale vectors and MoE router tensors (ffn_gate_inp.*) get NO
+    # override at all: llama-quantize keeps them at the source type (F32),
+    # which is exactly what Unsloth's Dynamic quants do - an override would
+    # either quantize a norm or wreck the router.
     rungs: dict[str, list[str]] = {}
     for s in scores:
         if s.skipped:
+            continue
+        if len(s.shape) < 2 or "ffn_gate_inp" in s.name.lower():
             continue
         rungs[s.name] = [t for t in K_LADDER if t in set(allowed_rungs(s.shape))]
 
@@ -457,21 +463,38 @@ def assign_k_ladder(
     }
 
     # sensitive tensors are pinned at the floor rung (best compatible rung
-    # not above floor_type) and never move
-    pinned = {s.name for s in scored if s.is_sensitive}
+    # not above floor_type) and never move. Includes bare (unscored)
+    # sensitive tensors such as token embeddings.
+    pinned = {s.name for s in scores if not s.skipped and s.name in rungs and s.is_sensitive}
     for name in pinned:
         cur[name] = highest_not_above(rungs[name], floor_idx)
 
     def total_size() -> int:
-        return sum(
-            (s.existing_bytes if s.skipped else type_bytes(s.shape, cur[s.name]))
-            for s in scores
-        )
+        total = 0
+        for s in scores:
+            if s.skipped:
+                total += s.existing_bytes
+            elif s.name in cur:
+                total += type_bytes(s.shape, cur[s.name])
+            else:
+                # no override (1-D / router): stays at source type (F32)
+                total += type_bytes(s.shape, "f32")
+        return total
 
     movable = sorted(
         (s for s in scored if not s.is_sensitive),
         key=lambda s: sens[s.name],
     )
+
+    # MoE two-zone strategy (matches what Unsloth Dynamic quants do): expert
+    # tensors are the vast majority of parameters, so they carry the bpw
+    # average and start at base_type; attention / shared-FFN weights are few
+    # but dominate output quality, so they start at the TOP of their ladder
+    # (q8_0) and only give way if the budget cannot be met otherwise.
+    experts = [s for s in movable if "_exps" in s.name]
+    non_experts = [s for s in movable if "_exps" not in s.name]
+    for s in non_experts:
+        cur[s.name] = rungs[s.name][-1]
 
     def step(name: str, direction: int) -> bool:
         personal = rungs[name]
@@ -482,21 +505,29 @@ def assign_k_ladder(
             return True
         return False
 
-    # Downgrade pass: walk least-sensitive first, one ladder step per touch.
+    # Downgrade pass: experts first (least sensitive expert rounds down the
+    # ladder), non-experts only when experts are exhausted. One step per
+    # touch per round, so damage spreads evenly inside each zone.
     size = total_size()
-    down_rounds = 0
-    while size > budget_bytes and down_rounds < len(K_LADDER):
-        moved = False
-        for s in movable:
-            if size <= budget_bytes:
+
+    def downgrade_pool(pool: list[TensorScore]) -> None:
+        nonlocal size
+        rounds = 0
+        while size > budget_bytes and rounds < len(K_LADDER) + 2:
+            moved = False
+            for s in pool:
+                if size <= budget_bytes:
+                    break
+                old = cur[s.name]
+                if step(s.name, -1):
+                    size = total_size()
+                    moved = moved or cur[s.name] != old
+            if not moved:
                 break
-            old = cur[s.name]
-            if step(s.name, -1):
-                size = total_size()
-                moved = moved or cur[s.name] != old
-        if not moved:
-            break
-        down_rounds += 1
+            rounds += 1
+
+    downgrade_pool(experts)
+    downgrade_pool(non_experts)
 
     # Upgrade pass: walk most-sensitive first, one ladder step per touch.
     up_rounds = 0
