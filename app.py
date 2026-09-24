@@ -38,6 +38,8 @@ from quant_gui import checkpoints as ckpt
 from quant_gui import run_control
 from quant_gui import run_history as rh
 from quant_gui.run_control import RunControl
+from quant_gui import gpu_quant as _gpu_quant
+from quant_gui import ui_settings
 
 APP_DIR = Path(__file__).resolve().parent
 DOWNLOAD_DIR = APP_DIR / "downloads"
@@ -46,6 +48,14 @@ CHECKPOINT_ROOT = ckpt.checkpoint_root(APP_DIR)
 RUN_HISTORY = APP_DIR / rh.HISTORY_NAME
 LLAMACPP_DIR = lcpp.default_llamacpp_dir(APP_DIR)
 LLM_MODELS_DIR = APP_DIR / "llm_models"
+
+# Persisted UI settings (ui_settings.json). GPU quantization is the first
+# one: the checkbox defaults to the saved value, and a saved "on" is applied
+# to the environment here, at import time, so worker threads spawned later
+# see it without any plumbing through the convert handlers.
+_initial_gpu_quant = bool(ui_settings.load_settings(APP_DIR).get("gguf_gpu_quant", False))
+if _initial_gpu_quant:
+    os.environ[_gpu_quant.GPU_QUANT_ENV] = "1"
 
 FORMAT_CHOICES = [
     ("INT8 — ConvRot (recommended, matches Kroma-Quant *-int8-convrot* files)", "int8_convrot"),
@@ -1984,6 +1994,26 @@ with gr.Blocks(title="Quant Convert GUI") as demo:
                             f"{', '.join(GGUF_SUPPORTED_ARCH_NAMES)}. Anything else is refused rather than "
                             "silently mislabeled; the Estimate button below will tell you which one it found."
                         )
+                        gguf_gpu_quant = gr.Checkbox(
+                            value=_initial_gpu_quant,
+                            label="Use GPU quantization (Q8_0)",
+                            info="Runs the Q8_0 block quantizer on your NVIDIA GPU via Triton - ~10x faster "
+                            "than the CPU path on large tensors, bit-identical output. Needs triton + CUDA; "
+                            "silently falls back to CPU if either is missing. The choice is saved for next "
+                            "launch.",
+                        )
+
+                        def _persist_gpu_quant(enabled: bool) -> None:
+                            # Worker threads read the env var at quantize
+                            # time, so flipping it here is enough - no need
+                            # to thread the value through convert handlers.
+                            if enabled:
+                                os.environ[_gpu_quant.GPU_QUANT_ENV] = "1"
+                            else:
+                                os.environ.pop(_gpu_quant.GPU_QUANT_ENV, None)
+                            ui_settings.set_setting(APP_DIR, "gguf_gpu_quant", bool(enabled))
+
+                        gguf_gpu_quant.change(_persist_gpu_quant, inputs=[gguf_gpu_quant], outputs=[])
 
                     with gr.Group(visible=True) as convrot_group:
                         gr.Markdown("**ConvRot group size** — must divide the layer width; 256 is ctq's default.")

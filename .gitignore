@@ -16,3 +16,4 @@ gguf_bench_tmp/
 checkpoints/
 tmp_compare/
 *.log
+ui_settings.json
