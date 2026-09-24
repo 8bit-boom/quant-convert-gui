@@ -266,7 +266,17 @@ def _prepare_tensor(f, key: str, arch, qtype, exclude_kw, highprec_kw, exclude_r
     else:
         data = tensor.numpy()
     try:
-        packed = quants.quantize(data, this_qtype)
+        if this_qtype == gguf.GGMLQuantizationType.Q8_0:
+            # Optional Triton GPU path (opt-in via QUANT_GUI_GPU_QUANT=1);
+            # silently falls back to gguf-py's numpy quantize when triton
+            # or a CUDA device isn't available. Bit-exact either way.
+            from . import gpu_quant
+            try:
+                packed = gpu_quant.quantize_q8_0(data)
+            except ValueError:
+                raise gguf.QuantError(f"shape {data.shape} not Q8_0-blockable")
+        else:
+            packed = quants.quantize(data, this_qtype)
     except (AttributeError, gguf.QuantError):
         # Shape isn't divisible by the quant type's block size (32) -
         # ctq's own presets fall back the same way for shape mismatches.
