@@ -123,6 +123,7 @@ def test_generate_imatrix_no_model_gguf_gives_guidance(monkeypatch, tmp_path):
 
 def test_generate_imatrix_custom_without_file(monkeypatch, tmp_path):
     monkeypatch.setattr(app, "OUTPUT_DIR", tmp_path)
+    monkeypatch.setattr(app.lcpp, "is_imatrix_built", lambda _d: True)  # pass the built-gate
     model = _touch(tmp_path / "m.gguf")
     result = list(app.run_llm_generate_imatrix(str(model), "Custom calibration file", "", ""))
     assert result and "calibration" in result[0][0].lower()
@@ -132,6 +133,7 @@ def test_generate_imatrix_autodetects_model(monkeypatch, tmp_path):
     out = tmp_path / "out"
     _touch(out / "latest.gguf")
     monkeypatch.setattr(app, "OUTPUT_DIR", out)
+    monkeypatch.setattr(app.lcpp, "is_imatrix_built", lambda _d: True)  # pass the built-gate
     gen = app.run_llm_generate_imatrix("", "Auto", "", "")
     first = next(gen)[0]  # intro log announces the auto-detected path
     gen.close()
@@ -151,6 +153,7 @@ def test_quantize_autodetect_note(monkeypatch, tmp_path):
     _touch(out / "latest.gguf")
     _touch(out / "latest.imatrix")
     monkeypatch.setattr(app, "OUTPUT_DIR", out)
+    monkeypatch.setattr(app.lcpp, "is_quantize_built", lambda _d: True)  # pass the built-gate
     gen = app.run_llm_quantize("", "q4.gguf", "Q4_K_M", "", "")
     first = next(gen)[0]
     gen.close()
@@ -161,6 +164,7 @@ def test_find_best_autodetect_note(monkeypatch, tmp_path):
     out = tmp_path / "out"
     _touch(out / "latest.gguf")
     monkeypatch.setattr(app, "OUTPUT_DIR", out)
+    monkeypatch.setattr(app.lcpp, "is_quantize_built", lambda _d: True)  # pass the built-gate
     monkeypatch.setattr(app.lcpp, "is_imatrix_built", lambda _d: False)  # keep worker spawn-free
     gen = app.run_llm_find_best("", "", "4.0", quants=[])
     first = next(gen)[0]
