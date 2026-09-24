@@ -1896,6 +1896,14 @@ with gr.Blocks(title="Quant Convert GUI") as demo:
                         input_hf_local = gr.Textbox(visible=False)
 
                     resolved_hint = gr.Markdown()
+                    batch_paths = gr.Textbox(
+                        label="Batch queue (optional) — extra model paths, one per line",
+                        placeholder="/path/to/model-a.safetensors\n/path/to/model-b.safetensors",
+                        info="With the 'Convert all (batch)' button: every listed model is converted "
+                        "with the settings above, one after another. Auto output naming is forced "
+                        "so files don't overwrite each other.",
+                        lines=3,
+                    )
 
                     gr.Markdown("### 2. What GPU will run this model?")
                     gpu_dd = gr.Dropdown(
@@ -2193,6 +2201,7 @@ with gr.Blocks(title="Quant Convert GUI") as demo:
                     estimate_md = gr.Markdown()
 
                     convert_btn = gr.Button("Convert", elem_id="convert-btn", variant="primary")
+                    batch_convert_btn = gr.Button("Convert all (batch)")
 
                     save_progress = gr.Checkbox(
                         value=True,
@@ -2888,6 +2897,68 @@ with gr.Blocks(title="Quant Convert GUI") as demo:
         # We render our own bar into convert_progress; gr.Progress()'s built-in
         # overlay otherwise blankets *every* output of this event (log_box and
         # result_file included) for the whole run and can get stuck once streaming ends.
+        show_progress="hidden",
+    )
+
+    def run_convert_batch(batch_paths, input_local, input_hf, source, *rest):
+        """Convert several models with the same settings, one after another.
+
+        Every path comes from the batch box (plus the primary local input, if
+        set); each item runs the full run_convert flow. Auto output naming is
+        forced so items can't overwrite each other. Stop/Pause from the UI
+        applies to the current item; a Stop ends the whole queue.
+        """
+        paths = [p.strip() for p in (batch_paths or "").splitlines() if p.strip()]
+        primary = (input_local or "").strip()
+        if source == "Local file path" and primary and primary not in paths:
+            paths.insert(0, primary)
+        if not paths:
+            yield "Add at least one path to the batch box (or pick a primary local file) first.", None, ""
+            return
+        # rest[0] is output_name, rest[1] is auto_output - force auto naming.
+        rest = (rest[0], True) + rest[2:]
+        total_log = (
+            f"# Batch queue: {len(paths)} model(s)\n"
+            "Auto output naming is forced in batch mode.\n\n"
+        )
+        done = failed = 0
+        for i, path in enumerate(paths, 1):
+            ctl = run_control.current()
+            if ctl is not None and ctl.is_cancelled:
+                total_log += "\n**Batch stopped by user.**\n"
+                yield total_log, None, ""
+                return
+            total_log += f"\n## [{i}/{len(paths)}] {path}\n\n"
+            if not Path(path).is_file():
+                total_log += "❌ not found on disk - skipped.\n"
+                failed += 1
+                yield total_log, None, ""
+                continue
+            last = ("", None, "")
+            for last in run_convert(path, input_hf, "Local file path", *rest):
+                yield total_log + (last[0] or ""), last[1], last[2]
+            total_log += (last[0] or "") + "\n"
+            if last[1]:
+                done += 1
+            else:
+                failed += 1
+        total_log += f"\n---\n**Batch finished: {done} ok, {failed} failed, {len(paths)} total.**\n"
+        yield total_log, None, ""
+
+    batch_convert_btn.click(
+        run_convert_batch,
+        inputs=[
+            batch_paths,
+            input_local, input_hf_local, source, output_name, auto_output, fmt_value, quality_mode,
+            convrot_group_size, dynamic_convrot, scaling_mode, block_size, preset_dd, comfy_quant,
+            save_metadata, low_memory, exclude_layers, custom_layers, custom_type, custom_scaling_mode,
+            custom_convrot, custom_convrot_group_size, custom_simple, fallback, fallback_simple,
+            device, output_dtype, verbose,
+            calib_samples, optimizer, num_iter, manual_seed, fast_math, loss_sync_batch,
+            snapshot_interval, compile_loop, python_exe,
+            int4_layers_regex, int4_fallback_int8, gguf_quant_type, save_progress,
+        ],
+        outputs=[log_box, result_file, convert_progress],
         show_progress="hidden",
     )
 
