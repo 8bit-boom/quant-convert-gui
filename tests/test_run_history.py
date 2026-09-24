@@ -97,3 +97,36 @@ def test_roundtrip_entry_is_json_serializable(tmp_path):
     rh.record(p, entry)
     loaded = json.loads(p.read_text(encoding="utf-8"))
     assert loaded[0]["loop"]["tensors"][1]["name"] == "b.weight"
+
+
+def test_rows_render_newest_first_with_metrics_and_comparison(tmp_path):
+    p = tmp_path / "h.json"
+    rh.record(p, {
+        "key": "/m/out.safetensors", "input": "/m/in.safetensors",
+        "output": "/m/out.safetensors", "duration_s": 60.0,
+        "output_bytes": 4_000_000_000,
+        "timestamp": "2026-01-01 00:00:00",
+        "loop": {"total_seconds": 40.0, "tensor_count": 336},
+    })
+    rh.record(p, {
+        "key": "/m/out.safetensors", "input": "/m/in.safetensors",
+        "output": "/m/out.safetensors", "duration_s": 30.0,
+        "output_bytes": 4_000_000_000,
+        "timestamp": "2026-01-01 01:00:00",
+        "loop": {"total_seconds": 20.0, "tensor_count": 336},
+    })
+    table = rh.rows(rh.load(p))
+    assert len(table) == 2
+    newest, oldest = table  # newest first
+    assert newest[3] == 4.0            # size GB
+    assert newest[4] == 30.0           # wall s
+    assert newest[5] == 20.0           # loop s
+    assert newest[6] == 336            # tensors
+    assert "faster" in newest[8]       # 40s -> 20s vs previous
+    assert oldest[8] == ""             # no previous run to compare
+
+
+def test_rows_tolerate_partial_entries():
+    table = rh.rows([{"timestamp": "t", "key": "k", "input": "", "output": ""}])
+    assert len(table) == 1
+    assert table[0][3] == "" and table[0][8] == ""

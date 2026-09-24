@@ -1498,6 +1498,7 @@ def run_convert(
     control = RunControl()
     run_control.register(control)
     loop_timer = LoopPhaseTimer()
+    t0 = time.time()
     try:
         log = ""
         result_path = None
@@ -1527,6 +1528,7 @@ def run_convert(
                     output_path=result_path or opts.output_path or "",
                     command=format_command(opts),
                     loop_timer=loop_timer,
+                    duration_s=time.time() - t0,
                 )
                 log += "\n✅ Conversion finished.\n"
                 if result_path:
@@ -1628,7 +1630,7 @@ def refresh_env():
 
 def _record_run_history(
     *, key: str, input_path: str, output_path: str, command: str,
-    loop_timer: LoopPhaseTimer, resumed: bool = False,
+    loop_timer: LoopPhaseTimer, resumed: bool = False, duration_s: float | None = None,
 ) -> str:
     """Persist this run's loop stats; return a '[loop]' comparison line.
 
@@ -1639,6 +1641,12 @@ def _record_run_history(
     try:
         loop = loop_timer.stats()
         stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        output_bytes = None
+        if output_path:
+            try:
+                output_bytes = Path(output_path).stat().st_size
+            except OSError:
+                output_bytes = None
         rh.record(
             RUN_HISTORY,
             {
@@ -1649,6 +1657,8 @@ def _record_run_history(
                 "command": command,
                 "resumed": resumed,
                 "loop": loop,
+                "duration_s": round(duration_s, 1) if duration_s is not None else None,
+                "output_bytes": output_bytes,
             },
         )
         prev = rh.previous(rh.load(RUN_HISTORY), key, before=stamp)
@@ -1719,6 +1729,7 @@ def resume_ctq(cp):
     control = RunControl()
     run_control.register(control)
     loop_timer = LoopPhaseTimer()
+    t0 = time.time()
     try:
         result_path = None
         bar = _progress_bar_html(0, "Starting ctq...")
@@ -1748,6 +1759,7 @@ def resume_ctq(cp):
                     command=str(cp.params.get("command") or " ".join(args)),
                     loop_timer=loop_timer,
                     resumed=True,
+                    duration_s=time.time() - t0,
                 )
                 log += "\n✅ Conversion finished.\n"
                 if result_path:
@@ -2514,6 +2526,18 @@ with gr.Blocks(title="Quant Convert GUI") as demo:
                 "5. Turbo: 8 steps, CFG 1.0, euler/simple, shift 1.15 · Raw: 20–52 steps, CFG 3–7"
             )
 
+        with gr.Tab("History"):
+            gr.Markdown(
+                "Every finished conversion (from `run_history.json`), newest first, with the metrics "
+                "that make runs comparable: output size, wall time, optimizer-loop time, tensor count, "
+                "and a speed verdict against the previous run of the same conversion."
+            )
+            history_tbl = gr.Dataframe(
+                headers=rh.HEADERS, value=rh.rows(rh.load(RUN_HISTORY)),
+                interactive=False, wrap=True,
+            )
+            history_refresh_btn = gr.Button("Refresh")
+
         with gr.Tab("Inspector"):
             gr.Markdown(
                 "Read-only look inside any GGUF: architecture, type histogram, "
@@ -2995,6 +3019,9 @@ with gr.Blocks(title="Quant Convert GUI") as demo:
             yield f"**Inspection failed:** `{exc}`"
 
     inspect_btn.click(run_inspect, inputs=[inspect_file], outputs=[inspect_out])
+    history_refresh_btn.click(
+        lambda: rh.rows(rh.load(RUN_HISTORY)), outputs=[history_tbl],
+    )
 
     def _stream_tool_cmd(cmd: list[str]):
         """Run a tools/ CLI in a subprocess, streaming merged output into a

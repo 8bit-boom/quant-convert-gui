@@ -88,3 +88,46 @@ def comparison_line(prev: dict, current_loop: dict) -> str | None:
         f"[loop] vs run {stamp}: optimizer phase {cur_s:.1f}s vs "
         f"{float(prev_s):.1f}s — {verdict}"
     )
+
+
+HEADERS = ["When", "Input", "Output", "Size GB", "Wall s", "Loop s", "Tensors", "Resumed", "vs previous"]
+
+
+def rows(entries: list[dict]) -> list[list]:
+    """Render history entries (oldest-first) as table rows, newest first,
+    with a per-key speed comparison against the previous run of the same
+    conversion. For gr.DataFrame(value=..., headers=HEADERS)."""
+    from pathlib import Path as _Path
+
+    out: list[list] = []
+    # Compare each run against the next-OLDER run of the same conversion
+    # (entries are oldest-first): build per-key chains forward.
+    prev_by_key: dict[str, dict] = {}
+    rendered: list[tuple[dict, dict | None]] = []
+    for e in entries:
+        rendered.append((e, prev_by_key.get(e.get("key", ""))))
+        prev_by_key[e.get("key", "")] = e
+    for e, prev in reversed(rendered):
+        loop = e.get("loop") or {}
+        cmp_line = comparison_line(prev, loop) if prev else None
+        if cmp_line:
+            cmp_short = cmp_line.split("—")[-1].strip()
+        else:
+            cmp_short = ""
+        size_gb = ""
+        if e.get("output_bytes"):
+            size_gb = round(e["output_bytes"] / 1e9, 2)
+        input_name = _Path(str(e.get("input") or "")).name or str(e.get("input") or "")
+        output_name = _Path(str(e.get("output") or "")).name or str(e.get("output") or "")
+        out.append([
+            e.get("timestamp", ""),
+            input_name,
+            output_name,
+            size_gb,
+            e.get("duration_s") if e.get("duration_s") is not None else "",
+            loop.get("total_seconds", ""),
+            loop.get("tensor_count", ""),
+            "yes" if e.get("resumed") else "",
+            cmp_short,
+        ])
+    return out
