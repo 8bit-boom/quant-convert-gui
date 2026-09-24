@@ -2397,6 +2397,49 @@ with gr.Blocks(title="Quant Convert GUI") as demo:
                 with gr.Column():
                     llm_result_file = gr.File(label="Output file", interactive=False)
 
+        with gr.Tab("Image → GGUF"):
+            gr.Markdown(
+                "Converts **Krea 2 (Raw / Turbo)** - the 12.9B text-to-image diffusion "
+                "transformer - into GGUF for ComfyUI. This is *not* an LLM conversion: "
+                "the GGUF holds only the DiT, with `arch = krea2` and ComfyUI-native "
+                "tensor names. The text encoder and VAE stay separate safetensors "
+                "(download buttons below). See [docs/KREA2.md](https://github.com/8bit-boom/quant-convert-gui/blob/main/docs/KREA2.md) for details."
+            )
+            with gr.Row():
+                img_src = gr.File(label="Source safetensors (Comfy-Org BF16 single file, or HF diffusers shards merged)",
+                                  file_types=[".safetensors"], type="filepath")
+            with gr.Row():
+                img_quant = gr.Dropdown(
+                    choices=["q8_0", "q5_1", "q5_0", "q4_1", "q4_0", "bf16"],
+                    value="q8_0", label="Quant for big BF16 linears",
+                )
+                img_dst_name = gr.Textbox(label="Output name", value="krea2_turbo_q8_0.gguf")
+                img_convert_btn = gr.Button("Convert", variant="primary")
+            img_convert_log = gr.Textbox(label="Conversion log", lines=12, interactive=False, autoscroll=True)
+
+            gr.Markdown("### Downloads (Comfy-Org/Krea-2 on Hugging Face)")
+            with gr.Row():
+                img_dl_turbo_btn = gr.Button("Turbo BF16 source (26 GB)")
+                img_dl_raw_btn = gr.Button("Raw BF16 source (26 GB)")
+                img_dl_te_btn = gr.Button("Text encoder (Qwen3-VL fp8)")
+                img_dl_vae_btn = gr.Button("VAE (Qwen-Image)")
+            img_dl_log = gr.Textbox(label="Download log", lines=4, interactive=False)
+            gr.Markdown(
+                "Files land in `image_models/` next to the app. Note the two 26 GB "
+                "sources - you only need **one** (Turbo = 8-step generation; Raw = higher quality, more steps)."
+            )
+
+            gr.Markdown(
+                "### ComfyUI recipe\n"
+                "Requires ComfyUI ≥ v0.25 plus a krea2-patched ComfyUI-GGUF fork "
+                "(RealRebelAI/ComfyUI-GGUF_KREA-2 or molbal's fork; stock city96 rejects the arch).\n"
+                "1. Copy the GGUF into `models/diffusion_models/`\n"
+                "2. **Unet Loader (GGUF)** ← the converted GGUF\n"
+                "3. **CLIPLoader** ← `qwen3vl_4b_fp8_scaled.safetensors`, type `krea2`\n"
+                "4. **VAELoader** ← `qwen_image_vae.safetensors`\n"
+                "5. Turbo: 8 steps, CFG 1.0, euler/simple, shift 1.15 · Raw: 20–52 steps, CFG 3–7"
+            )
+
         with gr.Tab("Inspector"):
             gr.Markdown(
                 "Read-only look inside any GGUF: architecture, type histogram, "
@@ -2435,16 +2478,7 @@ with gr.Blocks(title="Quant Convert GUI") as demo:
                     oll_btn = gr.Button("Generate Modelfile", variant="primary")
                 oll_log = gr.Textbox(label="Result", lines=6, interactive=False)
             with gr.Accordion("Krea 2 (image DiT) → GGUF", open=False):
-                with gr.Row():
-                    krea_src = gr.File(label="Source safetensors (BF16, Comfy-Org or diffusers)",
-                                       file_types=[".safetensors"], type="filepath")
-                    krea_quant = gr.Dropdown(
-                        choices=["q8_0", "q5_1", "q5_0", "q4_1", "q4_0", "bf16"],
-                        value="q8_0", label="Quant for big BF16 linears",
-                    )
-                    krea_dst_name = gr.Textbox(label="Output name", value="krea2_q8_0.gguf")
-                    krea_btn = gr.Button("Convert", variant="primary")
-                krea_log = gr.Textbox(label="Log", lines=14, interactive=False, autoscroll=True)
+                gr.Markdown("Moved to its own **Image → GGUF** tab (with companion-file downloads and the ComfyUI recipe).")
 
         with gr.Tab("About"):
             gr.Markdown(
@@ -2878,8 +2912,70 @@ with gr.Blocks(title="Quant Convert GUI") as demo:
                   outputs=[cmp_log])
     oll_btn.click(run_ollama_modelfile, inputs=[oll_gguf, oll_name, oll_ctx],
                   outputs=[oll_log])
-    krea_btn.click(run_krea_convert, inputs=[krea_src, krea_quant, krea_dst_name],
-                   outputs=[krea_log])
+
+    IMG_MODELS_DIR = APP_DIR / "image_models"
+    KREA_BASE = "https://huggingface.co/Comfy-Org/Krea-2/resolve/main"
+
+    def run_img_download(label: str, url: str):
+        import threading
+        IMG_MODELS_DIR.mkdir(parents=True, exist_ok=True)
+        state: dict = {}
+        yield f"Downloading {label}...\n(this can take a while for multi-GB files; progress prints to the server console)"
+
+        def work():
+            try:
+                state["path"] = hf_download(url, str(IMG_MODELS_DIR))
+            except Exception as exc:  # noqa: BLE001 - surfaced below
+                state["error"] = str(exc)
+
+        t = threading.Thread(target=work, daemon=True)
+        t.start()
+        while t.is_alive():
+            yield f"Downloading {label}... {time.strftime('%H:%M:%S')}"
+            time.sleep(2)
+        if "error" in state:
+            yield f"Download failed: {state['error']}"
+        else:
+            yield f"Done.\n`{state['path']}`"
+
+    def run_img_convert(src, quant, dst_name):
+        if not src:
+            yield "Pick a source safetensors first (or download one below)."
+            return
+        dst = OUTPUT_DIR / (dst_name or "krea2_q8_0.gguf")
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        yield from _stream_tool_cmd([
+            str(APP_DIR / "tools" / "convert_krea2_to_gguf.py"),
+            "--src", str(src), "--dst", str(dst), "--quant", quant or "q8_0",
+        ])
+
+    def dl_turbo():
+        yield from run_img_download(
+            "krea2_turbo_bf16.safetensors (26 GB)",
+            f"{KREA_BASE}/diffusion_models/krea2_turbo_bf16.safetensors")
+
+    def dl_raw():
+        yield from run_img_download(
+            "krea2_raw_bf16.safetensors (26 GB)",
+            f"{KREA_BASE}/diffusion_models/krea2_raw_bf16.safetensors")
+
+    def dl_te():
+        yield from run_img_download(
+            "qwen3vl_4b_fp8_scaled.safetensors (text encoder)",
+            f"{KREA_BASE}/text_encoders/qwen3vl_4b_fp8_scaled.safetensors")
+
+    def dl_vae():
+        yield from run_img_download(
+            "qwen_image_vae.safetensors (VAE)",
+            f"{KREA_BASE}/vae/qwen_image_vae.safetensors")
+
+    img_dl_turbo_btn.click(dl_turbo, outputs=[img_dl_log])
+    img_dl_raw_btn.click(dl_raw, outputs=[img_dl_log])
+    img_dl_te_btn.click(dl_te, outputs=[img_dl_log])
+    img_dl_vae_btn.click(dl_vae, outputs=[img_dl_log])
+    img_convert_btn.click(run_img_convert,
+                          inputs=[img_src, img_quant, img_dst_name],
+                          outputs=[img_convert_log])
 
     def run_llamacpp_clone():
         yield from run_llamacpp_setup_step("clone", "")

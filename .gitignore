@@ -5,6 +5,7 @@ venv/
 downloads/
 converted/
 llm_models/
+image_models/
 llama.cpp/
 *.safetensors
 *.gguf
