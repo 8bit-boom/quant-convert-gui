@@ -28,6 +28,7 @@ from quant_gui.gguf_backend import stream_gguf_conversion, stream_install as str
 from quant_gui.gguf_backend import QUANT_TYPE_CHOICES as GGUF_QUANT_TYPE_CHOICES
 from quant_gui.gguf_backend import SUPPORTED_ARCH_NAMES as GGUF_SUPPORTED_ARCH_NAMES
 from quant_gui.gguf_backend import is_available as gguf_is_available
+from quant_gui.gguf_inspect import format_inspection, inspect_gguf
 from quant_gui.int4_backend import stream_int4_conversion, stream_install as stream_int4_install
 from quant_gui.int4_backend import is_available as int4_is_available
 from quant_gui import runner
@@ -2396,6 +2397,19 @@ with gr.Blocks(title="Quant Convert GUI") as demo:
                 with gr.Column():
                     llm_result_file = gr.File(label="Output file", interactive=False)
 
+        with gr.Tab("Inspector"):
+            gr.Markdown(
+                "Read-only look inside any GGUF: architecture, type histogram, "
+                "bits-per-weight, biggest tensors, metadata. Nothing is loaded or "
+                "executed - inspection takes seconds even for 100 GB files."
+            )
+            with gr.Row():
+                inspect_file = gr.File(
+                    label="GGUF file", file_types=[".gguf"], type="filepath",
+                )
+                inspect_btn = gr.Button("Inspect", variant="primary")
+            inspect_out = gr.Markdown("Pick a GGUF and press **Inspect**.")
+
         with gr.Tab("About"):
             gr.Markdown(
                 "## What these formats mean\n"
@@ -2764,6 +2778,17 @@ with gr.Blocks(title="Quant Convert GUI") as demo:
     )
 
     refresh_btn.click(refresh_env, outputs=[env_md])
+
+    def run_inspect(path):
+        if not path:
+            yield "Pick a GGUF file first."
+            return
+        try:
+            yield format_inspection(inspect_gguf(path))
+        except Exception as exc:  # noqa: BLE001 - surfaced to the UI
+            yield f"**Inspection failed:** `{exc}`"
+
+    inspect_btn.click(run_inspect, inputs=[inspect_file], outputs=[inspect_out])
 
     def run_llamacpp_clone():
         yield from run_llamacpp_setup_step("clone", "")
