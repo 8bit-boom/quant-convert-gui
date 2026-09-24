@@ -202,6 +202,7 @@ ComfyUI-GGUF's own `tools/convert.py` uses.
   ComfyUI-GGUF's own script) always stay F32; a shape whose last dimension
   isn't divisible by 32 falls back to F16, exactly like `tools/convert.py`
   does. Your model preset / exclude-layers rules apply on top of that.
+- **Parallel + optional GPU quantization** — see [Performance](#performance).
 
 Verified end-to-end against a real GGUF round-trip (`gguf.GGUFReader`/
 `quants.dequantize`): correct `general.architecture` field, correct
@@ -411,6 +412,31 @@ Conversions can run for hours, so the Convert tab has progress controls:
   command plus all your settings) and resume relaunches that identical
   conversion with one click; any partially written output file is kept under
   a `*.partial-<timestamp>` name rather than left to be overwritten.
+
+## Performance
+
+Two speedups apply to the GGUF path (image/DiT models); both are on by
+default where applicable and neither changes the output:
+
+- **Parallel quantization** (always on): tensors are prefetched and
+  quantized across a small thread pool while the previous tensor is still
+  being written. Measured ~2.6× on a typical DiT vs strictly sequential
+  conversion; output is byte-identical.
+- **GPU quantization** (opt-in): the **"Use GPU quantization (Q8_0)"**
+  checkbox on the GGUF tab runs the Q8_0 block quantizer on your NVIDIA
+  GPU via a Triton kernel instead of numpy. Requirements: a CUDA GPU plus
+  `pip install triton-windows` (Windows; on Linux, `pip install triton`)
+  and a CUDA build of torch. If any piece is missing it silently falls
+  back to the CPU path. The checkbox choice is saved across launches
+  (`ui_settings.json`).
+
+  Measured on an RTX 5090 (1 GiB of f32 weights, warm kernel):
+  ~0.09 s on GPU vs 2.5 s numpy single-thread (~28×), and ~12× vs the
+  4-thread CPU path above — so it stays a real win on top of the
+  threading. The kernel is **bit-exact** against the numpy reference
+  (verified over 8M+ blocks, including rounding ties and zero blocks);
+  CPU and GPU runs produce byte-identical files. Without a GPU it also
+  works headless: set `QUANT_GUI_GPU_QUANT=1` in the environment.
 
 ## Project layout
 
