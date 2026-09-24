@@ -51,3 +51,23 @@ def test_gate_requires_env(monkeypatch):
         data = np.random.default_rng(1).standard_normal((64,)).astype(np.float32)
         expected = gguf.quants.quantize(data, gguf.GGMLQuantizationType.Q8_0)
         np.testing.assert_array_equal(gpu_quant.quantize_q8_0(data), expected)
+
+
+@pytest.mark.skipif(not gpu_quant.gpu_quant_ready(),
+                    reason="needs QUANT_GUI_GPU_QUANT=1 + triton + CUDA")
+def test_triton_path_bit_exact_when_available():
+    """Hardware check: the Triton kernel must match gguf-py byte for byte.
+
+    Verified on RTX 5090; CI (no GPU) skips this and covers the fallback."""
+    rng = np.random.default_rng(11)
+    for shape in [(32,), (64,), (4, 96), (2, 3, 64), (2048, 4096)]:
+        data = rng.standard_normal(shape).astype(np.float32) * 3
+        expected = gguf.quants.quantize(data, gguf.GGMLQuantizationType.Q8_0)
+        got = gpu_quant.quantize_q8_0(data)
+        assert got.shape == expected.shape
+        np.testing.assert_array_equal(got, expected)
+    # outliers + exact ties (the case that caught non-IEEE division)
+    data = np.array([[0.5, -0.5, 1.5, -1.5] + [0.0] * 28] * 64, dtype=np.float32)
+    data[1, 0] = 1000.0
+    expected = gguf.quants.quantize(data, gguf.GGMLQuantizationType.Q8_0)
+    np.testing.assert_array_equal(gpu_quant.quantize_q8_0(data), expected)
