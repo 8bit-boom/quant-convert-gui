@@ -1044,6 +1044,57 @@ def run_llm_find_best(input_gguf: str, imatrix_file: str, target_bpw: str = "", 
 _LAST_SWEEP: dict = {}
 
 
+def _stage_failed(stage_log: str) -> bool:
+    return "❌" in stage_log
+
+
+def run_llm_auto_pipeline(input_gguf: str, target_bpw: str, output_name: str,
+                          val_baseline: str, val_text: str):
+    """One-click chain: sweep -> tune winner -> perplexity-validate.
+
+    Each stage reuses the previous one's artifacts (the sweep's bench imatrix,
+    the tune's output file via newest_smart_gguf auto-detect), so a re-run
+    after an interruption skips work that's already on disk. Stops at the
+    first stage that fails.
+    """
+    header = (
+        "# Auto pipeline\n\n"
+        "Stages: **1. sweep** the target-size family → **2. per-tensor-tune the winner** "
+        "(Dynamic 3.0) → **3. validate** vs a plain baseline quant with perplexity.\n\n"
+    )
+    yield header, None
+
+    # -- stage 1: sweep ----------------------------------------------------
+    log = header + "## Stage 1/3: find-best sweep\n\n"
+    sweep_log = ""
+    for item in run_llm_find_best(input_gguf, "", target_bpw):
+        sweep_log = item[0]
+        yield log + sweep_log, None
+    if _stage_failed(sweep_log) or not _LAST_SWEEP.get("winner_quant"):
+        yield log + sweep_log + "\n\n**Pipeline stopped** - sweep did not produce a winner.\n", None
+        return
+
+    # -- stage 2: tune winner ----------------------------------------------
+    log += sweep_log + "\n\n## Stage 2/3: per-tensor tuning (Dynamic 3.0)\n\n"
+    tune_log, tune_file = "", None
+    for tune_log, tune_file in run_llm_tune_winner(output_name):
+        yield log + tune_log, tune_file
+    if _stage_failed(tune_log) or not tune_file:
+        yield log + tune_log + "\n\n**Pipeline stopped** - tuning did not produce a file.\n", tune_file
+        return
+
+    # -- stage 3: validate ---------------------------------------------------
+    log += tune_log + "\n\n## Stage 3/3: perplexity validation\n\n"
+    val_log = ""
+    for val_log, val_file in run_llm_validate("", "", val_baseline or "Q4_K_M", val_text, ""):
+        yield log + val_log, val_file or tune_file
+    if _stage_failed(val_log):
+        yield log + val_log + "\n\n**Pipeline finished with a validation failure** - the tuned file from stage 2 is still on disk.\n", tune_file
+        return
+    yield log + val_log + "\n\n✅ **Auto pipeline complete.**\n", tune_file
+
+
+
 def run_llm_tune_winner(output_name: str):
     """Hand the last sweep winner to the Dynamic tuner: same model + imatrix,
     budget from the winner's bits-per-weight family, K-ladder assignment."""
@@ -2302,6 +2353,14 @@ with gr.Blocks(title="Quant Convert GUI") as demo:
             with gr.Row():
                 llm_quantize_btn = gr.Button("Quantize")
                 llm_find_best_btn = gr.Button("Find best quant (sweep)")
+                llm_auto_btn = gr.Button("Auto (sweep → tune → validate)", variant="primary")
+            gr.Markdown(
+                "**Auto** chains the whole tuning pipeline in one click: sweep the target-size family, "
+                "per-tensor-tune the winner (Dynamic 3.0 style), then validate the tuned file against a "
+                "plain baseline quant with perplexity on a held-out text. Stages reuse each other's "
+                "artifacts (the sweep's imatrix, the tune's output file), so re-running skips work "
+                "that's already done. Needs llama-quantize + llama-imatrix built (Setup section)."
+            )
             gr.Markdown(
                 "**Find best quant** sweeps the target-size family through llama-quantize on the input "
                 "file — generating an imatrix first if none is given — and measures size, time, and "
@@ -3055,6 +3114,12 @@ with gr.Blocks(title="Quant Convert GUI") as demo:
         inputs=[llm_smart_output],
         outputs=[llm_log, llm_result_file],
     )
+    llm_auto_btn.click(
+        run_llm_auto_pipeline,
+        inputs=[llm_quantize_input, llm_target_bpw, llm_smart_output, llm_val_baseline, llm_val_text],
+        outputs=[llm_log, llm_result_file],
+    )
+
     llm_val_btn.click(
         run_llm_validate,
         inputs=[llm_val_tuned, llm_val_ref, llm_val_baseline, llm_val_text, llm_val_ngl],
