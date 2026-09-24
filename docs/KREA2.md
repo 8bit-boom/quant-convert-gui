@@ -63,6 +63,36 @@ K-quants (Q4_K_M, IQ4_XS, …) are **not** single-stage: gguf-py cannot emit the
 directly. Use the two-stage flow (this converter → BF16 GGUF → patched
 `llama-quantize`) if you need K-quants.
 
+### Two-stage K-quant flow with a sensitivity plan
+
+Stock `llama-quantize` refuses the krea2 arch; community forks
+(RealRebelAI/molbal) ship a krea2-patched `llama-quantize` that accepts
+`--tensor-type-file` for per-tensor K-quant types. The missing input is
+activation stats — DiTs have no `llama-imatrix` — so this repo provides a
+sensitivity-proxy planner:
+
+```bash
+python tools/krea2_kquant_plan.py model_q8_0.gguf --target-bpw 4.0 \
+    -o model.tensor-types.txt
+llama-quantize --tensor-type-file model.tensor-types.txt \
+    model_bf16.gguf out-Q4_K.gguf Q4_K
+```
+
+What the planner does, per plannable 2-D tensor (skipping 1-D, tiny, and
+hi-precision conditioning/output prefixes):
+
+1. decodes the tensor to F32 (BF16/F16/F32 pass through; legacy-quant
+   sources are dequantized — Q8_0 sources work and are near-lossless),
+2. scores reconstruction error under Q4_0 vs Q5_0 proxy quantization on a
+   row subsample (≤ 4096 rows, so a 14 GB DiT scores in ~3 minutes),
+3. ranks tensors by the error gap (how much the tensor suffers when
+   squeezed) and tiers them onto a Q6_K → Q5_K → Q4_K → Q3_K ladder,
+   shifting the cut points with `--target-bpw` (3.0–6.0).
+
+Caveat: this is an *uncalibrated* proxy — no activation weighting — so the
+plan is a starting template to hill-climb from, not a proven optimum. Treat
+the output as "better than one-size-fits-all Q4_K", not "optimal".
+
 ### Per-tensor precision rules (community ModelKrea2 consensus)
 
 1. 1-D tensors → F32 (norm scales, modulations, biases)
