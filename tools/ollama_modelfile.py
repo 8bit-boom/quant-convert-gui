@@ -61,6 +61,35 @@ def read_arch_and_params(gguf: Path) -> tuple[str, int]:
     return arch, sum(int(t.n_elements) for t in r.tensors)
 
 
+def kv_bytes_per_token(gguf: Path) -> int | None:
+    """f16 KV-cache bytes per token: layers × kv_heads × head_k × 2 (K+V).
+
+    Reads the arch-prefixed metadata fields (``*.block_count``,
+    ``*.attention.head_count_kv``/``head_count``, ``*.attention.key_length``).
+    Returns None when the file doesn't carry enough metadata (e.g. a DiT
+    GGUF - KV cache is an LLM-serving concept).
+    """
+    from gguf import GGUFReader
+
+    r = GGUFReader(str(gguf))
+
+    def _int(suffix: str) -> int | None:
+        for key, field in r.fields.items():
+            if key.endswith(suffix):
+                try:
+                    return int(field.parts[-1][0])
+                except (TypeError, ValueError, IndexError):
+                    return None
+        return None
+
+    layers = _int(".block_count")
+    kv_heads = _int(".attention.head_count_kv") or _int(".attention.head_count")
+    head_k = _int(".attention.key_length")
+    if layers and kv_heads and head_k:
+        return layers * kv_heads * head_k * 2 * 2
+    return None
+
+
 def build_modelfile(gguf: Path, model_name: str = "", num_ctx: int = 32768) -> str:
     gguf = gguf.resolve()
     arch, params = read_arch_and_params(gguf)
@@ -96,6 +125,19 @@ def build_modelfile(gguf: Path, model_name: str = "", num_ctx: int = 32768) -> s
             "# predate this architecture's renderer.",
         ]
     lines.append(f"PARAMETER num_ctx {num_ctx}")
+    kv_per_tok = kv_bytes_per_token(gguf)
+    if kv_per_tok:
+        kv_total = kv_per_tok * num_ctx
+        lines += [
+            "",
+            f"# KV cache (f16): {kv_per_tok / 1e6:.2f} MB/token -> "
+            f"~{kv_total / 1e9:.2f} GB at num_ctx {num_ctx}.",
+            "# Serving long contexts on limited VRAM? Shrink the cache with the",
+            "# OLLAMA_KV_CACHE_TYPE env var (halves at q8_0, quarters at q4_0):",
+            "#   PowerShell:  $env:OLLAMA_KV_CACHE_TYPE=\"q8_0\"; ollama serve",
+            "#   bash:        OLLAMA_KV_CACHE_TYPE=q8_0 ollama serve",
+            "# or lower num_ctx above (the context, not the model, scales the cache).",
+        ]
     lines += [
         "",
         "# Create and run:",
