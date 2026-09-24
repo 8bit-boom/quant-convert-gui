@@ -22,6 +22,9 @@ There's also a separate **LLM → GGUF** tab for converting text models
 real [llama.cpp](https://github.com/ggerganov/llama.cpp) checkout rather
 than any of the above; see
 [About "LLM to GGUF"](#about-llm-to-gguf-gemma-llama-qwen-etc) below.
+An **Image → GGUF** tab covers Krea 2 (below too), and the **Inspector**,
+**Tools**, and **History** tabs round out the app
+([About the other tabs](#about-the-other-tabs)).
 
 ## Which format for your GPU
 
@@ -259,11 +262,41 @@ this app's), and shells out to its actual tools:
   `--tensor-type-file` (a plain text file of `tensor.name=GGML_TYPE`
   lines) - the real mechanism behind manually assigning a different type
   per layer, which is what Unsloth's "Dynamic 3.0" per-layer mixing is
-  built from. This app does **not** generate one automatically: Unsloth's
-  specific per-model choices of which layer gets which type aren't
-  published anywhere in a form this module can consume, so this is
-  exposed as a manual power-user override, not a reproduction of their
-  recipe.
+  built from. Paste any such file into step 5's override box to quantize
+  with it directly.
+- **"Find best quant (sweep)"** automates the search: it runs the
+  target-size family through `llama-quantize` on your file (generating an
+  imatrix first if none is given), measures size, time, and
+  reconstruction error vs the input, and pre-selects the winner in the
+  Quant type dropdown. Weight-space error, not perplexity - it ranks
+  settings, it doesn't judge generation quality.
+- **Smart per-tensor tuning (Dynamic-quant style)** generates a
+  `--tensor-type-file` automatically: it ranks every tensor's
+  quantization sensitivity using your imatrix as the
+  activation-importance weight (minutes, pure Python, no GPU), then
+  greedily assigns per-tensor types under a size budget and quantizes
+  with the result. "K-ladder" mode maps sensitivity onto q3_k..q6_k;
+  "Legacy" uses only pure-Python-measurable types with exact errors.
+  Embeddings, the output tensor, and MoE routers are never dropped below
+  the floor. MoE models get a two-zone recipe (Q8_0-level attention/
+  shared FFN, IQ-quantized experts). Target-size presets
+  (~3/~4/~5 bpw families) compute the budget from parameter count;
+  "Custom" takes a GB figure.
+- **"Auto (sweep → tune → validate)"** chains the whole tuning pipeline in
+  one click: sweep the family, per-tensor-tune the winner, then compare
+  perplexity of the tuned file vs a plain baseline quant on a held-out
+  text (something the calibration didn't see) with llama-perplexity.
+  Stages reuse each other's artifacts, so re-running skips work already
+  done.
+- **KV-cache hints** for Ollama: the companion `tools/ollama_modelfile.py`
+  emits a `Modelfile` with the right `num_ctx`/flash-attention settings
+  for your GPU (see [docs/OLLAMA.md](docs/OLLAMA.md) for the thinking-mode
+  recipe on Gemma 4).
+
+What this is *not*: a reproduction of Unsloth's exact per-model layer
+choices (still unpublished). It's the same real llama.cpp mechanisms -
+imatrix + per-layer types + a size budget - driven by *your* calibration
+data instead of theirs.
 
 Verified end-to-end against a real synthetic Llama-architecture model
 (tiny SentencePiece tokenizer, trained with byte-fallback so it can encode
@@ -278,7 +311,43 @@ tokenizer/special-token IDs, a real generated importance matrix
 real per-layer type override applied via `--tensor-type-file` (confirmed
 by reading the exact GGML type back out of the output file), and a real
 Q4_K_M output file that `gguf.GGUFReader` reads back with the right
-architecture and per-tensor quant types.
+architecture and per-tensor quant types. The smart-tuning pipeline is
+covered by its own tests: imatrix loading (both legacy and GGUF
+container formats), sensitivity scoring, budget assignment on synthetic
+tensors, and the sweep's candidate ranking.
+
+## About "Image → GGUF" (Krea 2)
+
+A dedicated tab for **Krea 2 (Raw / Turbo)** - the 12.9B text-to-image
+diffusion transformer - which the generic GGUF backend above deliberately
+refuses (the krea2 arch is outside ComfyUI-GGUF's allowlist, so a
+community-patched loader fork is needed anyway). It wraps the repo's own
+`tools/convert_krea2_to_gguf.py` (pure numpy + gguf-py, no torch): only
+the DiT goes into the GGUF with `arch = krea2` and ComfyUI-native tensor
+names; the text encoder (Qwen3-VL fp8) and VAE (Qwen-Image) stay separate
+safetensors, with download buttons for all three on the tab. Quant
+choices are q8_0 down to q4_0 plus lossless bf16. See
+[docs/KREA2.md](docs/KREA2.md) for the full precision rules, the ComfyUI
+loading recipe, and the two-stage K-quant flow (a
+`tools/krea2_kquant_plan.py` sensitivity planner that emits a
+`--tensor-type-file` template for a krea2-patched `llama-quantize`).
+
+## About the other tabs
+
+- **Inspector** - read-only look inside any GGUF: architecture, type
+  histogram, bits-per-weight, biggest tensors, metadata. Nothing is
+  loaded or executed, so inspection takes seconds even for 100 GB files.
+- **History** - every finished conversion (from `run_history.json`),
+  newest first, with the metrics that make runs comparable: output size,
+  wall time, tensor count, and a speed verdict against the previous run
+  of the same conversion.
+- **Tools** - wrappers around the repo's CLI tools, same code as the
+  command line with logs streamed into the UI: **Compare GGUFs**
+  (inference-free quality report - reconstruction error per tensor,
+  optionally imatrix-weighted, vs a reference; much faster than a
+  perplexity run), **Ollama Modelfile** (see
+  [docs/OLLAMA.md](docs/OLLAMA.md)), and a pointer to the Image → GGUF
+  tab.
 
 ## Install (automatic)
 
@@ -382,6 +451,11 @@ things (e.g. missing `safetensors`/`scipy` from before those were added to
    output — no polling, no guessing). The finished file shows up under
    **Converted file** when it's done.
 
+**Converting several models with the same settings:** list one path per
+line in the **Batch queue** box (or pick a primary local file) and hit
+**Convert all (batch)** - auto output naming is forced so items can't
+overwrite each other, and Stop/Pause applies to the current item.
+
 Advanced ctq flags (exclude-layers regex, device override, calibration
 settings, etc.) are available under **Advanced options** for power users;
 everyone else can ignore them.
@@ -474,6 +548,34 @@ default where applicable and neither changes the output:
 - `quant_gui/data/default_calibration.txt` — the small bundled generic
   imatrix calibration text (multi-domain: prose, code, lists, Q&A) used
   when no custom calibration file is supplied.
+- `quant_gui/gpu_quant.py` — the opt-in Triton Q8_0 GPU quantizer with a
+  bit-exact numpy fallback (see [Performance](#performance)).
+- `quant_gui/smart_quant.py` — imatrix loading (legacy + GGUF formats),
+  per-tensor sensitivity scoring, and size-budget assignment for the
+  Dynamic-style tuner on the LLM tab.
+- `quant_gui/gguf_inspect.py` — read-only GGUF inspection for the
+  Inspector tab (header metadata + type histogram, no tensor loading).
+- `quant_gui/gguf_bench.py` — bits-per-weight target families and
+  candidate lists for the find-best sweep.
+- `quant_gui/loop_timing.py` — per-loop optimizer timing for the History
+  tab's speed verdicts.
+- `quant_gui/run_history.py` — append-only `run_history.json` log and the
+  History tab's comparison rows.
+- `quant_gui/ui_settings.py` — the small persisted-settings store behind
+  checkboxes that survive relaunches (e.g. GPU quantization).
+- `tools/convert_krea2_to_gguf.py` — the Krea 2 image-DiT converter behind
+  the Image → GGUF tab (see
+  [About "Image → GGUF"](#about-image--gguf-krea-2)).
+- `tools/krea2_kquant_plan.py` — sensitivity-proxy planner that emits a
+  `--tensor-type-file` for the two-stage Krea 2 K-quant flow
+  (see [docs/KREA2.md](docs/KREA2.md)).
+- `tools/compare_gguf.py` — inference-free GGUF quality comparison used by
+  the Tools tab.
+- `tools/ollama_modelfile.py` — Ollama `Modelfile` generator with
+  KV-cache hints (see [docs/OLLAMA.md](docs/OLLAMA.md)).
+- `docs/KREA2.md`, `docs/OLLAMA.md`, `docs/AUDIT.md`, `docs/ROADMAP.md` —
+  deeper write-ups: Krea 2 conversion + K-quants, Ollama thinking-mode
+  recipe, the backend audit, and the feature roadmap.
 
 ## Sources
 
