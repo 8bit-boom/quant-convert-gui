@@ -41,7 +41,7 @@ import platform
 import shutil
 import subprocess
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 LLAMACPP_REPO_URL = "https://github.com/ggerganov/llama.cpp.git"

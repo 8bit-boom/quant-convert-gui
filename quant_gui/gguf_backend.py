@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import importlib.util
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 from .checkpoints import Checkpoint, record_tensor, set_total

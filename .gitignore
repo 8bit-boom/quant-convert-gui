@@ -12,3 +12,6 @@ llama.cpp/
 run_history.json
 llama.cpp/
 gguf_bench_tmp/
+checkpoints/
+tmp_compare/
+*.log
