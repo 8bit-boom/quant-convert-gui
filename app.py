@@ -2410,6 +2410,42 @@ with gr.Blocks(title="Quant Convert GUI") as demo:
                 inspect_btn = gr.Button("Inspect", variant="primary")
             inspect_out = gr.Markdown("Pick a GGUF and press **Inspect**.")
 
+        with gr.Tab("Tools"):
+            gr.Markdown(
+                "Wrappers around the repo's CLI tools (`tools/`) - same code as "
+                "the command line, with logs streamed here."
+            )
+            with gr.Accordion("Compare GGUFs (inference-free quality report)", open=True):
+                with gr.Row():
+                    cmp_ref = gr.File(label="Reference GGUF (F16/BF16/F32)",
+                                      file_types=[".gguf"], type="filepath")
+                    cmp_cands = gr.File(label="Candidate GGUF(s) (pick several with Ctrl/Shift)",
+                                        file_types=[".gguf"], type="filepath", file_count="multiple")
+                with gr.Row():
+                    cmp_imatrix = gr.File(label="Imatrix (optional, for activation weighting)",
+                                          file_types=[".imatrix", ".gguf"], type="filepath")
+                    cmp_rows = gr.Number(label="Sample rows per tensor", value=48, precision=0)
+                    cmp_btn = gr.Button("Compare", variant="primary")
+                cmp_log = gr.Textbox(label="Report", lines=18, interactive=False, autoscroll=True)
+            with gr.Accordion("Ollama Modelfile", open=False):
+                with gr.Row():
+                    oll_gguf = gr.File(label="GGUF", file_types=[".gguf"], type="filepath")
+                    oll_name = gr.Textbox(label="Model name (optional)", placeholder="my-model")
+                    oll_ctx = gr.Number(label="num_ctx", value=32768, precision=0)
+                    oll_btn = gr.Button("Generate Modelfile", variant="primary")
+                oll_log = gr.Textbox(label="Result", lines=6, interactive=False)
+            with gr.Accordion("Krea 2 (image DiT) → GGUF", open=False):
+                with gr.Row():
+                    krea_src = gr.File(label="Source safetensors (BF16, Comfy-Org or diffusers)",
+                                       file_types=[".safetensors"], type="filepath")
+                    krea_quant = gr.Dropdown(
+                        choices=["q8_0", "q5_1", "q5_0", "q4_1", "q4_0", "bf16"],
+                        value="q8_0", label="Quant for big BF16 linears",
+                    )
+                    krea_dst_name = gr.Textbox(label="Output name", value="krea2_q8_0.gguf")
+                    krea_btn = gr.Button("Convert", variant="primary")
+                krea_log = gr.Textbox(label="Log", lines=14, interactive=False, autoscroll=True)
+
         with gr.Tab("About"):
             gr.Markdown(
                 "## What these formats mean\n"
@@ -2789,6 +2825,61 @@ with gr.Blocks(title="Quant Convert GUI") as demo:
             yield f"**Inspection failed:** `{exc}`"
 
     inspect_btn.click(run_inspect, inputs=[inspect_file], outputs=[inspect_out])
+
+    def _stream_tool_cmd(cmd: list[str]):
+        """Run a tools/ CLI in a subprocess, streaming merged output into a
+        Gradio textbox. Yields the accumulated log on every line."""
+        import subprocess
+        import sys
+        proc = subprocess.Popen(
+            [sys.executable, *cmd],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, bufsize=1, cwd=str(APP_DIR),
+        )
+        lines: list[str] = []
+        for line in proc.stdout:
+            lines.append(line)
+            yield "".join(lines)
+        proc.wait()
+        lines.append(f"\n[exit code {proc.returncode}]")
+        yield "".join(lines)
+
+    def run_compare(ref, cands, imatrix, rows):
+        if not ref or not cands:
+            yield "Pick a reference GGUF and at least one candidate."
+            return
+        cmd = [str(APP_DIR / "tools" / "compare_gguf.py"), str(ref), *map(str, cands),
+               "--sample-rows", str(int(rows or 48))]
+        if imatrix:
+            cmd += ["--imatrix", str(imatrix)]
+        yield from _stream_tool_cmd(cmd)
+
+    def run_ollama_modelfile(gguf, name, ctx):
+        if not gguf:
+            yield "Pick a GGUF first."
+            return
+        yield from _stream_tool_cmd([
+            str(APP_DIR / "tools" / "ollama_modelfile.py"), str(gguf),
+            "--name", name or "", "--num-ctx", str(int(ctx or 32768)),
+        ])
+
+    def run_krea_convert(src, quant, dst_name):
+        if not src:
+            yield "Pick a source safetensors first."
+            return
+        dst = OUTPUT_DIR / (dst_name or "krea2_q8_0.gguf")
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        yield from _stream_tool_cmd([
+            str(APP_DIR / "tools" / "convert_krea2_to_gguf.py"),
+            "--src", str(src), "--dst", str(dst), "--quant", quant or "q8_0",
+        ])
+
+    cmp_btn.click(run_compare, inputs=[cmp_ref, cmp_cands, cmp_imatrix, cmp_rows],
+                  outputs=[cmp_log])
+    oll_btn.click(run_ollama_modelfile, inputs=[oll_gguf, oll_name, oll_ctx],
+                  outputs=[oll_log])
+    krea_btn.click(run_krea_convert, inputs=[krea_src, krea_quant, krea_dst_name],
+                   outputs=[krea_log])
 
     def run_llamacpp_clone():
         yield from run_llamacpp_setup_step("clone", "")
