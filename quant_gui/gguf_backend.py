@@ -219,6 +219,64 @@ class GGUFConvertStats:
     fallback_f16_count: int = 0
 
 
+def _quant_worker_count() -> int:
+    """Threads for parallel quantization. gguf-py's quantize is numpy, which
+    releases the GIL on large array ops, so threads give real speedup without
+    the process-spawn risks of a Gradio server. Bounded so a handful of
+    in-flight f32 tensors can't exhaust RAM."""
+    import os
+    try:
+        return max(1, min(4, int(os.environ.get("QUANT_GUI_QUANT_THREADS", "0")) or
+                          (os.cpu_count() or 4) // 4))
+    except ValueError:
+        return 2
+
+
+def _prepare_tensor(f, key: str, arch, qtype, exclude_kw, highprec_kw, exclude_re):
+    """Load + quantize one tensor. Runs in a worker thread; returns
+    (key, packed_array, qtype, kind) or None for the >4-dim skip."""
+    import gguf
+    import numpy as np
+    import torch
+    from gguf import quants
+
+    tensor = f.get_tensor(key)
+    if tensor.dim() > MAX_TENSOR_DIMS:
+        return None
+
+    n_dims = tensor.dim()
+    n_params = tensor.numel()
+    force_f32 = (
+        n_dims == 1
+        or n_params <= QUANTIZATION_THRESHOLD
+        or _matches_any(key, arch.keys_hiprec)
+        or _matches_any(key, exclude_kw)
+        or _matches_any(key, highprec_kw)
+        or (exclude_re is not None and exclude_re.search(key))
+    )
+    this_qtype = gguf.GGMLQuantizationType.F32 if force_f32 else qtype
+    kind = "f32" if force_f32 else "quantized"
+
+    # Match city96/ComfyUI-GGUF's own dtype handling exactly: bf16 and
+    # fp8 have no native numpy dtype, so upcast before quantizing.
+    if tensor.dtype == torch.bfloat16:
+        data = tensor.to(torch.float32).numpy()
+    elif tensor.dtype in (getattr(torch, "float8_e4m3fn", None), getattr(torch, "float8_e5m2", None)):
+        data = tensor.to(torch.float16).numpy()
+    else:
+        data = tensor.numpy()
+    try:
+        packed = quants.quantize(data, this_qtype)
+    except (AttributeError, gguf.QuantError):
+        # Shape isn't divisible by the quant type's block size (32) -
+        # ctq's own presets fall back the same way for shape mismatches.
+        this_qtype = gguf.GGMLQuantizationType.F16
+        packed = quants.quantize(data, this_qtype)
+        if not force_f32:
+            kind = "fallback_f16"
+    return key, packed, this_qtype, kind
+
+
 def convert_to_gguf(
     input_path: str,
     output_path: str,
@@ -250,7 +308,6 @@ def convert_to_gguf(
 
     import gguf
     import numpy as np
-    import torch
     from gguf import quants
     from safetensors import safe_open
 
@@ -307,71 +364,67 @@ def convert_to_gguf(
                 else:
                     stats.quantized_count += 1
 
-        for i, key in enumerate(keys):
-            if i < start:
-                continue
+        # Parallel quantization: worker threads load+quantize up to `window`
+        # tensors ahead while the main thread writes shards/checkpoints and
+        # feeds the writer in strict key order. numpy releases the GIL on
+        # large array ops, so threads scale; the writer/checkpoint state is
+        # only touched by the main thread. Pause holds the writer (workers
+        # may finish their in-flight window first); cancel abandons pending
+        # futures without waiting for the window to drain.
+        from concurrent.futures import ThreadPoolExecutor
 
-            if progress_cb:
-                progress_cb(i + 1, stats.total, key)
+        n_workers = _quant_worker_count()
+        window = max(1, n_workers * 2)
+        pending: dict[int, "Future"] = {}
+        pool = ThreadPoolExecutor(max_workers=n_workers, thread_name_prefix="gguf-quant")
+        submit_i = start
 
-            # Tensor-boundary cooperation point: a started tensor always
-            # finishes, so checkpoint state stays consistent.
-            if control is not None:
-                control.wait_if_paused()
-                control.raise_if_cancelled()
-
-            tensor = f.get_tensor(key)
-            n_dims = tensor.dim()
-            n_params = tensor.numel()
-
-            if n_dims > MAX_TENSOR_DIMS:
-                stats.skipped_high_dim_count += 1
-                continue
-
-            force_f32 = (
-                n_dims == 1
-                or n_params <= QUANTIZATION_THRESHOLD
-                or _matches_any(key, arch.keys_hiprec)
-                or _matches_any(key, exclude_kw)
-                or _matches_any(key, highprec_kw)
-                or (exclude_re is not None and exclude_re.search(key))
+        def _submit(idx: int) -> None:
+            pending[idx] = pool.submit(
+                _prepare_tensor, f, keys[idx], arch, qtype,
+                exclude_kw, highprec_kw, exclude_re,
             )
 
-            this_qtype = gguf.GGMLQuantizationType.F32 if force_f32 else qtype
-            if force_f32:
-                stats.f32_kept_count += 1
-                kind = "f32"
-            else:
-                stats.quantized_count += 1
-                kind = "quantized"
+        try:
+            for i in range(start, len(keys)):
+                while submit_i < len(keys) and len(pending) < window:
+                    _submit(submit_i)
+                    submit_i += 1
 
-            # Match city96/ComfyUI-GGUF's own dtype handling exactly: bf16 and
-            # fp8 have no native numpy dtype, so upcast before quantizing.
-            if tensor.dtype == torch.bfloat16:
-                data = tensor.to(torch.float32).numpy()
-            elif tensor.dtype in (getattr(torch, "float8_e4m3fn", None), getattr(torch, "float8_e5m2", None)):
-                data = tensor.to(torch.float16).numpy()
-            else:
-                data = tensor.numpy()
-            try:
-                packed = quants.quantize(data, this_qtype)
-            except (AttributeError, gguf.QuantError):
-                # Shape isn't divisible by the quant type's block size (32) -
-                # ctq's own presets fall back the same way for shape mismatches.
-                this_qtype = gguf.GGMLQuantizationType.F16
-                packed = quants.quantize(data, this_qtype)
-                if not force_f32:
-                    stats.quantized_count -= 1
+                if progress_cb:
+                    progress_cb(i + 1, stats.total, keys[i])
+
+                # Tensor-boundary cooperation point: a started tensor always
+                # finishes, so checkpoint state stays consistent.
+                if control is not None:
+                    control.wait_if_paused()
+                    control.raise_if_cancelled()
+
+                result = pending.pop(i).result()
+                if result is None:  # >4 dims: deterministically re-skipped
+                    stats.skipped_high_dim_count += 1
+                    continue
+                key, packed, this_qtype, kind = result
+
+                if kind == "f32":
+                    stats.f32_kept_count += 1
+                elif kind == "fallback_f16":
                     stats.fallback_f16_count += 1
-                    kind = "fallback_f16"
+                else:
+                    stats.quantized_count += 1
 
-            if checkpoint is not None:
-                # Shard first, manifest second: the manifest never references
-                # a shard that isn't fully written.
-                np.save(str(checkpoint.shard_path(i, ".npy")), packed)
-                record_tensor(checkpoint, i, key, qtype=this_qtype.name, kind=kind)
+                if checkpoint is not None:
+                    # Shard first, manifest second: the manifest never
+                    # references a shard that isn't fully written.
+                    np.save(str(checkpoint.shard_path(i, ".npy")), packed)
+                    record_tensor(checkpoint, i, key, qtype=this_qtype.name, kind=kind)
 
-            writer.add_tensor(key, packed, raw_dtype=this_qtype)
+                writer.add_tensor(key, packed, raw_dtype=this_qtype)
+        except BaseException:
+            pool.shutdown(wait=False, cancel_futures=True)
+            raise
+        else:
+            pool.shutdown(wait=True)
 
         Path(output_path).parent.mkdir(parents=True, exist_ok=True)
         # Crash-atomic: build the file at a .tmp path, rename into place.
