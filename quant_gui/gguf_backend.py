@@ -23,6 +23,7 @@ mislabeling a legacy quant as a K-quant.
 from __future__ import annotations
 
 import importlib.util
+import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -373,10 +374,15 @@ def convert_to_gguf(
             writer.add_tensor(key, packed, raw_dtype=this_qtype)
 
         Path(output_path).parent.mkdir(parents=True, exist_ok=True)
-        writer.write_header_to_file(path=output_path)
+        # Crash-atomic: build the file at a .tmp path, rename into place.
+        # GGUFWriter opens the path it's given on write_header_to_file, so
+        # pointing it at the temp path is enough.
+        tmp_path = str(output_path) + ".tmp"
+        writer.write_header_to_file(path=tmp_path)
         writer.write_kv_data_to_file()
         writer.write_tensors_to_file(progress=False)
         writer.close()
+        os.replace(tmp_path, str(output_path))
 
     return stats
 

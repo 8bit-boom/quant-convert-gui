@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -273,7 +274,11 @@ def convert_int4_mixed(
         metadata["_quantization_metadata"] = json.dumps(quant_map)
 
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
-    save_file(out_tensors, output_path, metadata=metadata)
+    # Crash-atomic: write beside the target, then rename into place - a hard
+    # kill mid-save leaves a stray .tmp file, never a truncated output.
+    tmp_path = str(output_path) + ".tmp"
+    save_file(out_tensors, tmp_path, metadata=metadata)
+    os.replace(tmp_path, str(output_path))
     return stats
 
 
