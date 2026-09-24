@@ -1225,7 +1225,13 @@ def run_llm_smart_tune(model_gguf: str, imatrix_file: str, mode: str, target_siz
     stem = Path(model_gguf).stem
     tt_path = OUTPUT_DIR / f"{stem}.tensor-types.txt"
     tt_path.write_text(sq.emit_tensor_type_file(assignment), encoding="utf-8")
-    log += f"\nStage 3 - tensor-type file: {tt_path}\nquantizing with llama-quantize (base {base_ftype})...\n"
+    report_path = OUTPUT_DIR / f"{stem}.smart-report.md"
+    report_path.write_text(
+        sq.smart_report_markdown(scores, assignment, report), encoding="utf-8",
+    )
+    log += (f"\nStage 3 - tensor-type file: {tt_path}\n"
+            f"  tuning report: {report_path}\n"
+            f"quantizing with llama-quantize (base {base_ftype})...\n")
     yield log, None
 
     name = (output_name or "").strip()

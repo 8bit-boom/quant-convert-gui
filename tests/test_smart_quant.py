@@ -379,3 +379,26 @@ def test_moe_falls_back_to_uniform_when_nonexperts_are_fat():
     assignment, report = sq.assign_k_ladder([attn, exps], budget)
     assert not _has_two_zone(report)
     assert assignment["blk.0.attn_q.weight"] != "q8_0"
+
+
+def test_smart_report_markdown_renders_summary_types_and_moe():
+    s = _mk_score("blk.0.ffn_down_exps.weight", (64, 8, 4))
+    s.group_err = {"q4_0": [0.1, 0.2, 0.5, 0.1]}
+    md = sq.smart_report_markdown(
+        [s],
+        {"blk.0.ffn_down_exps.weight": "q4_k", "blk.1.attn.weight": "q6_k"},
+        ["summary line"],
+    )
+    assert md.startswith("# Smart quant tuning report")
+    assert "summary line" in md
+    assert "**q4_k** — 1 tensors" in md
+    assert "**q6_k** — 1 tensors" in md
+    assert "## MoE per-expert sensitivity" in md
+    assert "| blk.0.ffn_down_exps.weight | 4 |" in md
+
+
+def test_smart_report_markdown_omits_moe_section_for_dense_models():
+    s = _mk_score("blk.0.attn.weight", (64, 64))
+    md = sq.smart_report_markdown([s], {"blk.0.attn.weight": "q6_k"}, [])
+    assert "MoE per-expert" not in md
+    assert "## Assigned type breakdown" in md

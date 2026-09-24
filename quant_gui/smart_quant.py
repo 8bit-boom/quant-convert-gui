@@ -700,6 +700,41 @@ def emit_tensor_type_file(assignment: dict[str, str]) -> str:
     return "\n".join(lines) + "\n"
 
 
+def smart_report_markdown(scores: list[TensorScore], assignment: dict[str, str],
+                          report_lines: list[str]) -> str:
+    """Full standalone report for one tuning run: summary, type breakdown,
+    and the MoE per-expert sensitivity table. Written next to the
+    tensor-type file so the tuning result is auditable after the GUI log
+    is gone."""
+    from collections import Counter
+
+    out = ["# Smart quant tuning report", ""]
+    out += [f"{line}" for line in report_lines]
+    counts = Counter(assignment.values())
+    out += ["", "## Assigned type breakdown", ""]
+    for t, n in counts.most_common():
+        out.append(f"- **{t}** — {n} tensors")
+    moe = [s for s in scores if s.is_moe and s.group_err and not s.skipped]
+    if moe:
+        out += ["", "## MoE per-expert sensitivity", "",
+                "Spread = how much harder the worst expert is vs the best. "
+                "Large spread on a tensor = headroom if per-expert assignment "
+                "ever lands in llama-quantize.", "",
+                "| Tensor | Experts | rmse min (expert) | rmse max (expert) | Spread |",
+                "|---|---|---|---|---|"]
+        for s in moe:
+            primary = next(iter(s.group_err))
+            errs = s.group_err[primary]
+            if len(errs) < 2:
+                continue
+            lo_i = int(np.argmin(errs))
+            hi_i = int(np.argmax(errs))
+            out.append(
+                f"| {s.name} | {len(errs)} | {errs[lo_i]:.4g} ({lo_i}) "
+                f"| {errs[hi_i]:.4g} ({hi_i}) | x{errs[hi_i] / max(errs[lo_i], 1e-12):.2f} |")
+    return "\n".join(out) + "\n"
+
+
 def moe_expert_report(scores: list[TensorScore], top: int = 10) -> list[str]:
     """Per-expert sensitivity report for MoE models (informational - a
     tensor-type-file pattern covers a whole tensor, so experts can't be
