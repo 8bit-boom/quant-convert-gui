@@ -334,6 +334,13 @@ loading recipe, and the two-stage K-quant flow (a
 
 ## About the other tabs
 
+- **Editor** - edit a GGUF's metadata and save a new file: change values
+  (`general.name`, `tokenizer.chat_template`, ...), add keys, delete keys.
+  Tensor data is copied **byte-for-byte** (never re-quantized) and streams
+  through disk in constant memory - a metadata fix on a 26 GB model takes
+  ~1 minute and under 100 MB of RAM. A local, offline equivalent of the
+  Hugging Face *GGUF Editor* space. Writes are crash-atomic; the backend
+  (`quant_gui/gguf_edit.py`) also supports tensor rename/drop for scripts.
 - **Inspector** - read-only look inside any GGUF: architecture, type
   histogram, bits-per-weight, biggest tensors, metadata. Nothing is
   loaded or executed, so inspection takes seconds even for 100 GB files.
@@ -555,6 +562,9 @@ default where applicable and neither changes the output:
   Dynamic-style tuner on the LLM tab.
 - `quant_gui/gguf_inspect.py` — read-only GGUF inspection for the
   Inspector tab (header metadata + type histogram, no tensor loading).
+- `quant_gui/gguf_edit.py` — the GGUF metadata/tensor editor behind the
+  Editor tab: edits stream through a disk-spooled writer, so big files
+  are copied in constant memory; crash-atomic output.
 - `quant_gui/gguf_bench.py` — bits-per-weight target families and
   candidate lists for the find-best sweep.
 - `quant_gui/loop_timing.py` — per-loop optimizer timing for the History

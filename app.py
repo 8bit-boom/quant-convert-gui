@@ -29,6 +29,7 @@ from quant_gui.gguf_backend import QUANT_TYPE_CHOICES as GGUF_QUANT_TYPE_CHOICES
 from quant_gui.gguf_backend import SUPPORTED_ARCH_NAMES as GGUF_SUPPORTED_ARCH_NAMES
 from quant_gui.gguf_backend import is_available as gguf_is_available
 from quant_gui.gguf_inspect import format_inspection, inspect_gguf
+from quant_gui import gguf_edit as ge
 from quant_gui.int4_backend import stream_int4_conversion, stream_install as stream_int4_install
 from quant_gui.int4_backend import is_available as int4_is_available
 from quant_gui import runner
@@ -2581,6 +2582,52 @@ with gr.Blocks(title="Quant Convert GUI") as demo:
                 inspect_btn = gr.Button("Inspect", variant="primary")
             inspect_out = gr.Markdown("Pick a GGUF and press **Inspect**.")
 
+        with gr.Tab("Editor"):
+            gr.Markdown(
+                "Edit a GGUF's **metadata** and save a new file - tensor data is copied "
+                "byte-for-byte, never re-quantized, and streams through disk in constant "
+                "memory (a 26 GB model is fine). Local, offline equivalent of the "
+                "Hugging Face *GGUF Editor* space: fix a broken `general.name`, update "
+                "`general.quantized_by`, patch a chat template, delete stray keys."
+            )
+            with gr.Row():
+                edit_file = gr.File(
+                    label="GGUF file", file_types=[".gguf"], type="filepath",
+                )
+                edit_load_btn = gr.Button("Load", variant="primary")
+            edit_summary = gr.Markdown("Pick a GGUF and press **Load**.")
+            edit_meta_tbl = gr.Dataframe(
+                headers=["Key", "Type", "Value", "Editable"],
+                interactive=True, wrap=True,
+                label="Metadata - edit the Value column, then Save",
+            )
+            with gr.Row():
+                edit_del_keys = gr.Dropdown(
+                    multiselect=True, choices=[], label="Delete keys",
+                    info="Selected keys are omitted from the output file.",
+                )
+                with gr.Column():
+                    edit_new_key = gr.Textbox(
+                        label="New key (optional)",
+                        placeholder="e.g. general.quantized_by",
+                    )
+                    edit_new_type = gr.Dropdown(
+                        choices=list(ge.SCALAR_TYPES), value="STRING",
+                        label="New key type",
+                        info="Arrays can be edited on existing keys only.",
+                    )
+                    edit_new_val = gr.Textbox(label="New key value")
+            edit_out_name = gr.Textbox(
+                label="Output filename",
+                placeholder="model-edited.gguf (lands in converted/)",
+            )
+            edit_save_btn = gr.Button("Save edited GGUF", variant="primary")
+            edit_log = gr.Textbox(
+                label="Log", lines=10, interactive=False, autoscroll=True,
+            )
+            edit_result = gr.File(label="Output file", interactive=False)
+            edit_state = gr.State()
+
         with gr.Tab("Tools"):
             gr.Markdown(
                 "Wrappers around the repo's CLI tools (`tools/`) - same code as "
@@ -2693,6 +2740,9 @@ with gr.Blocks(title="Quant Convert GUI") as demo:
                 "GUI wrapper around those real implementations, not a reimplementation of them. It downloads "
                 "nothing on its own besides the model files you point it at.\n\n"
                 "## The other tabs\n"
+                "- **Editor** — edit a GGUF's metadata and save a new file (tensor data copied "
+                "byte-for-byte, streaming in constant memory). The local equivalent of the Hugging Face "
+                "*GGUF Editor* space.\n"
                 "- **Inspector** — read-only look inside any GGUF (architecture, type histogram, "
                 "bits-per-weight, biggest tensors) without loading or executing it.\n"
                 "- **Tools** — the repo's CLI utilities with logs streamed here: GGUF comparison "
@@ -3069,6 +3119,151 @@ with gr.Blocks(title="Quant Convert GUI") as demo:
             yield f"**Inspection failed:** `{exc}`"
 
     inspect_btn.click(run_inspect, inputs=[inspect_file], outputs=[inspect_out])
+
+    def run_editor_load(path):
+        if not path:
+            yield "Pick a GGUF file first.", [], [], None
+            return
+        try:
+            plan = ge.load_for_edit(path)
+        except ge.GGUFEditError as exc:
+            yield f"**Load failed:** `{exc}`", [], [], None
+            return
+        size_gb = (plan.total_bytes / 1e9) if plan.total_bytes else 0
+        summary = (
+            f"**{Path(path).name}** — arch `{plan.architecture}`, "
+            f"{plan.n_kv} metadata keys, {plan.n_tensors} tensors "
+            f"({size_gb:.1f} GB of tensor data will be copied verbatim)."
+        )
+        yield summary, plan.rows(), [kv.key for kv in plan.metadata], plan
+
+    edit_load_btn.click(
+        run_editor_load,
+        inputs=[edit_file],
+        outputs=[edit_summary, edit_meta_tbl, edit_del_keys, edit_state],
+    )
+
+    def run_editor_save(plan, rows, del_keys, new_key, new_type, new_val, out_name):
+        if plan is None:
+            yield "Load a GGUF first.", None
+            return
+        try:
+            rows = rows.values.tolist() if hasattr(rows, "values") else (rows or [])
+        except AttributeError:
+            rows = rows or []
+
+        original = {kv.key: kv for kv in plan.metadata}
+        set_meta: dict[str, ge.EditableKV] = {}
+        notes = []
+        errors = []
+        for row in rows:
+            if not row or len(row) < 3:
+                continue
+            key, vtype_txt, value_txt = str(row[0]), str(row[1]), "" if row[2] is None else str(row[2])
+            kv = original.get(key)
+            if kv is None:
+                notes.append(f"ignored unknown row {key!r}")
+                continue
+            declared = kv.vtype if kv.sub_type is None else f"ARRAY[{kv.sub_type}]"
+            if str(vtype_txt).strip() != declared:
+                notes.append(f"{key}: type column changed, ignored - the original {declared} is kept")
+                continue
+            if not kv.editable:
+                if value_txt != kv.display_value():
+                    notes.append(f"{key}: read-only (over {ge.ARRAY_EDIT_LIMIT} items), edits ignored")
+                continue
+            if kv.vtype == "ARRAY":
+                import json as _json
+                try:
+                    items = _json.loads(value_txt)
+                    new_value = ge.parse_array(kv.sub_type, items)
+                except (ValueError, ge.GGUFEditError) as exc:
+                    errors.append(f"{key}: {exc}")
+                    continue
+                if new_value != list(kv.value):
+                    set_meta[key] = ge.EditableKV(key, "ARRAY", kv.sub_type, new_value, True)
+            else:
+                try:
+                    new_value = ge.parse_scalar(kv.vtype, value_txt)
+                except ge.GGUFEditError as exc:
+                    errors.append(str(exc))
+                    continue
+                if new_value != kv.value:
+                    set_meta[key] = ge.EditableKV(key, kv.vtype, None, new_value, True)
+
+        new_key = (new_key or "").strip()
+        if new_key:
+            if new_key in original or new_key in set_meta:
+                errors.append(f"{new_key}: key already exists - edit its row instead")
+            elif new_key in set(del_keys or ()):
+                errors.append(f"{new_key}: also marked for deletion - pick one")
+            else:
+                try:
+                    value = ge.parse_scalar(new_type, new_val or "")
+                    set_meta[new_key] = ge.EditableKV(new_key, new_type, None, value, True)
+                except ge.GGUFEditError as exc:
+                    errors.append(f"{new_key}: {exc}")
+
+        if errors:
+            log = "Fix these before saving:\n  - " + "\n  - ".join(errors)
+            if notes:
+                log += "\n\nNotes:\n  - " + "\n  - ".join(notes)
+            yield log, None
+            return
+
+        name = (out_name or "").strip()
+        if not name:
+            stem = Path(plan.source).stem
+            name = f"{stem}-edited.gguf"
+        out_path = name if os.path.isabs(name) else str(OUTPUT_DIR / name)
+        Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+
+        log = f"Saving edited GGUF:\n  source: {plan.source}\n  output: {out_path}\n"
+        if set_meta:
+            log += f"  set/added: {', '.join(sorted(set_meta))}\n"
+        if del_keys:
+            log += f"  deleted:   {', '.join(sorted(del_keys))}\n"
+        log += f"  copying {plan.n_tensors} tensors ({plan.total_bytes / 1e9:.1f} GB) byte-for-byte...\n"
+        yield log, None
+
+        progress = {"done": 0, "total": plan.total_bytes or 1}
+        done_flags = {"ok": False, "err": None}
+
+        def _work():
+            try:
+                ge.save_edited(
+                    plan.source, out_path,
+                    set_meta=set_meta, del_keys=list(del_keys or ()),
+                    progress_cb=lambda d, t: progress.update(done=d, total=t),
+                )
+                done_flags["ok"] = True
+            except Exception as exc:  # noqa: BLE001 - surfaced below
+                done_flags["err"] = exc
+
+        import threading as _threading
+        worker = _threading.Thread(target=_work, daemon=True)
+        worker.start()
+        last_shown = -1
+        while worker.is_alive():
+            worker.join(timeout=0.25)
+            pct = int(100 * progress["done"] / progress["total"])
+            if pct != last_shown:
+                last_shown = pct
+                yield log + f"  {pct}% copied...", None
+        if done_flags["err"] is not None:
+            yield log + f"\n❌ Save failed: {done_flags['err']}", None
+            return
+        if notes:
+            log += "\nNotes:\n  - " + "\n  - ".join(notes) + "\n"
+        log += f"\n✅ Saved. {out_path}\n"
+        yield log, out_path
+
+    edit_save_btn.click(
+        run_editor_save,
+        inputs=[edit_state, edit_meta_tbl, edit_del_keys,
+                edit_new_key, edit_new_type, edit_new_val, edit_out_name],
+        outputs=[edit_log, edit_result],
+    )
     history_refresh_btn.click(
         lambda: rh.rows(rh.load(RUN_HISTORY)), outputs=[history_tbl],
     )
