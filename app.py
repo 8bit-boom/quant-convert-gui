@@ -3121,13 +3121,14 @@ with gr.Blocks(title="Quant Convert GUI") as demo:
     inspect_btn.click(run_inspect, inputs=[inspect_file], outputs=[inspect_out])
 
     def run_editor_load(path):
+        empty_dd = gr.update(choices=[], value=[])
         if not path:
-            yield "Pick a GGUF file first.", [], [], None
+            yield "Pick a GGUF file first.", [], empty_dd, None
             return
         try:
             plan = ge.load_for_edit(path)
         except ge.GGUFEditError as exc:
-            yield f"**Load failed:** `{exc}`", [], [], None
+            yield f"**Load failed:** `{exc}`", [], empty_dd, None
             return
         size_gb = (plan.total_bytes / 1e9) if plan.total_bytes else 0
         summary = (
@@ -3135,7 +3136,12 @@ with gr.Blocks(title="Quant Convert GUI") as demo:
             f"{plan.n_kv} metadata keys, {plan.n_tensors} tensors "
             f"({size_gb:.1f} GB of tensor data will be copied verbatim)."
         )
-        yield summary, plan.rows(), [kv.key for kv in plan.metadata], plan
+        # Update the dropdown's CHOICES with an empty selection - passing the
+        # key list bare would set its VALUE instead, which Gradio rejects
+        # ("not in the list of choices") and would pre-select every key for
+        # deletion.
+        del_dd = gr.update(choices=[kv.key for kv in plan.metadata], value=[])
+        yield summary, plan.rows(), del_dd, plan
 
     edit_load_btn.click(
         run_editor_load,

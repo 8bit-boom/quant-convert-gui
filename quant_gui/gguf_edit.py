@@ -236,6 +236,14 @@ def save_edited(
     reader = GGUFReader(str(src))
     arch_field = reader.fields.get("general.architecture")
     arch = str(arch_field.contents()) if arch_field is not None else "unknown"
+    # An edit to general.architecture defines the output's arch directly -
+    # the writer stamps it via add_architecture(), so it's not re-added as a
+    # KV below (which would trip gguf-py's duplicate-key warning).
+    arch_edit = set_meta.get("general.architecture")
+    if arch_edit is not None:
+        if arch_edit.vtype != "STRING":
+            raise GGUFEditError("general.architecture must be a STRING value.")
+        arch = str(arch_edit.value)
 
     tensor_names = [t.name for t in reader.tensors]
     for old in renames:
@@ -286,7 +294,8 @@ def save_edited(
                     writer.add_key_value(key, value, GGUFValueType[types[0]])
             n_kv += 1
         for key, kv in set_meta.items():
-            if key not in original_keys and key not in del_keys:
+            if (key not in original_keys and key not in del_keys
+                    and key != "general.architecture"):
                 kv.key = key
                 _writer_add_kv(writer, kv)
                 n_kv += 1

@@ -192,6 +192,27 @@ def test_metadata_edit_only_copies_everything(tmp_path, src):
     assert len(list(a.tensors)) == len(list(b.tensors)) == 2
 
 
+def test_architecture_edit_relabels_without_duplicate(tmp_path, src):
+    """Editing general.architecture must relabel the file, not duplicate the key."""
+    out = tmp_path / "out.gguf"
+    stats = ge.save_edited(
+        src, out,
+        set_meta={"general.architecture": _kv("general.architecture", "STRING", "krea2")})
+    r = GGUFReader(str(out))
+    assert r.fields["general.architecture"].contents() == "krea2"
+    # exactly one kv entry for the arch: GGUFReader stores fields in a dict,
+    # so a duplicate would overwrite; verify the file's own kv count instead
+    n_orig = len([k for k in GGUFReader(str(src)).fields
+                  if not k.startswith("GGUF.")])
+    n_new = int(r.fields["GGUF.kv_count"].contents())
+    assert n_new == n_orig
+    # non-string arch values are rejected before anything is written
+    with pytest.raises(ge.GGUFEditError):
+        ge.save_edited(src, tmp_path / "o2.gguf",
+                       set_meta={"general.architecture": _kv("general.architecture", "UINT32", 4)})
+    assert not (tmp_path / "o2.gguf").exists()
+
+
 # --- display ---
 
 def test_display_values():
