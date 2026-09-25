@@ -153,7 +153,13 @@ def load_for_edit(path: str | Path) -> EditPlan:
     try:
         reader = GGUFReader(str(path))
     except Exception as exc:  # noqa: BLE001
-        raise GGUFEditError(f"Not a readable GGUF: {exc}") from exc
+        msg = str(exc)
+        hint = ""
+        if "reshape" in msg or "unpack" in msg:
+            hint = (" The header parsed but tensor data doesn't fit - the file is "
+                    "truncated or was incompletely copied (large uploads through "
+                    "the file picker can be cut off; use the local-path box instead).")
+        raise GGUFEditError(f"Not a readable GGUF: {msg}.{hint}") from exc
     if reader.endianess != GGUFEndian.LITTLE:
         raise GGUFEditError("Big-endian GGUF files aren't supported by the editor.")
 

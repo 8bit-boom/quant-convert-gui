@@ -2575,9 +2575,14 @@ with gr.Blocks(title="Quant Convert GUI") as demo:
                 "bits-per-weight, biggest tensors, metadata. Nothing is loaded or "
                 "executed - inspection takes seconds even for 100 GB files."
             )
+            inspect_path = gr.Textbox(
+                label="Local file path (recommended for large files)",
+                placeholder="F:\\path\\to\\model.gguf",
+                info="Read directly from disk - avoids the multi-GB upload copy.",
+            )
             with gr.Row():
                 inspect_file = gr.File(
-                    label="GGUF file", file_types=[".gguf"], type="filepath",
+                    label="Or upload a GGUF file", file_types=[".gguf"], type="filepath",
                 )
                 inspect_btn = gr.Button("Inspect", variant="primary")
             inspect_out = gr.Markdown("Pick a GGUF and press **Inspect**.")
@@ -2590,9 +2595,15 @@ with gr.Blocks(title="Quant Convert GUI") as demo:
                 "Hugging Face *GGUF Editor* space: fix a broken `general.name`, update "
                 "`general.quantized_by`, patch a chat template, delete stray keys."
             )
+            edit_path = gr.Textbox(
+                label="Local file path (recommended for large files)",
+                placeholder="F:\\path\\to\\model.gguf",
+                info="Read directly from disk - avoids the multi-GB upload copy, "
+                "which can be truncated on very large files.",
+            )
             with gr.Row():
                 edit_file = gr.File(
-                    label="GGUF file", file_types=[".gguf"], type="filepath",
+                    label="Or upload a GGUF file", file_types=[".gguf"], type="filepath",
                 )
                 edit_load_btn = gr.Button("Load", variant="primary")
             edit_summary = gr.Markdown("Pick a GGUF and press **Load**.")
@@ -3109,21 +3120,25 @@ with gr.Blocks(title="Quant Convert GUI") as demo:
 
     refresh_btn.click(refresh_env, outputs=[env_md])
 
-    def run_inspect(path):
+    def run_inspect(path_text, upload):
+        path = (path_text or "").strip() or upload
         if not path:
-            yield "Pick a GGUF file first."
+            yield "Enter a local file path or pick a GGUF file first."
             return
         try:
             yield format_inspection(inspect_gguf(path))
         except Exception as exc:  # noqa: BLE001 - surfaced to the UI
             yield f"**Inspection failed:** `{exc}`"
 
-    inspect_btn.click(run_inspect, inputs=[inspect_file], outputs=[inspect_out])
+    inspect_btn.click(
+        run_inspect, inputs=[inspect_path, inspect_file], outputs=[inspect_out]
+    )
 
-    def run_editor_load(path):
+    def run_editor_load(path_text, upload):
         empty_dd = gr.update(choices=[], value=[])
+        path = (path_text or "").strip() or upload
         if not path:
-            yield "Pick a GGUF file first.", [], empty_dd, None
+            yield "Enter a local file path or pick a GGUF file first.", [], empty_dd, None
             return
         try:
             plan = ge.load_for_edit(path)
@@ -3145,7 +3160,7 @@ with gr.Blocks(title="Quant Convert GUI") as demo:
 
     edit_load_btn.click(
         run_editor_load,
-        inputs=[edit_file],
+        inputs=[edit_path, edit_file],
         outputs=[edit_summary, edit_meta_tbl, edit_del_keys, edit_state],
     )
 
