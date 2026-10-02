@@ -1,0 +1,27 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  pytest:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install CPU torch (tests use safetensors.torch)
+        run: pip install torch --index-url https://download.pytorch.org/whl/cpu
+      - name: Install remaining test dependencies
+        # Deliberately NOT requirements.txt: it pulls ctq from git, whose
+        # dependency tree is heavy and unnecessary for the test suite
+        # (tests gate the optional backends behind is_available() checks).
+        run: pip install pytest numpy gguf safetensors scipy gradio huggingface_hub
+      - name: Run tests
+        run: python -m pytest tests/ -q -p no:cacheprovider -m "not bench"

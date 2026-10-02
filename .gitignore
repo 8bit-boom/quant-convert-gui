@@ -5,6 +5,15 @@ venv/
 downloads/
 converted/
 llm_models/
+image_models/
 llama.cpp/
 *.safetensors
 *.gguf
+*.imatrix
+run_history.json
+llama.cpp/
+gguf_bench_tmp/
+checkpoints/
+tmp_compare/
+*.log
+ui_settings.json

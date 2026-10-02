@@ -124,3 +124,46 @@ def test_fallback_flag_appended():
     args = build_args(opts)
     assert "--fallback" in args and "fp8" in args
     assert "--fallback-simple" in args
+
+
+def test_perf_flags_all_off_by_default():
+    opts = ConvertOptions(input_path="m.safetensors", simple=False)
+    assert opts.uses_perf_flags is False
+    args = build_args(opts)
+    for flag in ("--fast_math", "--loss_sync_batch", "--snapshot_interval", "--compile_loop"):
+        assert flag not in args
+
+
+def test_perf_flags_emit_only_in_learned_mode():
+    learned = ConvertOptions(
+        input_path="m.safetensors", quant_format="int8", scaling_mode="row", convrot=True,
+        simple=False, fast_math=True, loss_sync_batch=8, snapshot_interval=4, compile_loop=True,
+    )
+    args = build_args(learned)
+    assert "--fast_math" in args
+    assert args[args.index("--loss_sync_batch") + 1] == "8"
+    assert args[args.index("--snapshot_interval") + 1] == "4"
+    assert "--compile_loop" in args
+    assert learned.uses_perf_flags is True
+
+    simple = ConvertOptions(
+        input_path="m.safetensors", quant_format="int8", scaling_mode="row", convrot=True,
+        simple=True, fast_math=True, loss_sync_batch=8, compile_loop=True,
+    )
+    sargs = build_args(simple)
+    for flag in ("--fast_math", "--loss_sync_batch", "--compile_loop"):
+        assert flag not in sargs
+    # Flags set but not emitted (simple mode): still claims it uses them so
+    # the run gate can warn if the installed ctq is too old.
+    assert simple.uses_perf_flags is True
+
+
+def test_perf_flags_defaults_emit_nothing():
+    opts = ConvertOptions(
+        input_path="m.safetensors", simple=False,
+        loss_sync_batch=1, snapshot_interval=1, fast_math=False, compile_loop=False,
+    )
+    assert opts.uses_perf_flags is False
+    args = build_args(opts)
+    for flag in ("--fast_math", "--loss_sync_batch", "--snapshot_interval", "--compile_loop"):
+        assert flag not in args

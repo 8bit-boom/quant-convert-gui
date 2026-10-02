@@ -23,11 +23,14 @@ mislabeling a legacy quant as a K-quant.
 from __future__ import annotations
 
 import importlib.util
+import os
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
+from .checkpoints import Checkpoint, record_tensor, set_total
 from .filters import get_model_filters
+from .run_control import RunCancelled
 
 MAX_TENSOR_DIMS = 4
 MAX_TENSOR_NAME_LENGTH = 127
@@ -216,6 +219,80 @@ class GGUFConvertStats:
     fallback_f16_count: int = 0
 
 
+def _quant_worker_count() -> int:
+    """Threads for parallel quantization. gguf-py's quantize is numpy, which
+    releases the GIL on large array ops, so threads give real speedup without
+    the process-spawn risks of a Gradio server. Bounded so a handful of
+    in-flight f32 tensors can't exhaust RAM."""
+    import os
+    try:
+        return max(1, min(4, int(os.environ.get("QUANT_GUI_QUANT_THREADS", "0")) or
+                          (os.cpu_count() or 4) // 4))
+    except ValueError:
+        return 2
+
+
+def _prepare_tensor(f, key: str, arch, qtype, exclude_kw, highprec_kw, exclude_re):
+    """Load + quantize one tensor. Runs in a worker thread; returns
+    (key, packed_array, qtype, kind)."""
+    import gguf
+    import numpy as np
+    import torch
+    from gguf import quants
+
+    tensor = f.get_tensor(key)
+
+    # Video models (Wan, HunyuanVideo) carry 5D Conv3d patch_embedding
+    # weights, which ggml's block quantizers can't handle. ComfyUI-GGUF's own
+    # fix_5d_tensors.py stores them as plain unquantized F32 via the normal
+    # writer - which is all that's needed, so do it directly rather than
+    # dropping them (a file missing them won't load).
+    high_dim = tensor.dim() > MAX_TENSOR_DIMS
+
+    n_dims = tensor.dim()
+    n_params = tensor.numel()
+    force_f32 = (
+        high_dim
+        or n_dims == 1
+        or n_params <= QUANTIZATION_THRESHOLD
+        or _matches_any(key, arch.keys_hiprec)
+        or _matches_any(key, exclude_kw)
+        or _matches_any(key, highprec_kw)
+        or (exclude_re is not None and exclude_re.search(key))
+    )
+    this_qtype = gguf.GGMLQuantizationType.F32 if force_f32 else qtype
+    kind = "high_dim_f32" if high_dim else ("f32" if force_f32 else "quantized")
+
+    # Match city96/ComfyUI-GGUF's own dtype handling exactly: bf16 and
+    # fp8 have no native numpy dtype, so upcast before quantizing.
+    if tensor.dtype == torch.bfloat16:
+        data = tensor.to(torch.float32).numpy()
+    elif tensor.dtype in (getattr(torch, "float8_e4m3fn", None), getattr(torch, "float8_e5m2", None)):
+        data = tensor.to(torch.float16).numpy()
+    else:
+        data = tensor.numpy()
+    try:
+        if this_qtype == gguf.GGMLQuantizationType.Q8_0:
+            # Optional Triton GPU path (opt-in via QUANT_GUI_GPU_QUANT=1);
+            # silently falls back to gguf-py's numpy quantize when triton
+            # or a CUDA device isn't available. Bit-exact either way.
+            from . import gpu_quant
+            try:
+                packed = gpu_quant.quantize_q8_0(data)
+            except ValueError:
+                raise gguf.QuantError(f"shape {data.shape} not Q8_0-blockable")
+        else:
+            packed = quants.quantize(data, this_qtype)
+    except (AttributeError, gguf.QuantError):
+        # Shape isn't divisible by the quant type's block size (32) -
+        # ctq's own presets fall back the same way for shape mismatches.
+        this_qtype = gguf.GGMLQuantizationType.F16
+        packed = quants.quantize(data, this_qtype)
+        if not force_f32:
+            kind = "fallback_f16"
+    return key, packed, this_qtype, kind
+
+
 def convert_to_gguf(
     input_path: str,
     output_path: str,
@@ -223,7 +300,19 @@ def convert_to_gguf(
     preset: str = "none",
     exclude_regex: str | None = None,
     progress_cb=None,
-) -> GGUFConvertStats:
+    control=None,
+    checkpoint: Checkpoint | None = None,
+):
+    """Quantize `input_path` into a GGUF file at `output_path`.
+
+    Pause/resume: `control` (run_control.RunControl) lets the UI pause
+    between tensors or stop the run; `checkpoint` (checkpoints.Checkpoint)
+    saves every finished tensor's packed array to disk so a stopped run
+    resumes from the next tensor without re-quantizing - already-finished
+    tensors are re-added to the writer straight from the checkpoint shards.
+    (Tensors skipped for having >4 dims aren't checkpointed - they're
+    deterministically re-skipped on resume.)
+    """
     if not is_available():
         raise GGUFBackendError(f"gguf isn't installed. Install it with:\n  {install_hint()}")
     if quant_type not in QUANT_TYPE_CHOICES:
@@ -234,7 +323,7 @@ def convert_to_gguf(
         )
 
     import gguf
-    import torch
+    import numpy as np
     from gguf import quants
     from safetensors import safe_open
 
@@ -271,71 +360,114 @@ def convert_to_gguf(
         qtype = getattr(gguf.GGMLQuantizationType, quant_type)
 
         stats = GGUFConvertStats(total=len(keys), arch=arch.arch)
+        if checkpoint is not None:
+            set_total(checkpoint, stats.total)
         writer = gguf.GGUFWriter(path=None, arch=arch.arch)
         writer.add_quantization_version(gguf.GGML_QUANT_VERSION)
         file_type = getattr(gguf.LlamaFileType, f"MOSTLY_{quant_type}", None)
         if file_type is not None:
             writer.add_file_type(file_type)
 
-        for i, key in enumerate(keys):
-            if progress_cb:
-                progress_cb(i + 1, stats.total, key)
+        # Resume: re-add every tensor the checkpoint already finished, from
+        # its packed-array shard - no re-quantization. An index with no shard
+        # is a >4-dim tensor from a checkpoint written before those were kept
+        # (they used to be dropped); re-prepare it from the input - it's only
+        # a copy to F32, so it's cheap.
+        start = checkpoint.next_index if checkpoint is not None else 0
+        if start:
+            for i in range(start):
+                meta = checkpoint.tensors.get(str(i))
+                if meta is None:
+                    key, packed, q, kind = _prepare_tensor(
+                        f, keys[i], arch, qtype, exclude_kw, highprec_kw, exclude_re,
+                    )
+                    writer.add_tensor(key, packed, raw_dtype=q)
+                    stats.high_dim_f32_count += 1
+                    continue
+                packed = np.load(str(checkpoint.shard_path(i, ".npy")))
+                writer.add_tensor(
+                    meta["key"], packed, raw_dtype=gguf.GGMLQuantizationType[meta["qtype"]],
+                )
+                kind = meta.get("kind")
+                if kind == "high_dim_f32":
+                    stats.high_dim_f32_count += 1
+                elif kind == "f32":
+                    stats.f32_kept_count += 1
+                elif kind == "fallback_f16":
+                    stats.fallback_f16_count += 1
+                else:
+                    stats.quantized_count += 1
 
-            tensor = f.get_tensor(key)
-            n_dims = tensor.dim()
-            n_params = tensor.numel()
+        # Parallel quantization: worker threads load+quantize up to `window`
+        # tensors ahead while the main thread writes shards/checkpoints and
+        # feeds the writer in strict key order. numpy releases the GIL on
+        # large array ops, so threads scale; the writer/checkpoint state is
+        # only touched by the main thread. Pause holds the writer (workers
+        # may finish their in-flight window first); cancel abandons pending
+        # futures without waiting for the window to drain.
+        from concurrent.futures import ThreadPoolExecutor
 
-            # Video models (Wan, HunyuanVideo) carry 5D Conv3d patch_embedding
-            # weights, which ggml's block quantizers can't handle. ComfyUI-GGUF's
-            # own fix_5d_tensors.py stores them as plain unquantized F32 via the
-            # normal writer - which is all that's needed, so do it directly
-            # rather than dropping them (a file missing them won't load).
-            high_dim = n_dims > MAX_TENSOR_DIMS
+        n_workers = _quant_worker_count()
+        window = max(1, n_workers * 2)
+        pending: dict[int, "Future"] = {}
+        pool = ThreadPoolExecutor(max_workers=n_workers, thread_name_prefix="gguf-quant")
+        submit_i = start
 
-            force_f32 = (
-                high_dim
-                or n_dims == 1
-                or n_params <= QUANTIZATION_THRESHOLD
-                or _matches_any(key, arch.keys_hiprec)
-                or _matches_any(key, exclude_kw)
-                or _matches_any(key, highprec_kw)
-                or (exclude_re is not None and exclude_re.search(key))
+        def _submit(idx: int) -> None:
+            pending[idx] = pool.submit(
+                _prepare_tensor, f, keys[idx], arch, qtype,
+                exclude_kw, highprec_kw, exclude_re,
             )
 
-            this_qtype = gguf.GGMLQuantizationType.F32 if force_f32 else qtype
-            if high_dim:
-                stats.high_dim_f32_count += 1
-            elif force_f32:
-                stats.f32_kept_count += 1
-            else:
-                stats.quantized_count += 1
+        try:
+            for i in range(start, len(keys)):
+                while submit_i < len(keys) and len(pending) < window:
+                    _submit(submit_i)
+                    submit_i += 1
 
-            # Match city96/ComfyUI-GGUF's own dtype handling exactly: bf16 and
-            # fp8 have no native numpy dtype, so upcast before quantizing.
-            if tensor.dtype == torch.bfloat16:
-                data = tensor.to(torch.float32).numpy()
-            elif tensor.dtype in (getattr(torch, "float8_e4m3fn", None), getattr(torch, "float8_e5m2", None)):
-                data = tensor.to(torch.float16).numpy()
-            else:
-                data = tensor.numpy()
-            try:
-                packed = quants.quantize(data, this_qtype)
-            except (AttributeError, gguf.QuantError):
-                # Shape isn't divisible by the quant type's block size (32) -
-                # ctq's own presets fall back the same way for shape mismatches.
-                this_qtype = gguf.GGMLQuantizationType.F16
-                packed = quants.quantize(data, this_qtype)
-                if not force_f32:
-                    stats.quantized_count -= 1
+                if progress_cb:
+                    progress_cb(i + 1, stats.total, keys[i])
+
+                # Tensor-boundary cooperation point: a started tensor always
+                # finishes, so checkpoint state stays consistent.
+                if control is not None:
+                    control.wait_if_paused()
+                    control.raise_if_cancelled()
+
+                key, packed, this_qtype, kind = pending.pop(i).result()
+
+                if kind == "high_dim_f32":
+                    stats.high_dim_f32_count += 1
+                elif kind == "f32":
+                    stats.f32_kept_count += 1
+                elif kind == "fallback_f16":
                     stats.fallback_f16_count += 1
+                else:
+                    stats.quantized_count += 1
 
-            writer.add_tensor(key, packed, raw_dtype=this_qtype)
+                if checkpoint is not None:
+                    # Shard first, manifest second: the manifest never
+                    # references a shard that isn't fully written.
+                    np.save(str(checkpoint.shard_path(i, ".npy")), packed)
+                    record_tensor(checkpoint, i, key, qtype=this_qtype.name, kind=kind)
+
+                writer.add_tensor(key, packed, raw_dtype=this_qtype)
+        except BaseException:
+            pool.shutdown(wait=False, cancel_futures=True)
+            raise
+        else:
+            pool.shutdown(wait=True)
 
         Path(output_path).parent.mkdir(parents=True, exist_ok=True)
-        writer.write_header_to_file(path=output_path)
+        # Crash-atomic: build the file at a .tmp path, rename into place.
+        # GGUFWriter opens the path it's given on write_header_to_file, so
+        # pointing it at the temp path is enough.
+        tmp_path = str(output_path) + ".tmp"
+        writer.write_header_to_file(path=tmp_path)
         writer.write_kv_data_to_file()
         writer.write_tensors_to_file(progress=False)
         writer.close()
+        os.replace(tmp_path, str(output_path))
 
     return stats
 
@@ -346,11 +478,15 @@ def stream_gguf_conversion(
     quant_type: str,
     preset: str = "none",
     exclude_regex: str | None = None,
+    control=None,
+    checkpoint: Checkpoint | None = None,
 ):
     """Generator wrapper mirroring int4_backend.stream_int4_conversion's
     interface: runs the (blocking) conversion in a background thread,
-    yielding ("progress", current, total, key) then ("ok", stats) or
-    ("fail", error_message)."""
+    yielding ("progress", current, total, key) while running, then exactly
+    one of ("ok", stats) / ("cancelled", message) / ("fail", error_message).
+    "cancelled" means the user hit Stop & save - checkpoint shards for every
+    finished tensor are on disk and the run can be resumed."""
     import queue
     import threading
 
@@ -365,8 +501,11 @@ def stream_gguf_conversion(
             stats = convert_to_gguf(
                 input_path, output_path, quant_type,
                 preset=preset, exclude_regex=exclude_regex, progress_cb=progress_cb,
+                control=control, checkpoint=checkpoint,
             )
             q.put(("ok", stats))
+        except RunCancelled:
+            q.put(("cancelled", "Stopped by user - progress saved to the checkpoint."))
         except Exception as exc:  # noqa: BLE001 - surfaced to the UI, not swallowed
             q.put(("fail", str(exc)))
         finally:

@@ -12,6 +12,7 @@ from quant_gui.llamacpp_backend import (
     QUANT_TYPE_CHOICES,
     _imatrix_binary,
     _quantize_binary,
+    _version_tuple,
     _venv_python,
     is_cloned,
     is_imatrix_built,
@@ -21,8 +22,11 @@ from quant_gui.llamacpp_backend import (
     stream_clone_or_update,
     stream_convert_to_gguf,
     stream_generate_imatrix,
+    parse_final_ppl,
+    stream_perplexity,
     stream_quantize,
     stream_setup_venv,
+    transformers_too_old,
 )
 
 
@@ -185,3 +189,166 @@ def test_stream_quantize_includes_imatrix_flag_in_command(tmp_path):
         tmp_path, "/in.gguf", "/out.gguf", "Q4_K_M", imatrix_file="/some/imatrix.gguf",
     ))
     assert "--imatrix /some/imatrix.gguf" in events[0]
+
+
+# ---------------------------------------------------- prebuilt binary download
+
+
+from quant_gui.llamacpp_backend import choose_prebuilt_assets  # noqa: E402
+
+B11070_ASSETS = [
+    "cudart-llama-bin-win-cuda-12.4-x64.zip",
+    "cudart-llama-bin-win-cuda-13.4-x64.zip",
+    "llama-b11070-bin-win-cpu-arm64.zip",
+    "llama-b11070-bin-win-cpu-x64.zip",
+    "llama-b11070-bin-win-cuda-12.4-x64.zip",
+    "llama-b11070-bin-win-cuda-13.4-x64.zip",
+    "llama-b11070-bin-win-vulkan-x64.zip",
+]
+
+
+def test_choose_prebuilt_assets_prefers_newest_cuda_with_cudart():
+    picked = choose_prebuilt_assets(B11070_ASSETS, use_cuda=True)
+    assert picked == {
+        "main": "llama-b11070-bin-win-cuda-13.4-x64.zip",
+        "cudart": "cudart-llama-bin-win-cuda-13.4-x64.zip",
+    }
+
+
+def test_choose_prebuilt_assets_cpu_picks_cpu_without_cudart():
+    picked = choose_prebuilt_assets(B11070_ASSETS, use_cuda=False)
+    assert picked == {"main": "llama-b11070-bin-win-cpu-x64.zip", "cudart": None}
+
+
+def test_choose_prebuilt_assets_falls_back_to_cpu_when_no_cuda_pair():
+    assets = ["llama-b1-bin-win-cuda-12.4-x64.zip", "llama-b1-bin-win-cpu-x64.zip"]
+    # no cudart package for 12.4 -> CUDA choice unusable -> CPU fallback
+    assert choose_prebuilt_assets(assets, use_cuda=True)["main"].endswith("cpu-x64.zip")
+
+
+def test_choose_prebuilt_assets_ignores_arm64_and_non_zip():
+    assets = ["llama-b1-bin-win-cpu-arm64.zip", "notes.txt", "llama-b1-bin-win-cpu-x64.zip"]
+    assert choose_prebuilt_assets(assets, use_cuda=True)["main"].endswith("cpu-x64.zip")
+
+
+def test_choose_prebuilt_assets_none_when_nothing_fits():
+    assert choose_prebuilt_assets(["llama-b1-bin-ubuntu-x64.zip"], use_cuda=True) is None
+    assert choose_prebuilt_assets([], use_cuda=False) is None
+
+
+def test_stream_build_quantize_noop_when_binaries_present():
+    """On machines with the real toolchain installed the 'already present'
+    fast path is covered by the suite run itself; everywhere else this
+    skips."""
+    from quant_gui.llamacpp_backend import is_imatrix_built, is_quantize_built
+
+    llamacpp_dir = Path(__file__).resolve().parent.parent / "llama.cpp"
+    if not (is_cloned(llamacpp_dir) and is_quantize_built(llamacpp_dir) and is_imatrix_built(llamacpp_dir)):
+        pytest.skip("local llama.cpp binaries not installed")
+    events = list(stream_build_quantize(llamacpp_dir))
+    assert events[-1] == "__OK__"
+    assert any("already present" in e for e in events)
+
+
+# ---------------------------------------------------------------------------
+# transformers version floor (Gemma 3/4 tokenizer fix)
+# ---------------------------------------------------------------------------
+
+def test_version_tuple_parses_semver():
+    assert _version_tuple("5.17.0") == (5, 17, 0)
+    assert _version_tuple("4.57.6") == (4, 57, 6)
+    assert _version_tuple("5.0") == (5, 0)
+    assert _version_tuple("garbage") is None
+    assert _version_tuple("") is None
+
+
+def test_transformers_too_old_boundaries():
+    assert transformers_too_old("4.57.6") is True
+    assert transformers_too_old("4.99.99") is True
+    assert transformers_too_old("5.0.0") is False
+    assert transformers_too_old("5.17.0") is False
+    assert transformers_too_old(None) is True
+    assert transformers_too_old("not-a-version") is True
+
+
+def _fake_cloned_dir(tmp_path):
+    (tmp_path / "convert_hf_to_gguf.py").write_text("# stub")
+    scripts = tmp_path / ".venv" / ("Scripts" if platform.system() == "Windows" else "bin")
+    scripts.mkdir(parents=True)
+    (tmp_path / "requirements").mkdir()
+    (tmp_path / "requirements" / "requirements-convert_hf_to_gguf.txt").write_text("# stub")
+    return tmp_path
+
+
+def test_setup_venv_force_upgrades_transformers(tmp_path, monkeypatch):
+    import quant_gui.llamacpp_backend as lb
+
+    fake = _fake_cloned_dir(tmp_path)
+    commands = []
+
+    def fake_run_streamed(cmd, cwd=None, result=None):
+        commands.append(list(cmd))
+        if result is not None:
+            result.returncode = 0
+        yield from ()
+
+    monkeypatch.setattr(lb, "_run_streamed", fake_run_streamed)
+    monkeypatch.setattr(lb, "venv_transformers_version", lambda _d: "5.17.0")
+
+    events = list(lb.stream_setup_venv(fake))
+    assert events[-1] == "__OK__"
+    upgrades = [c for c in commands if "install" in c and any("transformers>=" in a for a in c)]
+    assert len(upgrades) == 1, f"expected exactly one transformers upgrade, got {commands}"
+    assert any("Gemma 3/4" in e for e in events)
+    assert any("transformers 5.17.0" in e for e in events)
+
+
+def test_setup_venv_ok_even_when_upgrade_fails(tmp_path, monkeypatch):
+    """A failed transformers upgrade must not brick setup - it only warns."""
+    import quant_gui.llamacpp_backend as lb
+
+    fake = _fake_cloned_dir(tmp_path)
+
+    def fake_run_streamed(cmd, cwd=None, result=None):
+        if result is not None:
+            result.returncode = 1 if any("transformers>=" in a for a in cmd) else 0
+        yield from ()
+
+    monkeypatch.setattr(lb, "_run_streamed", fake_run_streamed)
+    monkeypatch.setattr(lb, "venv_transformers_version", lambda _d: "4.57.6")
+
+    events = list(lb.stream_setup_venv(fake))
+    assert events[-1] == "__OK__"
+    assert any("Gemma 3/4 conversions may fail" in e for e in events)
+
+
+# ---------------------------------------------------------------------------
+# llama-perplexity validation
+# ---------------------------------------------------------------------------
+
+def test_parse_final_ppl_extracts_value():
+    out = "perplexity: chunk 1, ppl = 14.2\nFinal estimate: PPL = 11.2345 +/- 0.5\n"
+    assert abs(parse_final_ppl(out) - 11.2345) < 1e-9
+
+
+def test_parse_final_ppl_takes_last_and_handles_noise():
+    out = "Final estimate: PPL = 99\nperplexity: calculating...\nfinal estimate: ppl = 7.5\n"
+    assert parse_final_ppl(out) == 7.5
+    assert parse_final_ppl("") is None
+    assert parse_final_ppl("no result here") is None
+
+
+def test_stream_perplexity_fails_fast_when_binary_missing(tmp_path):
+    events = list(stream_perplexity(tmp_path, "/m.gguf", "/t.txt"))
+    assert events[-1].startswith("__FAIL__")
+    assert any("llama-perplexity" in e for e in events)
+
+
+def test_stream_perplexity_requires_files(tmp_path):
+    binpath = tmp_path / "build" / "bin" / "llama-perplexity"
+    binpath.parent.mkdir(parents=True)
+    binpath.write_text("#!/bin/sh\n")
+    binpath.chmod(0o755)
+    events = list(stream_perplexity(tmp_path, "/no/model.gguf", "/no/text.txt"))
+    assert events[-1].startswith("__FAIL__")
+    assert any("Model GGUF not found" in e for e in events)

@@ -64,7 +64,24 @@ class ConvertOptions:
     num_iter: int = 4000
     manual_seed: int = -1
 
+    # Opt-in GPU speed modes (learned mode only, need a recent ctq that has
+    # the flags; all default-off = original behavior).
+    fast_math: bool = False          # TF32 matmuls + bf16 SVD projection (CUDA)
+    loss_sync_batch: int = 1         # sync the scalar loss once per K iters (CUDA)
+    snapshot_interval: int = 1       # clone best-so-far tensor every N improvements
+    compile_loop: bool = False       # torch.compile the optimizer forward (triton)
+
     extra_flags: list[str] = field(default_factory=list)
+
+    @property
+    def uses_perf_flags(self) -> bool:
+        """True when any opt-in GPU speed flag that an old ctq wouldn't understand is set."""
+        return (
+            self.fast_math
+            or self.compile_loop
+            or int(self.loss_sync_batch or 1) > 1
+            or int(self.snapshot_interval or 1) > 1
+        )
 
 
 CONVROT_VALID_GROUP_SIZES = (4, 16, 64, 256, 1024)
@@ -182,6 +199,14 @@ def build_args(opts: ConvertOptions) -> list[str]:
         args += ["--num_iter", str(opts.num_iter)]
         if opts.manual_seed is not None and opts.manual_seed != -1:
             args += ["--manual_seed", str(opts.manual_seed)]
+        if opts.fast_math:
+            args.append("--fast_math")
+        if int(opts.loss_sync_batch or 1) > 1:
+            args += ["--loss_sync_batch", str(int(opts.loss_sync_batch))]
+        if int(opts.snapshot_interval or 1) > 1:
+            args += ["--snapshot_interval", str(int(opts.snapshot_interval))]
+        if opts.compile_loop:
+            args.append("--compile_loop")
 
     args += opts.extra_flags
     return args
