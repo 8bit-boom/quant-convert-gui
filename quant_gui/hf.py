@@ -7,9 +7,13 @@ Accepts the URLs users copy out of their browser, e.g.:
 
 from __future__ import annotations
 
+import json
+import posixpath
 import re
 from dataclasses import dataclass
 from pathlib import Path
+
+from .sharded import INDEX_SUFFIX, SHARD_RE
 
 _HF_URL_RE = re.compile(
     r"^https?://huggingface\.co/(?P<repo_id>[^/]+/[^/]+)/(?:blob|resolve)/(?P<revision>[^/]+)/(?P<filename>.+)$"
@@ -44,8 +48,13 @@ def parse_hf_url(url: str) -> HFTarget:
     return HFTarget(repo_id=m.group("repo_id"), revision=m.group("revision"), filename=m.group("filename"))
 
 
-def download(url: str, dest_dir: str, token: str | None = None, progress_cb=None) -> str:
+def download(url: str, dest_dir: str, token: str | None = None, progress_cb=None, file_cb=None) -> str:
     """Download the file to dest_dir, returning the local path.
+
+    A URL to one shard of a sharded checkpoint (`model-00001-of-00005.safetensors`)
+    or to its `.safetensors.index.json` downloads the *whole set* and returns
+    the index path (or the first shard if the repo has no index) - a single
+    shard is useless on its own. `file_cb(i, n, name)` reports shard progress.
 
     Prefers huggingface_hub (handles resume, caching, auth) and falls back
     to a plain streamed HTTP GET when it isn't installed.
@@ -53,19 +62,60 @@ def download(url: str, dest_dir: str, token: str | None = None, progress_cb=None
     target = parse_hf_url(url)
     Path(dest_dir).mkdir(parents=True, exist_ok=True)
 
+    base = posixpath.basename(target.filename)
+    if SHARD_RE.match(base) or base.endswith(INDEX_SUFFIX):
+        return _download_shard_set(target, dest_dir, token, progress_cb, file_cb)
+    return _download_one(target, dest_dir, token, progress_cb)
+
+
+def _download_one(target: HFTarget, dest_dir: str, token: str | None, progress_cb) -> str:
     try:
         from huggingface_hub import hf_hub_download
 
-        local_path = hf_hub_download(
+        return hf_hub_download(
             repo_id=target.repo_id,
             filename=target.filename,
             revision=target.revision,
             local_dir=dest_dir,
             token=token,
         )
-        return local_path
     except ImportError:
         return _plain_download(target, dest_dir, token, progress_cb)
+
+
+def _sibling(target: HFTarget, name: str) -> HFTarget:
+    folder = posixpath.dirname(target.filename)
+    return HFTarget(target.repo_id, target.revision, posixpath.join(folder, name) if folder else name)
+
+
+def _download_shard_set(target: HFTarget, dest_dir: str, token: str | None, progress_cb, file_cb) -> str:
+    base = posixpath.basename(target.filename)
+    index_local: str | None = None
+
+    if base.endswith(INDEX_SUFFIX):
+        index_local = _download_one(target, dest_dir, token, progress_cb)
+        try:
+            weight_map = json.loads(Path(index_local).read_text(encoding="utf-8"))["weight_map"]
+        except (OSError, ValueError, KeyError) as exc:
+            raise ValueError(f"Couldn't read the downloaded shard index {base}: {exc}") from exc
+        names = sorted(set(weight_map.values()))
+    else:
+        m = SHARD_RE.match(base)
+        prefix, suffix = m.group("prefix"), m.group("suffix")
+        width, total = len(m.group("idx")), int(m.group("total"))
+        names = [f"{prefix}-{i:0{width}d}-of-{total:0{width}d}{suffix}" for i in range(1, total + 1)]
+        try:  # the index is optional - plenty of repos ship shards without one
+            index_local = _download_one(_sibling(target, f"{prefix}{INDEX_SUFFIX}"), dest_dir, token, None)
+        except Exception:  # noqa: BLE001 - absent index is fine, anything else surfaces via the shards
+            index_local = None
+
+    first_local: str | None = None
+    for i, name in enumerate(names, 1):
+        if file_cb:
+            file_cb(i, len(names), name)
+        local = _download_one(_sibling(target, name), dest_dir, token, progress_cb)
+        first_local = first_local or local
+    return index_local or first_local
 
 
 def download_repo(repo_id: str, dest_dir: str, token: str | None = None, revision: str = "main") -> str:

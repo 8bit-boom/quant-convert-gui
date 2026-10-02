@@ -23,6 +23,7 @@ from pathlib import Path
 
 from .cli_builder import ConvertOptions
 from .filters import get_model_filters
+from .sharded import input_exists
 
 DTYPE_BYTES = {
     "F64": 8, "F32": 4, "F16": 2, "BF16": 2,
@@ -61,7 +62,24 @@ class SizeEstimate:
 
 
 def read_header(path: str) -> list[TensorHeader]:
-    """Parse a safetensors file's header without loading any tensor data."""
+    """Parse a safetensors file's header (or, for a sharded checkpoint, every
+    shard's header) without loading any tensor data."""
+    from .sharded import ShardError, find_shards
+
+    try:
+        shard_set = find_shards(path)
+    except ShardError as exc:
+        raise SafetensorsHeaderError(str(exc)) from exc
+    if shard_set is None:
+        return _read_single_header(path)
+    tensors: list[TensorHeader] = []
+    for shard in shard_set.files:
+        tensors.extend(_read_single_header(str(shard)))
+    return tensors
+
+
+def _read_single_header(path: str) -> list[TensorHeader]:
+    """Parse one safetensors file's header without loading any tensor data."""
     with open(path, "rb") as f:
         raw_len = f.read(8)
         if len(raw_len) < 8:
@@ -193,7 +211,7 @@ def format_estimate_markdown(est: SizeEstimate, gpu_vram_gb: float | None = None
 
 
 def estimate_from_file(path: str, opts: ConvertOptions, gpu_vram_gb: float | None = None) -> str:
-    if not path or not Path(path).is_file():
+    if not path or not input_exists(path):
         return "Pick an input file first."
     try:
         tensors = read_header(path)
@@ -321,7 +339,7 @@ def estimate_gguf(tensors: list[TensorHeader], quant_type: str, preset: str = "n
 def estimate_gguf_from_file(
     path: str, quant_type: str, preset: str = "none", exclude_regex: str | None = None, gpu_vram_gb: float | None = None,
 ) -> str:
-    if not path or not Path(path).is_file():
+    if not path or not input_exists(path):
         return "Pick an input file first."
     try:
         tensors = read_header(path)
@@ -350,7 +368,7 @@ def estimate_int4_mixed_from_file(
     fallback_int8: bool = True,
     gpu_vram_gb: float | None = None,
 ) -> str:
-    if not path or not Path(path).is_file():
+    if not path or not input_exists(path):
         return "Pick an input file first."
     try:
         tensors = read_header(path)

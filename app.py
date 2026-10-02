@@ -26,6 +26,7 @@ from quant_gui.gpu_profiles import GPU_PROFILE_BY_KEY, GPU_PROFILES, detect_prof
 from quant_gui.hf import HFUrlError, download as hf_download, download_repo as hf_download_repo, parse_hf_url
 from quant_gui.loop_timing import LoopPhaseTimer
 from quant_gui import llamacpp_backend as lcpp
+from quant_gui import sharded
 from quant_gui import gguf_bench as gb
 from quant_gui.gguf_backend import stream_gguf_conversion, stream_install as stream_gguf_install
 from quant_gui.gguf_backend import QUANT_TYPE_CHOICES as GGUF_QUANT_TYPE_CHOICES
@@ -52,6 +53,7 @@ CHECKPOINT_ROOT = ckpt.checkpoint_root(APP_DIR)
 RUN_HISTORY = APP_DIR / rh.HISTORY_NAME
 LLAMACPP_DIR = lcpp.default_llamacpp_dir(APP_DIR)
 LLM_MODELS_DIR = APP_DIR / "llm_models"
+MERGED_DIR = APP_DIR / "merged"
 
 # Persisted UI settings (ui_settings.json). GPU quantization is the first
 # one: the checkbox defaults to the saved value, and a saved "on" is applied
@@ -288,15 +290,20 @@ def on_source_change(source: str):
 
 def list_downloaded_models() -> list[tuple[str, str]]:
     """(label, absolute path) for every .safetensors file under downloads/,
-    newest first, so 'Local file path' can offer them without retyping."""
+    newest first, so 'Local file path' can offer them without retyping. A
+    sharded checkpoint is one entry (its index file, or first shard), not N."""
     if not DOWNLOAD_DIR.is_dir():
         return []
-    files = sorted(DOWNLOAD_DIR.rglob("*.safetensors"), key=lambda p: p.stat().st_mtime, reverse=True)
+    entries = sharded.collapse_listing(list(DOWNLOAD_DIR.rglob("*.safetensors")))
+    entries.sort(key=lambda e: e[0].stat().st_mtime, reverse=True)
     choices = []
-    for f in files:
-        size_gb = f.stat().st_size / (1024**3)
-        rel = f.relative_to(DOWNLOAD_DIR)
-        choices.append((f"{rel} ({size_gb:.2f} GB)", str(f)))
+    for path, nbytes, n_shards, complete in entries:
+        rel = path.relative_to(DOWNLOAD_DIR)
+        extra = ""
+        if n_shards > 1:
+            extra = f", {n_shards} shards" if complete else f", INCOMPLETE - shards missing"
+        size = f"{nbytes / 1024**3:.2f} GB" if nbytes >= 0.5 * 1024**3 else f"{nbytes / 1024**2:.0f} MB"
+        choices.append((f"{rel} ({size}{extra})", str(path)))
     return choices
 
 
@@ -322,12 +329,21 @@ def do_hf_download(url: str, token: str, progress=gr.Progress()):
         if total:
             progress(min(read / total, 1.0), desc=f"{read / 1e6:.0f} / {total / 1e6:.0f} MB")
 
+    def file_cb(i, n, name):
+        progress(i / n, desc=f"shard {i}/{n}: {name}")
+
     try:
-        local_path = hf_download(url, str(DOWNLOAD_DIR), token=(token or "").strip() or None, progress_cb=cb)
+        local_path = hf_download(
+            url, str(DOWNLOAD_DIR), token=(token or "").strip() or None, progress_cb=cb, file_cb=file_cb,
+        )
     except Exception as exc:  # noqa: BLE001 - surfaced directly to the user
         return "", f"Download failed: {exc}"
 
-    return local_path, f"Downloaded to `{local_path}`"
+    try:
+        detail = sharded.describe(local_path)
+    except sharded.ShardError as exc:
+        return local_path, f"Downloaded to `{local_path}` - but {exc}"
+    return local_path, f"Downloaded to `{local_path}`" + (f" ({detail})" if detail else "")
 
 
 def on_input_resolved(local_path: str, hf_url: str, current_preset_label: str):
@@ -404,7 +420,7 @@ def run_int4_convert(
     if not input_path:
         yield "Pick an input file (local path or downloaded Hugging Face file) first.", None, ""
         return
-    if not Path(input_path).is_file():
+    if not sharded.input_exists(input_path):
         yield f"Input file not found on disk: {input_path}", None, ""
         return
     if not int4_is_available():
@@ -417,7 +433,7 @@ def run_int4_convert(
     if not auto_output and name:
         output_path = str(OUTPUT_DIR / name) if not os.path.isabs(name) and os.sep not in name else name
     else:
-        stem = Path(input_path).stem
+        stem = sharded.logical_stem(input_path)
         output_path = str(OUTPUT_DIR / f"{stem}-int4-mixed.safetensors")
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
 
@@ -519,7 +535,7 @@ def run_gguf_convert(
     if not input_path:
         yield "Pick an input file (local path or downloaded Hugging Face file) first.", None, ""
         return
-    if not Path(input_path).is_file():
+    if not sharded.input_exists(input_path):
         yield f"Input file not found on disk: {input_path}", None, ""
         return
     if not gguf_is_available():
@@ -532,7 +548,7 @@ def run_gguf_convert(
     if not auto_output and name:
         output_path = str(OUTPUT_DIR / name) if not os.path.isabs(name) and os.sep not in name else name
     else:
-        stem = Path(input_path).stem
+        stem = sharded.logical_stem(input_path)
         output_path = str(OUTPUT_DIR / f"{stem}-{gguf_quant_type}.gguf")
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
 
@@ -1467,9 +1483,36 @@ def run_convert(
         yield "Pick an input file (local path or downloaded Hugging Face file) first.", None, ""
         return
 
-    if not Path(input_path).is_file():
+    if not sharded.input_exists(input_path):
         yield f"Input file not found on disk: {input_path}", None, ""
         return
+
+    # convert_to_quant only reads one file. A sharded checkpoint is merged into one
+    # first (raw byte copy - nothing re-encoded); the INT4/GGUF paths above read
+    # shards in place and never get here.
+    merge_note = ""
+    merged_input = False
+    try:
+        shard_set = sharded.find_shards(input_path)
+    except sharded.ShardError as exc:
+        yield str(exc), None, ""
+        return
+    if shard_set is not None:
+        merged_path = sharded.merged_path_for(shard_set, MERGED_DIR)
+        merge_note = (
+            f"Sharded checkpoint ({sharded.describe(input_path)}). convert_to_quant reads a single file, "
+            f"so the shards are merged first - a raw byte copy, nothing is re-encoded:\n  {merged_path}\n"
+        )
+        yield merge_note, None, _progress_bar_html(0, "Merging shards...")
+        try:
+            for done, total, shard_name in sharded.iter_merge(shard_set, merged_path):
+                yield merge_note, None, _progress_bar_html(done / total if total else 1, f"Merging {shard_name}")
+        except (sharded.ShardError, OSError) as exc:
+            yield merge_note + f"\n❌ Merge failed: {exc}\n", None, _progress_bar_html(1.0, "Failed")
+            return
+        merge_note += "Merged.\n\n"
+        input_path = str(merged_path)
+        merged_input = True
 
     try:
         opts = build_options(
@@ -1485,6 +1528,9 @@ def run_convert(
             manual_seed=manual_seed, fast_math=fast_math, loss_sync_batch=loss_sync_batch,
             snapshot_interval=snapshot_interval, compile_loop=compile_loop,
         )
+        if merged_input and not opts.output_path:
+            # ctq's auto-name lands beside the input, i.e. inside the merge cache - keep it in converted/.
+            opts.output_path = str(OUTPUT_DIR / f"{sharded.logical_stem(shard_set.entry_path)}-{fmt}.safetensors")
         args = build_args(opts)
     except OptionsError as exc:
         yield f"Can't build a valid command: {exc}", None, ""
@@ -1527,7 +1573,7 @@ def run_convert(
     loop_timer = LoopPhaseTimer()
     t0 = time.time()
     try:
-        log = ""
+        log = merge_note
         result_path = None
         bar = _progress_bar_html(0, "Starting ctq...")
         for chunk in stream_conversion(
@@ -1926,7 +1972,7 @@ with gr.Blocks(title="Quant Convert GUI") as demo:
                             refresh_local_models_btn = gr.Button("🔄", scale=1, min_width=40)
                         input_local = gr.Textbox(
                             label="Local .safetensors path",
-                            placeholder="/path/to/model.safetensors",
+                            placeholder="/path/to/model.safetensors - or a shard, its .index.json, or a folder of shards",
                         )
 
                     with gr.Group(visible=True) as hf_group:
@@ -2750,6 +2796,13 @@ with gr.Blocks(title="Quant Convert GUI") as demo:
                 "tensor's sensitivity from your imatrix and assigns per-layer types under a size budget "
                 "(Dynamic 3.0 style, driven by *your* calibration data rather than Unsloth's unpublished "
                 "per-model picks). **Auto** chains sweep → tune → perplexity validation in one click.\n\n"
+                "## What about sharded checkpoints (model-00001-of-00005.safetensors)?\n"
+                "Give **Local file path** any shard, the `.index.json`, or the folder; a Hugging Face link to "
+                "any shard downloads the whole set. INT4 and GGUF read the shards in place. The ctq formats "
+                "merge them into one file first (a raw byte copy, cached in `merged/`) because "
+                "convert_to_quant only reads a single file - that needs free disk equal to the model size, "
+                "which is checked before starting. An incomplete set is refused by name rather than "
+                "converted partially.\n\n"
                 "## What about video and audio models?\n"
                 "Video families (Wan, Hunyuan Video, LTX Video, MiniMax H3) work through the normal Convert "
                 "tab; the app recognizes them from your filename/URL and selects ctq's matching preset where "
@@ -3041,7 +3094,7 @@ with gr.Blocks(title="Quant Convert GUI") as demo:
         int4_regex_v, int4_fallback_v, gguf_quant_type_v = args[-3], args[-2], args[-1]
 
         input_path = (input_path or "").strip()
-        if not input_path or not Path(input_path).is_file():
+        if not input_path or not sharded.input_exists(input_path):
             return "Pick an input file (local path, or download a Hugging Face file) first."
         vram = check_environment().gpu_vram_gb
 

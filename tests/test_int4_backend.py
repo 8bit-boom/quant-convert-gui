@@ -131,3 +131,35 @@ def test_stream_int4_conversion_yields_progress_then_ok(tmp_path):
 def test_stream_int4_conversion_reports_failure_for_bad_input():
     events = list(stream_int4_conversion("/no/such/file.safetensors", "/tmp/out.safetensors", None))
     assert events[-1][0] == "fail"
+
+
+def test_sharded_checkpoint_converts_identically_to_the_single_file(tmp_path):
+    import json
+
+    src = tmp_path / "model.safetensors"
+    _write_test_model(src)
+    shards = tmp_path / "shards"
+    shards.mkdir()
+    with safe_open(str(src), framework="pt") as f:
+        keys = sorted(f.keys())
+        weight_map = {}
+        for i in range(3):
+            part = {k: f.get_tensor(k).clone() for k in keys[i::3]}
+            name = f"m-{i + 1:05d}-of-00003.safetensors"
+            save_file(part, str(shards / name))
+            weight_map.update({k: name for k in part})
+    index = shards / "m.safetensors.index.json"
+    index.write_text(json.dumps({"weight_map": weight_map}))
+
+    kwargs = dict(int4_layers_regex=r"attn\.wq|mlp\.gate", preset="krea2")
+    a = convert_int4_mixed(str(src), str(tmp_path / "a.safetensors"), **kwargs)
+    b = convert_int4_mixed(str(index), str(tmp_path / "b.safetensors"), **kwargs)
+
+    assert (a.int4_count, a.int8_count, a.kept_count) == (b.int4_count, b.int8_count, b.kept_count)
+    with safe_open(str(tmp_path / "a.safetensors"), framework="pt") as fa, \
+         safe_open(str(tmp_path / "b.safetensors"), framework="pt") as fb:
+        assert sorted(fa.keys()) == sorted(fb.keys())
+        for k in fa.keys():
+            assert torch.equal(fa.get_tensor(k), fb.get_tensor(k)), k
+        # key order inside the JSON follows shard enumeration order; the content must be identical
+        assert json.loads(fa.metadata()["_quantization_metadata"]) == json.loads(fb.metadata()["_quantization_metadata"])

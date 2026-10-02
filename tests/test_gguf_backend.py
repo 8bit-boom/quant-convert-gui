@@ -160,3 +160,53 @@ def test_unsupported_family_gets_a_specific_refusal(tmp_path):
 
     with pytest.raises(GGUFBackendError, match="LTX Video 2.*no matching architecture"):
         convert_to_gguf(str(src), str(tmp_path / "out.gguf"), "Q8_0")
+
+
+def _shard(src: Path, out_dir: Path, n: int = 3) -> Path:
+    """Re-save src's tensors as n shards plus an index; returns the index path."""
+    import json
+    from safetensors import safe_open
+
+    out_dir.mkdir(exist_ok=True)
+    with safe_open(str(src), framework="pt") as f:
+        keys = sorted(f.keys())
+        weight_map = {}
+        for i in range(n):
+            part = {k: f.get_tensor(k).clone() for k in keys[i::n]}
+            name = f"model-{i + 1:05d}-of-{n:05d}.safetensors"
+            save_file(part, str(out_dir / name))
+            weight_map.update({k: name for k in part})
+    index = out_dir / "model.safetensors.index.json"
+    index.write_text(json.dumps({"weight_map": weight_map}))
+    return index
+
+
+def _gguf_contents(path: Path):
+    r = gguf.GGUFReader(str(path))
+    return {t.name: (t.tensor_type, tuple(t.shape), bytes(t.data)) for t in r.tensors}
+
+
+@pytest.mark.parametrize("entry", ["index", "shard", "folder"])
+def test_sharded_checkpoint_converts_identically_to_the_single_file(tmp_path, entry):
+    single = tmp_path / "wan.safetensors"
+    _write_wan_like_model(single)
+    index = _shard(single, tmp_path / "shards")
+    path = {"index": index, "shard": index.parent / "model-00002-of-00003.safetensors", "folder": index.parent}[entry]
+
+    stats_single = convert_to_gguf(str(single), str(tmp_path / "a.gguf"), "Q8_0")
+    stats_sharded = convert_to_gguf(str(path), str(tmp_path / "b.gguf"), "Q8_0")
+
+    assert stats_sharded.arch == stats_single.arch == "wan"
+    assert stats_sharded.quantized_count == stats_single.quantized_count
+    assert stats_sharded.high_dim_f32_count == 1
+    assert _gguf_contents(tmp_path / "b.gguf") == _gguf_contents(tmp_path / "a.gguf")
+
+
+def test_incomplete_shard_set_fails_with_the_missing_names(tmp_path):
+    single = tmp_path / "wan.safetensors"
+    _write_wan_like_model(single)
+    index = _shard(single, tmp_path / "shards")
+    (index.parent / "model-00003-of-00003.safetensors").unlink()
+
+    events = list(stream_gguf_conversion(str(index), str(tmp_path / "o.gguf"), "Q8_0"))
+    assert events[-1][0] == "fail" and "model-00003-of-00003" in events[-1][1]

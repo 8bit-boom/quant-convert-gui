@@ -139,3 +139,31 @@ def test_custom_layers_use_custom_type_for_size():
     # int8 and fp8 have the same bytes/elem, so this mostly checks the custom path doesn't crash
     # and still counts as quantized rather than kept.
     assert est.estimated_bytes < est.original_bytes
+
+
+def test_estimates_accept_a_sharded_checkpoint_and_match_the_single_file(tmp_path):
+    from quant_gui.size_estimate import estimate_from_file, estimate_gguf_from_file, estimate_int4_mixed_from_file
+
+    t = {
+        "cap_embedder.1.weight": ("BF16", [1024, 2048]),
+        "context_refiner.0.attention.qkv.weight": ("BF16", [3072, 1024]),
+        "blocks.0.attn.wq.weight": ("BF16", [1024, 1024]),
+        "blocks.0.norm.weight": ("BF16", [1024]),
+    }
+    single = tmp_path / "single.safetensors"
+    write_fake_safetensors(single, t)
+    shards = tmp_path / "shards"
+    shards.mkdir()
+    keys = list(t)
+    write_fake_safetensors(shards / "m-00001-of-00002.safetensors", {k: t[k] for k in keys[:2]})
+    write_fake_safetensors(shards / "m-00002-of-00002.safetensors", {k: t[k] for k in keys[2:]})
+
+    opts = ConvertOptions(input_path="x", quant_format="int8", convrot=False)
+    for target in (shards, shards / "m-00001-of-00002.safetensors"):
+        assert estimate_gguf_from_file(str(target), "Q8_0") == estimate_gguf_from_file(str(single), "Q8_0")
+        assert estimate_int4_mixed_from_file(str(target), r"attn\.wq") == estimate_int4_mixed_from_file(str(single), r"attn\.wq")
+        assert estimate_from_file(str(target), opts) == estimate_from_file(str(single), opts)
+
+    # an incomplete set is explained, not silently estimated from the shards present
+    (shards / "m-00002-of-00002.safetensors").unlink()
+    assert "incomplete" in estimate_gguf_from_file(str(shards / "m-00001-of-00002.safetensors"), "Q8_0")

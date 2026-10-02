@@ -143,7 +143,7 @@ def convert_int4_mixed(
         )
 
     import torch
-    from safetensors import safe_open
+    from .sharded import open_checkpoint
     from safetensors.torch import load_file, save_file
 
     from comfy_kitchen.tensor import TensorWiseINT8Layout
@@ -157,7 +157,7 @@ def convert_int4_mixed(
     out_tensors: dict[str, "torch.Tensor"] = {}
     quant_map: dict[str, dict] = {"layers": {}}
 
-    with safe_open(input_path, framework="pt", device=device) as f:
+    with open_checkpoint(input_path, framework="pt", device=device) as f:
         keys = list(f.keys())
         stats.total = len(keys)
         if checkpoint is not None:

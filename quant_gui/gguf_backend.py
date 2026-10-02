@@ -325,9 +325,9 @@ def convert_to_gguf(
     import gguf
     import numpy as np
     from gguf import quants
-    from safetensors import safe_open
+    from .sharded import open_checkpoint
 
-    with safe_open(input_path, framework="pt") as f:
+    with open_checkpoint(input_path, framework="pt") as f:
         keys = list(f.keys())
         key_set = set(keys)
         arch = detect_arch(key_set)

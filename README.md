@@ -257,8 +257,36 @@ What's verified rather than assumed:
 - **Sizes are shown per family** (parameters × 2 bytes for BF16, about half
   as INT8/FP8) so you can sanity-check VRAM before converting.
 
-Not covered: checkpoints sharded across several files (the Convert tab takes
-one `.safetensors` file at a time).
+Checkpoints sharded across several files are covered too - see
+[Sharded checkpoints](#sharded-checkpoints).
+
+## Sharded checkpoints
+
+Large checkpoints ship as `model-00001-of-00005.safetensors` … plus a
+`model.safetensors.index.json`. In **Local file path** you can give any one of:
+a shard, the `.index.json`, or a folder containing the set. For Hugging Face
+URLs, a link to *any* shard (or the index) downloads the whole set.
+
+- **INT4 and GGUF read the shards in place** - no copy, no extra disk.
+- **ctq formats merge the shards into one file first**, because
+  convert_to_quant only reads a single file (it has no shard/index handling -
+  checked in its source). The merge copies raw byte ranges, so it never
+  decodes a tensor: any dtype works, memory stays at one 64 MB buffer, and
+  the result is cached in `merged/` so re-runs skip it. It needs free disk
+  equal to the model size, which is checked up front with a message saying
+  how much is missing. Converted files still land in `converted/`.
+- **Incomplete sets are refused by name**, e.g. "1 of 3 shard files are
+  missing - model-00002-of-00003.safetensors", instead of quietly converting
+  the shards that happen to be present. An index listing a tensor no shard
+  has, or two shards that both contain a tensor, are refused too.
+
+Verified, not assumed: a sharded checkpoint converted through the merge path
+with ctq produced output **bit-identical** to the same model converted as one
+file (every tensor equal), and INT4/GGUF output from shards matches the
+single-file output tensor for tensor. The merged file is a valid safetensors
+file (8-byte-aligned data, bf16 preserved), an interrupted merge leaves no
+half-written file, and the downloads list shows a set as one entry (flagging
+an incomplete one).
 
 ## About "LLM to GGUF" (Gemma, Llama, Qwen, etc.)
 
@@ -596,6 +624,9 @@ default where applicable and neither changes the output:
   `comfy_kitchen`, independent of ctq (see [About "INT4 ConvRot"](#about-int4-convrot)).
 - `quant_gui/gguf_backend.py` — GGUF export via llama.cpp's `gguf` package,
   independent of ctq (see [About "GGUF"](#about-gguf)).
+- `quant_gui/sharded.py` — sharded-checkpoint support: shard-set detection,
+  an in-place reader for INT4/GGUF, and the streaming merge for ctq (see
+  [Sharded checkpoints](#sharded-checkpoints)).
 - `quant_gui/model_families.py` — the video/audio family catalog: filename
   detection, ctq preset mapping, and per-family GGUF support (see
   [Video and audio models](#video-and-audio-models)).
