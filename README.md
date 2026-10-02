@@ -208,6 +208,54 @@ Verified end-to-end against a real GGUF round-trip (`gguf.GGUFReader`/
 per-tensor `GGMLQuantizationType`, and the packed shapes ComfyUI-GGUF's own
 loader validation expects.
 
+## Video and audio models
+
+The families in SwarmUI's video/audio support tables are catalogued in
+`quant_gui/model_families.py`. Drop a file named like one of them into the
+Convert tab and the app recognizes it from the filename/URL, selects the
+matching ctq preset when one exists, and tells you exactly what is and isn't
+supported for it. You can also pick a family by hand under **Model preset →
+Video & audio model family**.
+
+| Family | ctq preset | GGUF |
+|---|---|---|
+| Wan 2.1 / 2.2 | `wan` | yes (`wan`) |
+| Hunyuan Video 1.5 | `hunyuan` | only if its tensor names match ComfyUI-GGUF's Hunyuan detection, else refused |
+| Hunyuan Video (2024) | none (the `hunyuan` preset is documented for 1.5) | yes (`hyvid`) |
+| LTX Video (2024) | none (`ltxv2` is for LTX 2) | yes (`ltxv`) |
+| LTX Video 2 | `ltxv2` (keeps its audio stack at full precision) | no |
+| MiniMax H3 | `minimaxh3` | no |
+| Ace Step 1.5, MiniMax Music 3, YuE2 (audio) | **none exists** | no |
+
+What's verified rather than assumed:
+
+- **Presets apply.** A Wan-style checkpoint run through the real `ctq --wan`:
+  blocks to INT8, `text_embedding`/`time_embedding`/`head` skipped by the
+  preset, and the 5D Conv3d `patch_embedding` left BF16. A test asserts every
+  preset named in the catalog really exists in ctq's registry, so a rename
+  upstream can't silently stop one applying.
+- **Audio models have no preset, and the app says so.** ctq only knows a few
+  audio-ish layer names inside its video presets. Nothing here invents layer
+  lists for checkpoints that couldn't be inspected. ctq still converts them -
+  in a real run its INT8 path quantized only the 2D linear weights and left
+  Conv1d/Conv2d (vocoder/VAE-style) weights untouched - and **Advanced options
+  → Exclude layers → "Timestep, modulation & in/out projections"** offers a
+  generic starting regex built from substrings ctq's own presets already
+  protect (`scale_shift`, `adaln`, `time_`, `final_layer`, `patch_embed`, ...).
+  Treat it as a starting point and check your checkpoint's real layer names.
+- **GGUF now keeps 5D tensors.** Wan and Hunyuan carry a 5D Conv3d patch
+  embedding that ggml's block quantizers can't handle. The GGUF backend used
+  to drop such tensors (producing a file that wouldn't load); it now stores
+  them as unquantized F32, exactly what ComfyUI-GGUF's own `fix_5d_tensors.py`
+  does, with no separate fix-up step. A family ComfyUI-GGUF's loader has no
+  architecture for (LTX Video 2, MiniMax H3, all audio models) is refused with
+  a message naming it, rather than writing a file nothing can read.
+- **Sizes are shown per family** (parameters × 2 bytes for BF16, about half
+  as INT8/FP8) so you can sanity-check VRAM before converting.
+
+Not covered: checkpoints sharded across several files (the Convert tab takes
+one `.safetensors` file at a time).
+
 ## About "LLM to GGUF" (Gemma, Llama, Qwen, etc.)
 
 This is a separate tab and a separate tool from everything above it.
@@ -400,6 +448,9 @@ everyone else can ignore them.
   `comfy_kitchen`, independent of ctq (see [About "INT4 ConvRot"](#about-int4-convrot)).
 - `quant_gui/gguf_backend.py` — GGUF export via llama.cpp's `gguf` package,
   independent of ctq (see [About "GGUF"](#about-gguf)).
+- `quant_gui/model_families.py` — the video/audio family catalog: filename
+  detection, ctq preset mapping, and per-family GGUF support (see
+  [Video and audio models](#video-and-audio-models)).
 - `quant_gui/llamacpp_backend.py` — manages a real llama.cpp checkout/venv
   and shells out to its `convert_hf_to_gguf.py`/`llama-quantize`/
   `llama-imatrix` for LLMs
@@ -438,6 +489,8 @@ none of the three go through `ctq`:
   the standalone, pip-installable kernel library (`comfy_kitchen.tensor.convrot_w4a4`)
   that both Starnodes and this app's `quant_gui/int4_backend.py` actually
   quantize with.
+- [SwarmUI's video and audio model support tables](https://github.com/mcmonkeyprojects/SwarmUI) —
+  the list of families, years, authors and scales in `quant_gui/model_families.py`.
 - [city96/ComfyUI-GGUF](https://github.com/city96/ComfyUI-GGUF), specifically
   its `tools/convert.py` and `loader.py` — the reference this app's GGUF
   architecture detection and F32-fallback rules are ported from, and the

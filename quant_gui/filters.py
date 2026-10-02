@@ -83,6 +83,14 @@ def suggest_preset(name_hint: str) -> str | None:
     lowered = (name_hint or "").lower()
     if any(hint in lowered for hint in _KREA2_HINTS):
         return "krea2"
+
+    # Video families (wan, hunyuan 1.5, ltxv2, minimaxh3): only suggest a
+    # preset the installed ctq actually has.
+    from .model_families import detect_family
+
+    family = detect_family(lowered)
+    if family and family.ctq_preset and family.ctq_preset in get_model_filters():
+        return family.ctq_preset
     return None
 
 

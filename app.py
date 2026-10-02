@@ -17,6 +17,9 @@ import gradio as gr
 from quant_gui.cli_builder import ConvertOptions, OptionsError, build_args, format_command
 from quant_gui.env_check import check_environment, report_markdown
 from quant_gui.filters import preset_choices, preset_highprec_regex, preset_label, suggest_preset
+from quant_gui.model_families import (
+    FAMILY_BY_KEY, GENERIC_DIT_SENSITIVE_REGEX, detect_family, family_choices, family_note_markdown,
+)
 from quant_gui.gpu_profiles import GPU_PROFILE_BY_KEY, GPU_PROFILES, detect_profile_key
 from quant_gui.hf import HFUrlError, download as hf_download, download_repo as hf_download_repo, parse_hf_url
 from quant_gui import llamacpp_backend as lcpp
@@ -299,20 +302,32 @@ def do_hf_download(url: str, token: str, progress=gr.Progress()):
 def on_input_resolved(local_path: str, hf_url: str, current_preset_label: str):
     hint = local_path or hf_url
     preset = suggest_preset(hint)
-    if not preset:
-        return "", gr.update()
-
+    family = detect_family(hint)
     name = Path(hint).name if local_path else hf_url
-    if LABEL_TO_PRESET.get(current_preset_label, "none") == "none":
-        msg = (
-            f"Detected `{name}` — auto-selected the **{preset}** preset below "
-            "(its layer list literally includes `txtfusion`; this is what gives txtfusion-edition "
-            "models better quality than plain ConvRot). Change it below if you don't want that."
-        )
-        return msg, gr.update(value=PRESET_LABELS[preset])
+    has_pick = LABEL_TO_PRESET.get(current_preset_label, "none") != "none"
 
-    msg = f"Detected `{name}` — this model usually does best with the **{preset}** preset, but you've already picked a different one."
-    return msg, gr.update()
+    if preset == "krea2":
+        if not has_pick:
+            msg = (
+                f"Detected `{name}` — auto-selected the **{preset}** preset below "
+                "(its layer list literally includes `txtfusion`; this is what gives txtfusion-edition "
+                "models better quality than plain ConvRot). Change it below if you don't want that."
+            )
+            return msg, gr.update(value=PRESET_LABELS[preset])
+        msg = f"Detected `{name}` — this model usually does best with the **{preset}** preset, but you've already picked a different one."
+        return msg, gr.update()
+
+    if family:
+        base = f"Detected `{name}` — looks like **{family.label}** ({family.kind} model)."
+        available = bool(family.ctq_preset) and family.ctq_preset in PRESET_LABELS
+        note = "\n\n" + family_note_markdown(family, available)
+        if preset and not has_pick:
+            return base + f" Auto-selected the **{preset}** preset." + note, gr.update(value=PRESET_LABELS[preset])
+        if preset:
+            return base + f" Its usual preset is **{preset}**, but you've already picked a different one." + note, gr.update()
+        return base + note, gr.update()
+
+    return "", gr.update()
 
 
 def on_local_input_resolved(local_path: str, current_preset_label: str):
@@ -471,10 +486,11 @@ def run_gguf_convert(
                     f"  ⚠️ {stats.fallback_f16_count} layer(s) had a shape not divisible by 32 and fell "
                     f"back to F16 instead of {gguf_quant_type}.\n"
                 )
-            if stats.skipped_high_dim_count:
+            if stats.high_dim_f32_count:
                 log += (
-                    f"  ⚠️ {stats.skipped_high_dim_count} tensor(s) with more than 4 dimensions were skipped "
-                    "entirely - GGUF can't represent them (see ComfyUI-GGUF's fix_5d_tensors.py).\n"
+                    f"  ℹ️ {stats.high_dim_f32_count} tensor(s) with more than 4 dimensions (e.g. a video "
+                    "model's Conv3d patch embedding) were stored as unquantized F32 - GGUF's block "
+                    "quantizers can't handle them, and ComfyUI-GGUF's loader expects them this way.\n"
                 )
             if result_path:
                 log += f"Output: {result_path}\n"
@@ -960,6 +976,14 @@ with gr.Blocks(title="Quant Convert GUI") as demo:
                             info="Keeps sensitive layers (norms, embeddings, modulation) at full precision. "
                             "Pick the family closest to your model.",
                         )
+                        family_dd = gr.Dropdown(
+                            [("(not listed / pick the preset above directly)", "")] + family_choices(),
+                            value="", label="Video & audio model family",
+                            info="Picks the matching ctq preset (if one exists) and explains what is and isn't "
+                            "supported for it - ctq has presets for several video models but none for audio. "
+                            "Auto-detected from your filename/URL when possible.",
+                        )
+                        family_note = gr.Markdown()
                         with gr.Group(visible=False) as krea2_size_group:
                             gr.Markdown(
                                 "**Krea2 size profile** (for now, just this preset) — trades quality for a "
@@ -1002,6 +1026,7 @@ with gr.Blocks(title="Quant Convert GUI") as demo:
                             excl_tpl_norms_btn = gr.Button("Norms & embeddings", size="sm")
                             excl_tpl_mod_btn = gr.Button("Modulation & gating", size="sm")
                             excl_tpl_final_btn = gr.Button("Final output layer", size="sm")
+                            excl_tpl_dit_btn = gr.Button("Timestep, modulation & in/out projections", size="sm")
                             excl_tpl_clear_btn = gr.Button("Clear", size="sm")
                         gr.Markdown(
                             "_Generic starting points, not guaranteed to match your model — check the live log "
@@ -1311,6 +1336,15 @@ with gr.Blocks(title="Quant Convert GUI") as demo:
                 "docs. A small bundled calibration text makes it work out of the box; a manual per-layer type "
                 "override (`--tensor-type-file`) is also exposed for power users, since Unsloth's specific "
                 "per-model layer choices aren't published anywhere this app could just consume.\n\n"
+                "## What about video and audio models?\n"
+                "Video families (Wan, Hunyuan Video, LTX Video, MiniMax H3) work through the normal Convert "
+                "tab; the app recognizes them from your filename/URL and selects ctq's matching preset where "
+                "one exists (`wan`, `hunyuan` for 1.5, `ltxv2`, `minimaxh3`). **Audio/music models (Ace Step "
+                "1.5, MiniMax Music 3, YuE2) have no ctq preset** - they still convert, and Advanced options "
+                "has a generic exclude template for timestep/modulation/in-out layers, but it's a starting "
+                "point, not a verified per-model recipe. GGUF works for Wan and the 2024 Hunyuan/LTX models "
+                "(5D patch embeddings are stored as unquantized F32); LTX Video 2, MiniMax H3 and all audio "
+                "models have no ComfyUI-GGUF architecture, so GGUF export refuses them.\n\n"
                 "## What does \"txtfusion\" in a filename mean?\n"
                 "It's not a format — it's a **layer name**. `kroma-v0.3-txtfusion-edition-...` was converted "
                 "with ctq's `krea2` preset, whose high-precision keyword list literally includes `txtfusion` "
@@ -1432,6 +1466,20 @@ with gr.Blocks(title="Quant Convert GUI") as demo:
         return "", "none", "none", False, PRESET_LABELS["none"]
 
     preset_dd.change(krea2_group_visibility, inputs=[preset_dd], outputs=[krea2_size_group])
+
+    def on_family_select(key: str):
+        if not key:
+            return gr.update(), ""
+        fam = FAMILY_BY_KEY[key]
+        available = bool(fam.ctq_preset) and fam.ctq_preset in PRESET_LABELS
+        # Picking a family is explicit intent, so a family with no ctq preset must also clear any
+        # preset an earlier auto-detect left selected (e.g. "wan" must not stay on an audio model).
+        preset_update = gr.update(value=PRESET_LABELS[fam.ctq_preset if available else "none"])
+        return preset_update, family_note_markdown(fam, available)
+
+    family_dd.change(on_family_select, inputs=[family_dd], outputs=[preset_dd, family_note]).then(
+        krea2_group_visibility, inputs=[preset_dd], outputs=[krea2_size_group]
+    )
     krea2_balanced_btn.click(krea2_balanced, outputs=krea2_profile_outputs)
     krea2_compact_btn.click(krea2_compact, outputs=krea2_profile_outputs)
     krea2_smallest_btn.click(krea2_smallest, outputs=krea2_profile_outputs).then(
@@ -1445,6 +1493,7 @@ with gr.Blocks(title="Quant Convert GUI") as demo:
     excl_tpl_norms_btn.click(lambda: EXCLUDE_TEMPLATE_NORMS, outputs=[exclude_layers])
     excl_tpl_mod_btn.click(lambda: EXCLUDE_TEMPLATE_MOD, outputs=[exclude_layers])
     excl_tpl_final_btn.click(lambda: EXCLUDE_TEMPLATE_FINAL, outputs=[exclude_layers])
+    excl_tpl_dit_btn.click(lambda: GENERIC_DIT_SENSITIVE_REGEX, outputs=[exclude_layers])
     excl_tpl_clear_btn.click(lambda: "", outputs=[exclude_layers])
 
     custom_mixed_outputs = [custom_layers, custom_type, custom_scaling_mode, custom_convrot]

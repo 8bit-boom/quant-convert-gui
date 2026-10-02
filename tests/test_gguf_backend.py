@@ -63,7 +63,7 @@ def test_convert_to_gguf_splits_tensors_correctly(tmp_path):
     assert stats.quantized_count == 3
     assert stats.f32_kept_count == 2
     assert stats.fallback_f16_count == 1
-    assert stats.skipped_high_dim_count == 0
+    assert stats.high_dim_f32_count == 0
     assert out.is_file()
 
 
@@ -119,3 +119,44 @@ def test_stream_gguf_conversion_yields_progress_then_ok(tmp_path):
 def test_stream_gguf_conversion_reports_failure_for_bad_input():
     events = list(stream_gguf_conversion("/no/such/file.safetensors", "/tmp/out.gguf", "Q8_0"))
     assert events[-1][0] == "fail"
+
+
+def _write_wan_like_model(path: Path) -> None:
+    bf = torch.bfloat16
+    sd = {
+        # Conv3d patch embedding - 5D, which ggml's block quantizers can't handle.
+        "patch_embedding.weight": torch.randn(256, 16, 1, 2, 2, dtype=bf),
+        "text_embedding.2.weight": torch.randn(256, 256, dtype=bf),
+        "head.modulation": torch.randn(1, 2, 256, dtype=bf),
+        "blocks.0.self_attn.norm_q.weight": torch.randn(256, dtype=bf),
+        "blocks.0.self_attn.q.weight": torch.randn(256, 256, dtype=bf),
+        "blocks.0.ffn.0.weight": torch.randn(1024, 256, dtype=bf),
+    }
+    save_file(sd, str(path))
+
+
+def test_video_model_5d_tensor_is_kept_as_f32_not_dropped(tmp_path):
+    src = tmp_path / "wan.safetensors"
+    out = tmp_path / "wan-Q8_0.gguf"
+    _write_wan_like_model(src)
+
+    stats = convert_to_gguf(str(src), str(out), "Q8_0")
+
+    assert stats.arch == "wan"
+    assert stats.high_dim_f32_count == 1
+    reader = gguf.GGUFReader(str(out))
+    by_name = {t.name: t for t in reader.tensors}
+    assert "patch_embedding.weight" in by_name, "5D tensor must not be dropped - the file won't load without it"
+    assert by_name["patch_embedding.weight"].tensor_type == gguf.GGMLQuantizationType.F32
+    assert list(by_name["patch_embedding.weight"].shape) == [2, 2, 1, 16, 256]  # GGUF stores dims reversed
+    # Wan's arch-specific hiprec rule: .modulation stays F32; real blocks still quantize.
+    assert by_name["head.modulation"].tensor_type == gguf.GGMLQuantizationType.F32
+    assert by_name["blocks.0.self_attn.q.weight"].tensor_type == gguf.GGMLQuantizationType.Q8_0
+
+
+def test_unsupported_family_gets_a_specific_refusal(tmp_path):
+    src = tmp_path / "ltx-2-19b-dev.safetensors"
+    save_file({"transformer_blocks.0.attn1.to_q.weight": torch.randn(64, 64, dtype=torch.bfloat16)}, str(src))
+
+    with pytest.raises(GGUFBackendError, match="LTX Video 2.*no matching architecture"):
+        convert_to_gguf(str(src), str(tmp_path / "out.gguf"), "Q8_0")

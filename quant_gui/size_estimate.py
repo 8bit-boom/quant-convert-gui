@@ -287,7 +287,7 @@ def estimate_gguf(tensors: list[TensorHeader], quant_type: str, preset: str = "n
         elem_count = t.nbytes / dtype_size if dtype_size else 0
 
         if len(t.shape) > MAX_TENSOR_DIMS:
-            estimated_total += t.nbytes  # skipped, kept as-is in the estimate
+            estimated_total += int(elem_count * 4.0)  # >4D (Conv3d etc.) stored as unquantized F32
             kept += 1
             continue
 

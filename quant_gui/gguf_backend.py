@@ -212,7 +212,7 @@ class GGUFConvertStats:
     arch: str = ""
     quantized_count: int = 0
     f32_kept_count: int = 0
-    skipped_high_dim_count: int = 0
+    high_dim_f32_count: int = 0  # >4D (e.g. Conv3d patch embeddings), stored as unquantized F32
     fallback_f16_count: int = 0
 
 
@@ -243,8 +243,18 @@ def convert_to_gguf(
         key_set = set(keys)
         arch = detect_arch(key_set)
         if arch is None:
+            from .model_families import detect_family
+
+            fam = detect_family(Path(input_path).name)
+            hint = ""
+            if fam is not None:
+                hint = (
+                    f"This looks like {fam.label} ({fam.kind}), and ComfyUI-GGUF's loader has no matching "
+                    "architecture for it, so a GGUF file wouldn't load anywhere - use an INT8/FP8 "
+                    ".safetensors format instead. "
+                )
             raise GGUFBackendError(
-                "Unknown model architecture - GGUF export (via this app or ComfyUI-GGUF's own loader) only "
+                hint + "Unknown model architecture - GGUF export (via this app or ComfyUI-GGUF's own loader) only "
                 f"recognizes: {', '.join(SUPPORTED_ARCH_NAMES)}. If this is a diffusers-format checkpoint, "
                 "convert it to the reference/checkpoint key format first (e.g. ComfyUI's 'ModelSave' node)."
             )
@@ -275,12 +285,16 @@ def convert_to_gguf(
             n_dims = tensor.dim()
             n_params = tensor.numel()
 
-            if n_dims > MAX_TENSOR_DIMS:
-                stats.skipped_high_dim_count += 1
-                continue
+            # Video models (Wan, HunyuanVideo) carry 5D Conv3d patch_embedding
+            # weights, which ggml's block quantizers can't handle. ComfyUI-GGUF's
+            # own fix_5d_tensors.py stores them as plain unquantized F32 via the
+            # normal writer - which is all that's needed, so do it directly
+            # rather than dropping them (a file missing them won't load).
+            high_dim = n_dims > MAX_TENSOR_DIMS
 
             force_f32 = (
-                n_dims == 1
+                high_dim
+                or n_dims == 1
                 or n_params <= QUANTIZATION_THRESHOLD
                 or _matches_any(key, arch.keys_hiprec)
                 or _matches_any(key, exclude_kw)
@@ -289,7 +303,9 @@ def convert_to_gguf(
             )
 
             this_qtype = gguf.GGMLQuantizationType.F32 if force_f32 else qtype
-            if force_f32:
+            if high_dim:
+                stats.high_dim_f32_count += 1
+            elif force_f32:
                 stats.f32_kept_count += 1
             else:
                 stats.quantized_count += 1
