@@ -97,7 +97,7 @@ def test_merge_imatrix_command_line(tmp_path, monkeypatch):
     monkeypatch.setattr(lcpp, "_run_streamed", fake_run)
     out = list(lcpp.stream_merge_imatrix(tmp_path, [str(a), str(b)], str(tmp_path / "o" / "m.gguf")))
     assert out[-1] == "__OK__"
-    assert cmds[0] == ["/bin/llama-imatrix", "--in-file", str(a), "--in-file", str(b), "-o", str(tmp_path / "o" / "m.gguf")]
+    assert cmds[0] == [str(Path("/bin/llama-imatrix")), "--in-file", str(a), "--in-file", str(b), "-o", str(tmp_path / "o" / "m.gguf")]
     assert list(lcpp.stream_merge_imatrix(tmp_path, [str(a)], "x"))[-1].startswith("__FAIL__")
 
 
@@ -112,5 +112,5 @@ def test_quantize_passes_extra_args_before_files(tmp_path, monkeypatch):
     monkeypatch.setattr(lcpp, "_run_streamed", fake_run)
     list(lcpp.stream_quantize(tmp_path, "in.gguf", str(tmp_path / "o.gguf"), "Q4_K_M", imatrix_file="im.gguf",
                               extra_args=["--output-tensor-type", "Q6_K", "--tensor-type", "a=Q5_K"]))
-    assert cmds[0] == ["/bin/llama-quantize", "--imatrix", "im.gguf", "--output-tensor-type", "Q6_K", "--tensor-type", "a=Q5_K",
+    assert cmds[0] == [str(Path("/bin/llama-quantize")), "--imatrix", "im.gguf", "--output-tensor-type", "Q6_K", "--tensor-type", "a=Q5_K",
                        "in.gguf", str(tmp_path / "o.gguf"), "Q4_K_M"]
