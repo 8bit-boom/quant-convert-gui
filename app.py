@@ -2897,16 +2897,16 @@ with gr.Blocks(title="Quant Convert GUI") as demo:
                 "tensor names. The text encoder and VAE stay separate safetensors "
                 "(download buttons below). See [docs/KREA2.md](https://github.com/8bit-boom/quant-convert-gui/blob/main/docs/KREA2.md) for details."
             )
-            with gr.Row():
-                img_src = gr.File(label="Source safetensors (Comfy-Org BF16 single file, or HF diffusers shards merged)",
-                                  file_types=[".safetensors"], type="filepath")
             img_src_path = gr.Textbox(
-                label="Or: local file path (recommended for the 26 GB sources)",
+                label="Source: local file path (recommended - reads the file in place)",
                 placeholder="F:\\SD\\quant-convert-gui\\image_models\\krea2_turbo_bf16.safetensors",
                 info="Read directly from disk. The upload box copies the whole file first, and a copy of a "
-                     "multi-GB file can be cut short. Takes precedence when both are filled; the Downloads "
-                     "below save into image_models/.",
+                     "multi-GB file can be cut short. Takes precedence over the upload box below; the Downloads "
+                     "buttons further down save into image_models/.",
             )
+            with gr.Row():
+                img_src = gr.File(label="Or upload a copy (NOT for the 26 GB sources: it is copied to a temp folder first, and a cut-short copy fails)",
+                                  file_types=[".safetensors"], type="filepath")
             with gr.Row():
                 img_quant = gr.Dropdown(
                     choices=["q8_0", "q5_1", "q5_0", "q4_1", "q4_0", "q2_k", "q2_k_l", "q3_k_s", "q3_k_m", "q3_k_l",
