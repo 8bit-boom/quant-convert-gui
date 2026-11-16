@@ -243,3 +243,16 @@ def test_kquant_labels_of_one_family_are_the_same_bytes(tmp_path):
         k2g.convert(src, dst, q)
         outs.append(np.asarray(next(t for t in GGUFReader(str(dst)).tensors if t.name.endswith("wq.weight")).data).tobytes())
     assert outs[0] == outs[1] == outs[2]
+
+
+def test_truncated_source_is_reported_plainly_not_as_a_reshape_error(tmp_path):
+    src = tmp_path / "full.safetensors"
+    _write_safetensors(src, {"blocks.0.attn.wq.weight": (_to_bf16_storage(np.ones((64, 64), np.float32)), "BF16")})
+    cut = tmp_path / "cut.safetensors"
+    cut.write_bytes(src.read_bytes()[:-1000])            # an upload/download that stopped early
+
+    with pytest.raises(ValueError, match="incomplete.*missing"):
+        k2g.SafetensorsFile(cut)
+    # the CLI prints the message and exits 1 instead of a traceback
+    assert k2g.main(["--src", str(cut), "--dst", str(tmp_path / "o.gguf")]) == 1
+    assert k2g.SafetensorsFile(src).keys() == ["blocks.0.attn.wq.weight"]      # a complete file is fine

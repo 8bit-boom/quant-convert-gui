@@ -2900,6 +2900,13 @@ with gr.Blocks(title="Quant Convert GUI") as demo:
             with gr.Row():
                 img_src = gr.File(label="Source safetensors (Comfy-Org BF16 single file, or HF diffusers shards merged)",
                                   file_types=[".safetensors"], type="filepath")
+            img_src_path = gr.Textbox(
+                label="Or: local file path (recommended for the 26 GB sources)",
+                placeholder="F:\\SD\\quant-convert-gui\\image_models\\krea2_turbo_bf16.safetensors",
+                info="Read directly from disk. The upload box copies the whole file first, and a copy of a "
+                     "multi-GB file can be cut short. Takes precedence when both are filled; the Downloads "
+                     "below save into image_models/.",
+            )
             with gr.Row():
                 img_quant = gr.Dropdown(
                     choices=["q8_0", "q5_1", "q5_0", "q4_1", "q4_0", "q2_k", "q2_k_l", "q3_k_s", "q3_k_m", "q3_k_l",
@@ -3776,9 +3783,13 @@ with gr.Blocks(title="Quant Convert GUI") as demo:
         else:
             yield f"Done.\n`{state['path']}`"
 
-    def run_img_convert(src, quant, dst_name):
+    def run_img_convert(src, local_path, quant, dst_name):
+        src = (local_path or "").strip().strip('"') or src
         if not src:
-            yield "Pick a source safetensors first (or download one below)."
+            yield "Pick a source safetensors first (or give a local path, or download one below)."
+            return
+        if not Path(src).is_file():
+            yield f"File not found: {src}"
             return
         dst = OUTPUT_DIR / (dst_name or "krea2_q8_0.gguf")
         dst.parent.mkdir(parents=True, exist_ok=True)
@@ -3812,7 +3823,7 @@ with gr.Blocks(title="Quant Convert GUI") as demo:
     img_dl_te_btn.click(dl_te, outputs=[img_dl_log])
     img_dl_vae_btn.click(dl_vae, outputs=[img_dl_log])
     img_convert_btn.click(run_img_convert,
-                          inputs=[img_src, img_quant, img_dst_name],
+                          inputs=[img_src, img_src_path, img_quant, img_dst_name],
                           outputs=[img_convert_log])
 
     def run_llamacpp_clone():

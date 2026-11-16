@@ -94,8 +94,22 @@ class SafetensorsFile:
         with open(self.path, "rb") as f:
             (header_len,) = np.frombuffer(f.read(8), dtype=np.uint64)
             self.header = json.loads(f.read(int(header_len)))
-        self._data = np.memmap(self.path, dtype=np.uint8, mode="r")
         self.metadata = self.header.get("__metadata__", {})
+        # A file shorter than its own header claims is truncated (interrupted download, or an upload
+        # copy cut short). numpy would silently hand back short slices and fail later with a
+        # confusing reshape error, so say it plainly up front.
+        want = 8 + int(header_len) + max(
+            (v["data_offsets"][1] for k, v in self.header.items() if k != "__metadata__"), default=0)
+        have = self.path.stat().st_size
+        if have < want:
+            raise ValueError(
+                f"{self.path.name} is incomplete: it is {have:,} bytes but its header says {want:,} "
+                f"({(want - have) / 1e6:.1f} MB missing). The download was interrupted or the file was "
+                "copied/uploaded only partway - download it again (the Downloads buttons on the "
+                "Image → GGUF tab save to image_models/) and point the converter at that file with "
+                "'Local file path' rather than uploading it."
+            )
+        self._data = np.memmap(self.path, dtype=np.uint8, mode="r")
 
     def keys(self) -> list[str]:
         return [k for k in self.header if k != "__metadata__"]
@@ -315,8 +329,12 @@ def main(argv: list[str] | None = None) -> int:
         print(f"not found: {args.src}", file=sys.stderr)
         return 1
     args.dst.parent.mkdir(parents=True, exist_ok=True)
-    convert(args.src, args.dst, None if args.quant == "bf16" else args.quant,
-            arch=args.arch, verbose=args.verbose)
+    try:
+        convert(args.src, args.dst, None if args.quant == "bf16" else args.quant,
+                arch=args.arch, verbose=args.verbose)
+    except ValueError as exc:       # incomplete source, unsupported dtype: a message, not a traceback
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
     return 0
 
 
