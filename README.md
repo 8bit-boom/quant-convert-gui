@@ -358,6 +358,31 @@ this app's), and shells out to its actual tools:
   shared FFN, IQ-quantized experts). Target-size presets
   (~3/~4/~5 bpw families) compute the budget from parameter count;
   "Custom" takes a GB figure.
+- **Mixed recipes + fit to a size** (accordion under step 5): three fixed
+  recipes - Mixed 4-bit / 3-bit / 2-bit - that hand `llama-quantize` a base
+  type plus ordered `--tensor-type REGEX=TYPE` rules, `--output-tensor-type`
+  and `--token-embedding-type` (embedding/output, attention k/v/output,
+  ffn_down and the first/last layers get more bits, middle-layer
+  ffn_up/gate fewest). **Preview sizes** estimates each recipe's file size
+  from the GGUF header alone (no weights, no llama.cpp). **Fit to a size**
+  (experimental) starts every tensor at Q2_K and upgrades them in order of
+  importance-per-extra-byte, using the per-tensor statistics in a
+  GGUF-format imatrix, until your target GB is used; with no usable matrix
+  it falls back to the biggest recipe that fits and says so. These are
+  *our own recipes*, not Unsloth's UD quants (their per-layer recipe is
+  unpublished) - use the validate/perplexity step to see whether one
+  actually beats a plain size. The input must be the F16/BF16/F32 GGUF.
+- **Merge importance matrices / Unsloth's published matrix** (accordion
+  under step 5): `llama-imatrix --in-file a --in-file b` combines matrices
+  (statistics are *added*, so a matrix measured on more text outweighs a
+  smaller one). "Look up published matrix" finds `imatrix_unsloth.*` in
+  `unsloth/<model>-GGUF` on the Hugging Face Hub (derived the way
+  Unsloth's own code does it), shows its size, and downloads it once into
+  `imatrix_downloads/`. It describes the *unmodified base model*.
+- **Diffusion GGUFs (Krea 2 / Kroma etc.) have no imatrix**: `llama-imatrix`
+  runs language models, and nothing in this app or sd.cpp measures one for
+  an image model. The per-layer choices there are the arch-specific
+  high-precision rules in the GGUF export, not importance-weighted.
 - **"Auto (sweep → tune → validate)"** chains the whole tuning pipeline in
   one click: sweep the family, per-tensor-tune the winner, then compare
   perplexity of the tuned file vs a plain baseline quant on a held-out
@@ -642,6 +667,10 @@ default where applicable and neither changes the output:
 - `quant_gui/smart_quant.py` — imatrix loading (legacy + GGUF formats),
   per-tensor sensitivity scoring, and size-budget assignment for the
   Dynamic-style tuner on the LLM tab.
+- `quant_gui/mixed_quant.py` / `quant_gui/gguf_header.py` - the mixed
+  recipes, size estimate and fit-to-a-size, plus the stdlib GGUF header
+  reader they use (both ported from the owner's `8bit-boom/Llm-training`).
+- `quant_gui/imatrix_hub.py` - Unsloth's published-matrix lookup/download.
 - `quant_gui/gguf_inspect.py` — read-only GGUF inspection for the
   Inspector tab (header metadata + type histogram, no tensor loading).
 - `quant_gui/gguf_edit.py` — the GGUF metadata/tensor editor behind the
@@ -719,6 +748,13 @@ none of the three go through `ctq`:
   implementation) — `quant_gui/llamacpp_backend.py` clones and shells out
   to all of these directly, the same way the rest of this app shells out
   to `ctq`, rather than reimplementing any of it.
+- [8bit-boom/Llm-training](https://github.com/8bit-boom/Llm-training) - the
+  owner's own project; its `worker/ndforge_worker/mixedquant.py`,
+  `ggufinfo.py` and `imatrixmerge.py` are the source of the mixed recipes,
+  size estimate, fit-to-a-size and published-matrix lookup (stdlib ports).
+  Its own docs say those were built against stand-in tools and never run
+  with a real llama.cpp; the same is true here (see the tests, which use
+  header-only GGUFs, a fake Hub server and fake llama.cpp binaries).
 - [Unsloth's Dynamic 2.0/3.0 GGUF docs](https://unsloth.ai/docs/basics/dynamic-3.0-ggufs) -
   read via web search (unsloth.ai itself was network-blocked in the
   environment this was built in) to understand what their technique

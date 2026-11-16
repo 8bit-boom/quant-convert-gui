@@ -27,6 +27,9 @@ from quant_gui.hf import HFUrlError, download as hf_download, download_repo as h
 from quant_gui.loop_timing import LoopPhaseTimer
 from quant_gui import llamacpp_backend as lcpp
 from quant_gui import sharded
+from quant_gui import mixed_quant as mq
+from quant_gui import imatrix_hub
+from quant_gui import gguf_header
 from quant_gui import gguf_bench as gb
 from quant_gui.gguf_backend import stream_gguf_conversion, stream_install as stream_gguf_install
 from quant_gui.gguf_backend import QUANT_TYPE_CHOICES as GGUF_QUANT_TYPE_CHOICES
@@ -954,6 +957,178 @@ def run_llm_quantize(input_gguf: str, output_name: str, quant_type: str, imatrix
         else:
             log += line
             yield log, result_path
+
+
+MIXED_RECIPE_CHOICES = [(f"{p['label']}  -  {p['summary']}", p["id"]) for p in mq.PRESETS] + [
+    (f"{mq.FIT_LABEL}  -  needs a GGUF-format importance matrix and a target size", mq.FIT_ID)]
+IMATRIX_DOWNLOAD_DIR = APP_DIR / "imatrix_downloads"
+
+
+def _resolve_llm_input(input_gguf: str) -> tuple[str, str]:
+    """(path, note) - the typed path, else the newest model GGUF in the output folder."""
+    input_gguf = (input_gguf or "").strip()
+    if input_gguf:
+        return input_gguf, ""
+    detected = newest_model_gguf()
+    return (detected, f"(auto-detected newest model GGUF: {detected})\n") if detected else ("", "")
+
+
+def run_llm_mixed_preview(input_gguf: str, imatrix_file: str, target_gb):
+    """Sizes of every mixed recipe for this model, read from the GGUF header only (no weights, no llama.cpp)."""
+    path, _ = _resolve_llm_input(input_gguf)
+    if not path or not Path(path).is_file():
+        return "Give an Input GGUF first (any size of the model: only its tensor names and shapes are read)."
+    try:
+        model = mq.describe_model(path)
+    except (OSError, ValueError) as exc:
+        return f"Could not read {path} as a GGUF file: {exc}"
+    plans = [mq.preset_plan(p["id"], model) for p in mq.PRESETS]
+    params = sum(gguf_header.numel(t) for t in model["info"]["tensors"])
+    out = [f"**{Path(path).name}** - architecture `{model['arch']}`, {model['n_layer']} layers, {params / 1e9:.2f} B parameters", "",
+           "| Recipe | Estimated size | Bits/weight |", "|---|---|---|"]
+    for pl in plans:
+        e = pl["estimate"]
+        out.append(f"| {pl['label']} | {e['gb']:.2f} GB | {e['bpw']} |")
+    out += ["", "Plain sizes for comparison (Llama-3.1-8B figures from llama.cpp's table; other models differ): "
+            + ", ".join(f"{k} {v:.2f}" for k, v in mq.PLAIN_BPW.items()) + " bits/weight."]
+    for pl in plans:
+        for note in pl["notes"]:
+            out.append(f"- {pl['label']}: {note}")
+    try:
+        t = float(target_gb or 0)
+    except (TypeError, ValueError):
+        t = 0.0
+    if t > 0:
+        try:
+            if not (imatrix_file or "").strip():
+                raise mq.FitError("Give an importance matrix (GGUF format) - the fit needs its per-tensor statistics.")
+            res = mq.fit(model["info"], int(t * 1e9), mq.read_importance(imatrix_file.strip()))
+            out += ["", f"**Fit to {t:.2f} GB (experimental):** {res['gb']:.2f} GB, {res['bpw']} bits/weight, {len(res['rules'])} rules"
+                    + ("" if res["fits"] else " - NOT reachable: even the lowest types are bigger") ]
+            out += [f"- {n}" for n in res["notes"]]
+        except mq.FitError as exc:
+            out += ["", f"**Fit to a size:** {exc}"]
+    out += ["", "_These are our own recipes, not Unsloth's UD quants (their per-layer recipe is unpublished). Estimates are from the "
+            "tensor shapes; tensors no rule names follow the base type's own mixture, so those are approximate. "
+            "Whether a recipe beats a plain size is measured with the validate/perplexity step, not assumed._"]
+    return "\n".join(out)
+
+
+def run_llm_mixed_quantize(input_gguf: str, recipe: str, target_gb, imatrix_file: str, output_name: str):
+    path, auto_note = _resolve_llm_input(input_gguf)
+    if not path or not Path(path).is_file():
+        yield "No input GGUF given and none auto-detected - convert in step 3 first, or paste a .gguf path.", None
+        return
+    if not lcpp.is_quantize_built(LLAMACPP_DIR):
+        yield "llama-quantize isn't built yet - see the Setup section above.", None
+        return
+    try:
+        info = gguf_header.read(path)
+    except (OSError, ValueError) as exc:
+        yield f"Could not read {path} as a GGUF file: {exc}", None
+        return
+    if gguf_header.is_full_precision(info) is False:
+        yield ("The input is already quantized. Mixed recipes need the F16/BF16 (or F32) GGUF from step 3 - "
+               "re-quantizing a quantized file stacks the errors."), None
+        return
+    imatrix_file = (imatrix_file or "").strip()
+    if not imatrix_file:
+        imatrix_file = newest_imatrix() or ""
+        if imatrix_file:
+            auto_note += f"(auto-detected imatrix: {imatrix_file})\n"
+    try:
+        plan = mq.for_export(recipe, path, {"target_gb": target_gb}, imatrix_file or None)
+    except KeyError:
+        yield f"Unknown recipe {recipe!r}.", None
+        return
+    except (OSError, ValueError) as exc:
+        yield f"Could not read {path}: {exc}", None
+        return
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    name = (output_name or "").strip()
+    out_id = plan.get("fell_back_to") or plan["id"]
+    out_path = (str(OUTPUT_DIR / name) if name and not os.path.isabs(name) and os.sep not in name else name) or str(
+        OUTPUT_DIR / f"{Path(path).stem}-{out_id}.gguf")
+    est = plan["estimate"]
+    log = (f"Quantizing {path} -> {plan['label']} ({mq.LABEL})\n{auto_note}  output: {out_path}\n"
+           f"  base type: {plan['base']}, {len(plan['rules'])} --tensor-type rules\n"
+           f"  estimated size: {est['gb']:.2f} GB ({est['bpw']} bits/weight)\n")
+    if imatrix_file:
+        log += f"  imatrix: {imatrix_file}\n"
+    for note in plan["notes"]:
+        log += f"  note: {note}\n"
+    log += "\n"
+    yield log, None
+    result_path = None
+    for line in lcpp.stream_quantize(
+        LLAMACPP_DIR, path, out_path, plan["base"], imatrix_file=imatrix_file or None, extra_args=plan["flags"],
+    ):
+        if line == "__OK__":
+            result_path = out_path if Path(out_path).is_file() else None
+            size = Path(out_path).stat().st_size / 1e9 if result_path else 0.0
+            log += f"\n✅ Done. Output: {result_path or out_path} ({size:.2f} GB, estimate was {est['gb']:.2f} GB)\n"
+            yield log, result_path
+        elif line.startswith("__FAIL__"):
+            log += "\n❌ Quantization failed (see log above). If llama-quantize rejected --tensor-type, update llama.cpp.\n"
+            yield log, None
+        else:
+            log += line
+            yield log, result_path
+
+
+def run_llm_published_lookup(base_model: str):
+    base = (base_model or "").strip()
+    if not base:
+        return "Enter the base model's Hugging Face id (e.g. google/gemma-3-4b-it)."
+    try:
+        info = imatrix_hub.lookup(base, IMATRIX_DOWNLOAD_DIR)
+    except imatrix_hub.HubError as exc:
+        return f"❌ {exc}"
+    size = f"{info['size'] / 1e6:.0f} MB" if info["size"] else "size unknown"
+    return (f"Found `{info['file']}` in [{info['repo']}]({info['page']}) ({size})"
+            + (" - already downloaded." if info["cached"] else ". It is downloaded once into the app's imatrix_downloads folder.")
+            + "\n\nIt describes the **unmodified base model**: good for the base or a light fine-tune, less so for a heavily changed model.")
+
+
+def run_llm_merge_imatrix(paths_text: str, base_model: str, include_published: bool, output_name: str):
+    files = [ln.strip().strip('"') for ln in (paths_text or "").replace(",", "\n").splitlines() if ln.strip()]
+    log = ""
+    if include_published:
+        base = (base_model or "").strip()
+        log += f"Looking up Unsloth's published matrix for {base or '(no model given)'} ...\n"
+        yield log, None
+        try:
+            info = imatrix_hub.lookup(base, IMATRIX_DOWNLOAD_DIR)
+            if not info["cached"]:
+                log += f"Downloading {info['repo']}/{info['file']} ...\n"
+                yield log, None
+            files.append(str(imatrix_hub.download(info)))
+            log += f"Published matrix: {files[-1]}\n"
+        except imatrix_hub.HubError as exc:
+            yield log + f"\n❌ {exc}\n", None
+            return
+    if len(files) < 2:
+        yield log + "Give at least two matrices (one per line), or one plus the published matrix.", None
+        return
+    if not lcpp.is_imatrix_built(LLAMACPP_DIR):
+        yield log + "llama-imatrix isn't built yet - see the Setup section above.", None
+        return
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    name = (output_name or "").strip() or "imatrix-merged.gguf"
+    out_path = str(OUTPUT_DIR / name) if not os.path.isabs(name) and os.sep not in name else name
+    log += (f"Merging {len(files)} matrices -> {out_path}\n"
+            "  llama.cpp ADDS the statistics: a matrix measured on more text outweighs a smaller one, so a large "
+            "published matrix can drown a small one of your own.\n\n")
+    yield log, None
+    for line in lcpp.stream_merge_imatrix(LLAMACPP_DIR, files, out_path):
+        if line == "__OK__":
+            ok = out_path if Path(out_path).is_file() else None
+            yield log + f"\n✅ Merged matrix: {ok or out_path}\n", ok
+        elif line.startswith("__FAIL__"):
+            yield log + "\n❌ Merge failed (see log above).\n", None
+        else:
+            log += line
+            yield log, None
 
 
 def run_llm_find_best(input_gguf: str, imatrix_file: str, target_bpw: str = "", quants: list[str] | None = None):
@@ -2473,6 +2648,40 @@ with gr.Blocks(title="Quant Convert GUI") as demo:
                     "here to quantize with it directly.",
                 )
             llm_quantize_output_name = gr.Textbox(label="Output filename (optional)", placeholder="auto")
+            with gr.Accordion("Mixed recipes + fit to a size (our own presets, experimental)", open=False):
+                gr.Markdown(
+                    "Instead of one type for the whole model, `llama-quantize` gets a base type plus ordered "
+                    "`--tensor-type` rules: the embedding/output tensors, attention k/v/output, ffn_down and the "
+                    "first/last layers get more bits; ffn_up/gate of the middle layers get the fewest. "
+                    "**These are our own recipes, not Unsloth's UD quants** (their per-layer recipe is not "
+                    "published). *Fit to a size* upgrades tensors in order of importance-per-byte from your "
+                    "GGUF-format imatrix until a size budget is used - a heuristic, not a measurement. "
+                    "Use **Validate** below to see whether a recipe actually beats a plain size.\n\n"
+                    "Ported from the Llm-training repo's recipe code; not run against a real llama.cpp from here."
+                )
+                llm_mixed_recipe = gr.Dropdown(MIXED_RECIPE_CHOICES, value=mq.PRESETS[0]["id"], label="Recipe")
+                llm_mixed_target = gr.Number(label="Target size in GB (used by Preview and by the fit recipe)", value=0, minimum=0)
+                with gr.Row():
+                    llm_mixed_preview_btn = gr.Button("Preview sizes")
+                    llm_mixed_btn = gr.Button("Quantize with recipe", variant="primary")
+                llm_mixed_preview = gr.Markdown()
+            with gr.Accordion("Merge importance matrices / use Unsloth's published matrix", open=False):
+                gr.Markdown(
+                    "Combine matrices with `llama-imatrix --in-file a --in-file b` (statistics are **added**, so "
+                    "more text weighs more). Unsloth publishes a matrix for many base models "
+                    "(`unsloth/<model>-GGUF`); it describes the unmodified base model. The download needs the "
+                    "internet and is cached once. Result is used like any imatrix in step 5."
+                )
+                llm_merge_paths = gr.Textbox(label="Matrix files (one path per line)", lines=3,
+                                             placeholder="/path/to/imatrix-a.gguf\n/path/to/imatrix-b.gguf")
+                with gr.Row():
+                    llm_merge_base = gr.Textbox(label="Base model id (for the published matrix)", placeholder="google/gemma-3-4b-it")
+                    llm_merge_published = gr.Checkbox(label="Also include Unsloth's published matrix", value=False)
+                llm_merge_name = gr.Textbox(label="Output filename (optional)", placeholder="imatrix-merged.gguf")
+                with gr.Row():
+                    llm_merge_lookup_btn = gr.Button("Look up published matrix")
+                    llm_merge_btn = gr.Button("Merge")
+                llm_merge_info = gr.Markdown()
             llm_target_bpw = gr.Radio(
                 list(gb.BPP_FAMILY_CANDIDATES.keys()), value=gb.DEFAULT_BPP_TARGET,
                 label="Target size",
@@ -3571,6 +3780,20 @@ with gr.Blocks(title="Quant Convert GUI") as demo:
         ],
         outputs=[llm_log, llm_result_file],
     )
+    llm_mixed_preview_btn.click(
+        run_llm_mixed_preview, inputs=[llm_quantize_input, llm_quantize_imatrix, llm_mixed_target], outputs=[llm_mixed_preview],
+    )
+    llm_mixed_btn.click(
+        run_llm_mixed_quantize,
+        inputs=[llm_quantize_input, llm_mixed_recipe, llm_mixed_target, llm_quantize_imatrix, llm_quantize_output_name],
+        outputs=[llm_log, llm_result_file],
+    )
+    llm_merge_lookup_btn.click(run_llm_published_lookup, inputs=[llm_merge_base], outputs=[llm_merge_info])
+    llm_merge_btn.click(
+        run_llm_merge_imatrix,
+        inputs=[llm_merge_paths, llm_merge_base, llm_merge_published, llm_merge_name],
+        outputs=[llm_log, llm_result_file],
+    ).then(carry_over_result, inputs=[llm_result_file], outputs=[llm_quantize_imatrix])
     llm_find_best_btn.click(
         run_llm_find_best,
         inputs=[llm_quantize_input, llm_quantize_imatrix, llm_target_bpw],

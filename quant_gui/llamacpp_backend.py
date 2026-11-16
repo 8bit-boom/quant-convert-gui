@@ -594,7 +594,11 @@ def stream_generate_imatrix(
 def stream_quantize(
     llamacpp_dir: Path, input_gguf: str, output_gguf: str, quant_type: str,
     imatrix_file: str | None = None, tensor_type_file: str | None = None,
+    extra_args: list[str] | None = None,
 ):
+    """`extra_args` are raw llama-quantize options placed before the file names
+    (the mixed recipes pass --output-tensor-type / --token-embedding-type /
+    repeated --tensor-type REGEX=TYPE)."""
     binary = _quantize_binary(llamacpp_dir)
     if binary is None:
         yield "llama-quantize isn't built yet.\n"
@@ -611,7 +615,39 @@ def stream_quantize(
         cmd += ["--imatrix", imatrix_file.strip()]
     if (tensor_type_file or "").strip():
         cmd += ["--tensor-type-file", tensor_type_file.strip()]
+    cmd += list(extra_args or [])
     cmd += [input_gguf, output_gguf, quant_type]
+    r = _ProcResult()
+    yield from _run_streamed(cmd, result=r)
+    yield "__OK__" if r.returncode == 0 else f"__FAIL__:{r.returncode}"
+
+
+def stream_merge_imatrix(llamacpp_dir: Path, inputs: list[str], output_imatrix: str):
+    """Combines precomputed importance matrices with
+    `llama-imatrix --in-file a --in-file b -o out` (no model, no text: llama.cpp
+    adds the per-tensor statistics, so a matrix measured on more text outweighs
+    a smaller one). Needs llama-imatrix built; never run against a real build
+    from this repo's tests (command line only)."""
+    binary = _imatrix_binary(llamacpp_dir)
+    if binary is None:
+        yield "llama-imatrix isn't built yet.\n"
+        yield "__FAIL__:1"
+        return
+    files = [str(f).strip() for f in inputs if str(f).strip()]
+    if len(files) < 2:
+        yield "Choose at least two importance matrices to merge.\n"
+        yield "__FAIL__:1"
+        return
+    for f in files:
+        if not Path(f).is_file():
+            yield f"Matrix not found: {f}\n"
+            yield "__FAIL__:1"
+            return
+    Path(output_imatrix).parent.mkdir(parents=True, exist_ok=True)
+    cmd = [str(binary)]
+    for f in files:
+        cmd += ["--in-file", f]
+    cmd += ["-o", output_imatrix]
     r = _ProcResult()
     yield from _run_streamed(cmd, result=r)
     yield "__OK__" if r.returncode == 0 else f"__FAIL__:{r.returncode}"
