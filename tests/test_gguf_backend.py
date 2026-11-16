@@ -210,3 +210,61 @@ def test_incomplete_shard_set_fails_with_the_missing_names(tmp_path):
 
     events = list(stream_gguf_conversion(str(index), str(tmp_path / "o.gguf"), "Q8_0"))
     assert events[-1][0] == "fail" and "model-00003-of-00003" in events[-1][1]
+
+
+def _write_kquant_model(path: Path) -> None:
+    sd = {
+        "cap_embedder.1.weight": torch.randn(1024, 2048, dtype=torch.bfloat16) * 0.02,
+        "context_refiner.0.attention.qkv.weight": torch.randn(3072, 1024, dtype=torch.bfloat16) * 0.02,
+        "blocks.0.attn.wq.weight": torch.randn(1024, 1024, dtype=torch.bfloat16) * 0.02,
+        "blocks.0.norm.weight": torch.randn(1024, dtype=torch.bfloat16),            # 1D -> F32
+        "blocks.0.tiny.weight": torch.randn(4, 4, dtype=torch.bfloat16),            # small -> F32
+        "blocks.0.legacy.weight": torch.randn(64, 800, dtype=torch.bfloat16) * 0.02,   # %32 but not %256
+        "blocks.0.oddshape.weight": torch.randn(64, 50, dtype=torch.bfloat16),      # not %32 -> F16
+    }
+    save_file(sd, str(path))
+
+
+@pytest.mark.parametrize("label,ktype,legacy", [
+    ("Q4_K_M", "Q4_K", "Q5_0"), ("Q5_K_S", "Q5_K", "Q5_1"), ("Q6_K", "Q6_K", "Q8_0"),
+    ("Q3_K_L", "Q3_K", "Q4_0"), ("Q2_K", "Q2_K", "Q4_0"),
+])
+def test_kquant_conversion_types_stats_and_fallbacks(tmp_path, label, ktype, legacy):
+    src = tmp_path / "model.safetensors"
+    out = tmp_path / f"model-{label}.gguf"
+    _write_kquant_model(src)
+
+    stats = convert_to_gguf(str(src), str(out), label)
+
+    assert stats.arch == "lumina2"
+    assert stats.quantized_count == 3
+    assert stats.f32_kept_count == 2
+    assert stats.fallback_legacy_count == 1
+    assert stats.fallback_f16_count == 1
+    by_name = {t.name: t for t in gguf.GGUFReader(str(out)).tensors}
+    K = gguf.GGMLQuantizationType[ktype]
+    for name in ("cap_embedder.1.weight", "context_refiner.0.attention.qkv.weight", "blocks.0.attn.wq.weight"):
+        assert by_name[name].tensor_type == K
+    assert by_name["blocks.0.legacy.weight"].tensor_type == gguf.GGMLQuantizationType[legacy]
+    assert by_name["blocks.0.oddshape.weight"].tensor_type == gguf.GGMLQuantizationType.F16
+    assert by_name["blocks.0.norm.weight"].tensor_type == gguf.GGMLQuantizationType.F32
+    # logical shape, not the packed byte shape
+    assert list(by_name["blocks.0.attn.wq.weight"].shape) == [1024, 1024]
+
+
+def test_kquant_suffixes_of_one_family_are_identical_and_decodable(tmp_path):
+    from gguf import quants
+
+    src = tmp_path / "model.safetensors"
+    _write_kquant_model(src)
+    convert_to_gguf(str(src), str(tmp_path / "s.gguf"), "Q4_K_S")
+    convert_to_gguf(str(src), str(tmp_path / "m.gguf"), "Q4_K_M")
+    assert _gguf_contents(tmp_path / "s.gguf") == _gguf_contents(tmp_path / "m.gguf")
+
+    from safetensors import safe_open
+    with safe_open(str(src), framework="pt") as f:
+        ref = f.get_tensor("blocks.0.attn.wq.weight").to(torch.float32).numpy()
+    t = next(t for t in gguf.GGUFReader(str(tmp_path / "m.gguf")).tensors if t.name == "blocks.0.attn.wq.weight")
+    got = quants.dequantize(t.data, t.tensor_type).reshape(ref.shape)
+    rel = float(((got - ref) ** 2).mean() ** 0.5 / (ref ** 2).mean() ** 0.5)
+    assert rel < 0.1

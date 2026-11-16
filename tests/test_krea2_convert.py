@@ -172,3 +172,72 @@ def test_bf16_round_trip_lossless():
     # truncation drops the low 16 bits exactly
     np.testing.assert_array_equal(back.view(np.uint32) & 0xFFFF0000,
                                   f32.view(np.uint32) & 0xFFFF0000)
+
+
+# ---------------------------------------------------------------------------
+# K-quants (written by quant_gui/kquants.py, not gguf-py)
+# ---------------------------------------------------------------------------
+
+def test_pick_qtype_kquants_and_fallbacks():
+    pq = k2g.pick_qtype
+    assert pq("blocks.0.attn.wq.weight", (6144, 6144), "BF16", "q4_k_m") == QT.Q4_K
+    assert pq("blocks.0.attn.wq.weight", (6144, 6144), "BF16", "q4_k_s") == QT.Q4_K      # same type, label only
+    assert pq("blocks.0.attn.wq.weight", (6144, 6144), "BF16", "q3_k_l") == QT.Q3_K
+    assert pq("blocks.0.attn.wq.weight", (6144, 6144), "BF16", "q2_k") == QT.Q2_K
+    assert pq("blocks.0.attn.wq.weight", (6144, 6144), "BF16", "q6_k") == QT.Q6_K
+    # row length fits the 32-blocks only -> llama.cpp's legacy fallback
+    assert pq("blocks.0.attn.wq.weight", (6144, 800), "BF16", "q4_k_m") == QT.Q5_0
+    assert pq("blocks.0.attn.wq.weight", (6144, 800), "BF16", "q5_k_m") == QT.Q5_1
+    assert pq("blocks.0.attn.wq.weight", (6144, 800), "BF16", "q6_k") == QT.Q8_0
+    assert pq("blocks.0.attn.wq.weight", (6144, 800), "BF16", "q2_k") == QT.Q4_0
+    # not even a multiple of 32 -> BF16, never a K type
+    assert pq("blocks.0.attn.wq.weight", (6144, 100), "BF16", "q4_k_m") == QT.BF16
+    # the precision rules still win over the quant
+    assert pq("first.weight", (6144, 6144), "BF16", "q4_k_m") == QT.F32
+    assert pq("blocks.0.prenorm.scale", (6144,), "BF16", "q4_k_m") == QT.F32
+
+
+@pytest.mark.parametrize("quant,want", [("q4_k_m", QT.Q4_K), ("q4_k_s", QT.Q4_K), ("q5_k_m", QT.Q5_K),
+                                        ("q6_k", QT.Q6_K), ("q3_k_s", QT.Q3_K), ("q2_k", QT.Q2_K)])
+def test_convert_end_to_end_kquant(tmp_path, quant, want):
+    rng = np.random.default_rng(11)
+    w = (rng.standard_normal((256, 512)) * 0.02).astype(np.float32)
+    odd = (rng.standard_normal((64, 800)) * 0.02).astype(np.float32)
+    src = tmp_path / "krea2_tiny.safetensors"
+    _write_safetensors(src, {
+        "blocks.0.attn.wq.weight": (_to_bf16_storage(w), "BF16"),
+        "blocks.0.mlp.odd.weight": (_to_bf16_storage(odd), "BF16"),
+        "blocks.0.prenorm.scale": (np.ones(256, dtype=np.float32), "F32"),
+        "first.weight": (rng.standard_normal((256, 64)).astype(np.float32), "F32"),
+    })
+    dst = tmp_path / f"{quant}.gguf"
+    k2g.convert(src, dst, quant)
+
+    r = GGUFReader(str(dst))
+    by_name = {t.name: t for t in r.tensors}
+    assert by_name["blocks.0.attn.wq.weight"].tensor_type == want
+    assert by_name["blocks.0.mlp.odd.weight"].tensor_type == {
+        QT.Q4_K: QT.Q5_0, QT.Q5_K: QT.Q5_1, QT.Q6_K: QT.Q8_0, QT.Q3_K: QT.Q4_0, QT.Q2_K: QT.Q4_0}[want]
+    assert by_name["blocks.0.prenorm.scale"].tensor_type == QT.F32
+    assert by_name["first.weight"].tensor_type == QT.F32
+    # the shape the loader sees is the logical (rows, cols), not the packed byte shape
+    assert list(by_name["blocks.0.attn.wq.weight"].shape) == [512, 256]
+
+    from gguf import quants
+    ref = (_to_bf16_storage(w).astype(np.uint32) << 16).view(np.float32)       # what the converter saw
+    got = quants.dequantize(np.asarray(by_name["blocks.0.attn.wq.weight"].data), want).reshape(ref.shape)
+    rel = float(np.sqrt(((got - ref) ** 2).mean()) / np.sqrt((ref ** 2).mean()))
+    assert rel < {QT.Q2_K: 0.4, QT.Q3_K: 0.2, QT.Q4_K: 0.1, QT.Q5_K: 0.05, QT.Q6_K: 0.03}[want]
+
+
+def test_kquant_labels_of_one_family_are_the_same_bytes(tmp_path):
+    rng = np.random.default_rng(2)
+    w = (rng.standard_normal((256, 512)) * 0.02).astype(np.float32)
+    src = tmp_path / "t.safetensors"
+    _write_safetensors(src, {"blocks.0.attn.wq.weight": (_to_bf16_storage(w), "BF16")})
+    outs = []
+    for q in ("q4_k_s", "q4_k_m"):
+        dst = tmp_path / f"{q}.gguf"
+        k2g.convert(src, dst, q)
+        outs.append(np.asarray(next(t for t in GGUFReader(str(dst)).tensors if t.name.endswith("wq.weight")).data).tobytes())
+    assert outs[0] == outs[1]

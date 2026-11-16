@@ -73,3 +73,40 @@ def test_stop_saves_checkpoint_and_resume_completes_identically(tmp_path):
 
     # Same tensors in, same writer settings -> byte-identical GGUF file.
     assert out_resumed.read_bytes() == out_fresh.read_bytes()
+
+
+def test_kquant_stop_and_resume_is_byte_identical(tmp_path):
+    """K-quant packed blocks (and the legacy-fallback kind) survive the checkpoint shards."""
+    src = tmp_path / "model.safetensors"
+    save_file({
+        "cap_embedder.1.weight": torch.randn(512, 1024) * 0.02,                      # lumina2 detection keys
+        "context_refiner.0.attention.qkv.weight": torch.randn(768, 512) * 0.02,
+        "blocks.0.attn.wq.weight": torch.randn(512, 512) * 0.02,
+        "blocks.0.legacy.weight": torch.randn(64, 800) * 0.02,                       # %32 but not %256 -> Q5_0
+        "blocks.0.norm.weight": torch.randn(512),
+    }, str(src))
+    out_resumed = tmp_path / "resumed.gguf"
+
+    control = RunControl()
+    checkpoint = ckpt.create_checkpoint(
+        tmp_path / "checkpoints", "gguf",
+        params={"input_path": str(src)}, output_path=str(out_resumed), total=0,
+    )
+
+    def cancel_midway(current, total, key):
+        if current == 3:
+            control.cancel()
+
+    with pytest.raises(RunCancelled):
+        convert_to_gguf(str(src), str(out_resumed), "Q4_K_M", control=control, checkpoint=checkpoint,
+                        progress_cb=cancel_midway)
+    assert 0 < checkpoint.completed_count < checkpoint.total
+
+    loaded = ckpt.load_checkpoint(tmp_path / "checkpoints", checkpoint.id)
+    resumed_stats = convert_to_gguf(str(src), str(out_resumed), "Q4_K_M", checkpoint=loaded)
+    fresh = tmp_path / "fresh.gguf"
+    fresh_stats = convert_to_gguf(str(src), str(fresh), "Q4_K_M")
+
+    assert out_resumed.read_bytes() == fresh.read_bytes()
+    assert resumed_stats == fresh_stats
+    assert fresh_stats.fallback_legacy_count == 1

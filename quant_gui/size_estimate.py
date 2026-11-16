@@ -286,11 +286,15 @@ def estimate_gguf(tensors: list[TensorHeader], quant_type: str, preset: str = "n
     gguf_backend's own arch detection and F32-fallback rules (1D / small /
     hiprec / shape-not-divisible-by-32) so the estimate can't drift from the
     real converter."""
-    from .gguf_backend import MAX_TENSOR_DIMS, QUANT_BYTES_PER_ELEM, QUANTIZATION_THRESHOLD, detect_arch
+    from .gguf_backend import (
+        KQUANT_FALLBACK, KQUANT_LABEL_TO_TYPE, MAX_TENSOR_DIMS, QUANT_BYTES_PER_ELEM, QUANTIZATION_THRESHOLD, detect_arch,
+    )
 
     exclude_kw, highprec_kw, _remove_kw = _preset_lists(preset)
     exclude_re = re.compile(exclude_regex) if exclude_regex else None
-    bytes_per_elem = QUANT_BYTES_PER_ELEM.get(quant_type, 4.0)
+    base_type = KQUANT_LABEL_TO_TYPE.get(quant_type, quant_type)   # Q4_K_M -> Q4_K
+    is_k = base_type in KQUANT_FALLBACK
+    bytes_per_elem = QUANT_BYTES_PER_ELEM.get(base_type, 4.0)
 
     arch = detect_arch({t.name for t in tensors})
     hiprec_kw = list(arch.keys_hiprec) if arch else []
@@ -317,11 +321,16 @@ def estimate_gguf(tensors: list[TensorHeader], quant_type: str, preset: str = "n
             or _matches_any(t.name, highprec_kw)
             or (exclude_re is not None and exclude_re.search(t.name))
         )
-        shape_ok = len(t.shape) >= 1 and t.shape[-1] % 32 == 0
+        last = t.shape[-1] if len(t.shape) >= 1 else 0
+        shape_ok = last % 32 == 0 and last > 0
 
         if force_f32 or not shape_ok:
             estimated_total += int(elem_count * (4.0 if force_f32 else 2.0))  # F32 kept, else F16 fallback
             kept += 1
+        elif is_k and last % 256 != 0:
+            # row length fits only the 32-blocks: llama.cpp's fallback legacy type (Q4_K -> Q5_0 ...)
+            estimated_total += int(elem_count * QUANT_BYTES_PER_ELEM[KQUANT_FALLBACK[base_type]])
+            quantized += 1
         else:
             estimated_total += int(elem_count * bytes_per_elem)
             quantized += 1

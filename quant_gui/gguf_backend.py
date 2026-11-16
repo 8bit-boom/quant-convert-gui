@@ -13,11 +13,15 @@ Real block quantization (Q4_0/Q4_1/Q5_0/Q5_1/Q8_0) is implemented in pure
 Python/numpy by the `gguf` package itself (`gguf.quants`, added upstream
 for llama.cpp's `convert_hf_to_gguf.py --outtype` support) - confirmed
 against the installed package's source, no C++ build required. The K-quant
-family (Q4_K/Q5_K/Q6_K/...) only has a *dequantize* implementation in that
-same module; producing them still requires compiling a patched
-`llama-quantize` binary (see ComfyUI-GGUF/tools/README.md) - out of scope
-for this app, and this module refuses those types rather than silently
-mislabeling a legacy quant as a K-quant.
+family (Q2_K..Q6_K) only has a *dequantize* implementation in that same
+module, so those are encoded by `quant_gui/kquants.py` - a numpy port of
+llama.cpp's reference quantizers that is bit-identical to ggml's own encoder
+on the blocks tested (see that module). Image models normally need a patched
+`llama-quantize` for K-quants; this writes the same blocks directly. The
+S/M/L suffixes of Q3_K_S/Q4_K_M/... are LLM-only recipes (more bits for some
+attention/ffn tensors) that the patched tool does not apply to image
+architectures, so for a diffusion model every suffix of a family is the same
+uniform K type.
 """
 
 from __future__ import annotations
@@ -181,10 +185,25 @@ SUPPORTED_ARCH_NAMES = [a.arch for a in MODEL_ARCHES]
 # deliberately left out - see the module docstring.
 QUANT_TYPE_CHOICES = ["Q8_0", "Q5_1", "Q5_0", "Q4_1", "Q4_0", "F16", "BF16"]
 
+# K-quant names as Hugging Face lists them -> the one ggml tensor type they all store.
+# (llama.cpp's S/M/L pick LLM-specific per-tensor mixtures; there is nothing to mix in a DiT.)
+KQUANT_LABEL_TO_TYPE = {
+    "Q2_K": "Q2_K",
+    "Q3_K_S": "Q3_K", "Q3_K_M": "Q3_K", "Q3_K_L": "Q3_K",
+    "Q4_K_S": "Q4_K", "Q4_K_M": "Q4_K",
+    "Q5_K_S": "Q5_K", "Q5_K_M": "Q5_K",
+    "Q6_K": "Q6_K",
+}
+KQUANT_CHOICES = list(KQUANT_LABEL_TO_TYPE)
+QUANT_TYPE_CHOICES = QUANT_TYPE_CHOICES + KQUANT_CHOICES
+# llama.cpp's tensor_type_fallback (src/llama-quant.cpp): used when a row length is not a multiple of 256
+KQUANT_FALLBACK = {"Q2_K": "Q4_0", "Q3_K": "Q4_0", "Q4_K": "Q5_0", "Q5_K": "Q5_1", "Q6_K": "Q8_0"}
+
 # type_size / block_size in bytes-per-element, straight from gguf.GGML_QUANT_SIZES.
 QUANT_BYTES_PER_ELEM = {
     "Q8_0": 34 / 32, "Q5_1": 24 / 32, "Q5_0": 22 / 32, "Q4_1": 20 / 32, "Q4_0": 18 / 32,
     "F16": 2.0, "BF16": 2.0, "F32": 4.0,
+    "Q2_K": 84 / 256, "Q3_K": 110 / 256, "Q4_K": 144 / 256, "Q5_K": 176 / 256, "Q6_K": 210 / 256,
 }
 
 
@@ -217,6 +236,7 @@ class GGUFConvertStats:
     f32_kept_count: int = 0
     high_dim_f32_count: int = 0  # >4D (e.g. Conv3d patch embeddings), stored as unquantized F32
     fallback_f16_count: int = 0
+    fallback_legacy_count: int = 0  # K-quant requested, row length not a multiple of 256 -> Q4_0/Q5_0/Q5_1/Q8_0
 
 
 def _quant_worker_count() -> int:
@@ -232,6 +252,17 @@ def _quant_worker_count() -> int:
         return 2
 
 
+def _kquant_worker_count() -> int:
+    """K-quant encoding is compute-bound numpy (several float32 temporaries per chunk, ~100 MB per
+    worker), so use most cores: QUANT_GUI_QUANT_THREADS if set, else cpu_count - 1, capped at 8."""
+    import os
+    try:
+        forced = int(os.environ.get("QUANT_GUI_QUANT_THREADS", "0"))
+    except ValueError:
+        forced = 0
+    return max(1, forced or min(8, (os.cpu_count() or 4) - 1))
+
+
 def _prepare_tensor(f, key: str, arch, qtype, exclude_kw, highprec_kw, exclude_re):
     """Load + quantize one tensor. Runs in a worker thread; returns
     (key, packed_array, qtype, kind)."""
@@ -239,6 +270,7 @@ def _prepare_tensor(f, key: str, arch, qtype, exclude_kw, highprec_kw, exclude_r
     import numpy as np
     import torch
     from gguf import quants
+    from . import kquants
 
     tensor = f.get_tensor(key)
 
@@ -281,6 +313,17 @@ def _prepare_tensor(f, key: str, arch, qtype, exclude_kw, highprec_kw, exclude_r
                 packed = gpu_quant.quantize_q8_0(data)
             except ValueError:
                 raise gguf.QuantError(f"shape {data.shape} not Q8_0-blockable")
+        elif this_qtype.name in kquants.SUPPORTED:
+            if data.shape[-1] % kquants.QK_K == 0:
+                packed = kquants.quantize(data, this_qtype.name)
+            else:
+                # same fallback llama-quantize applies: a legacy type whose block (32) fits, else F16
+                fb = gguf.GGMLQuantizationType[KQUANT_FALLBACK[this_qtype.name]]
+                if data.shape[-1] % 32 != 0:
+                    raise gguf.QuantError(f"shape {data.shape} not blockable")
+                this_qtype = fb
+                kind = "fallback_legacy"
+                packed = quants.quantize(data, this_qtype)
         else:
             packed = quants.quantize(data, this_qtype)
     except (AttributeError, gguf.QuantError):
@@ -318,8 +361,7 @@ def convert_to_gguf(
     if quant_type not in QUANT_TYPE_CHOICES:
         raise GGUFBackendError(
             f"Unsupported GGUF quant type {quant_type!r}. This app can only produce "
-            f"{', '.join(QUANT_TYPE_CHOICES)} - K-quants (Q4_K_M etc.) need a compiled "
-            "llama-quantize binary, which this app doesn't build or invoke."
+            f"{', '.join(QUANT_TYPE_CHOICES)}."
         )
 
     import gguf
@@ -357,7 +399,7 @@ def convert_to_gguf(
 
         exclude_kw, highprec_kw = _preset_lists(preset)
         exclude_re = re.compile(exclude_regex) if exclude_regex else None
-        qtype = getattr(gguf.GGMLQuantizationType, quant_type)
+        qtype = getattr(gguf.GGMLQuantizationType, KQUANT_LABEL_TO_TYPE.get(quant_type, quant_type))
 
         stats = GGUFConvertStats(total=len(keys), arch=arch.arch)
         if checkpoint is not None:
@@ -395,6 +437,8 @@ def convert_to_gguf(
                     stats.f32_kept_count += 1
                 elif kind == "fallback_f16":
                     stats.fallback_f16_count += 1
+                elif kind == "fallback_legacy":
+                    stats.fallback_legacy_count += 1
                 else:
                     stats.quantized_count += 1
 
@@ -407,8 +451,9 @@ def convert_to_gguf(
         # futures without waiting for the window to drain.
         from concurrent.futures import ThreadPoolExecutor
 
-        n_workers = _quant_worker_count()
-        window = max(1, n_workers * 2)
+        is_k = KQUANT_LABEL_TO_TYPE.get(quant_type) is not None
+        n_workers = _kquant_worker_count() if is_k else _quant_worker_count()
+        window = max(1, n_workers + 2) if is_k else max(1, n_workers * 2)
         pending: dict[int, "Future"] = {}
         pool = ThreadPoolExecutor(max_workers=n_workers, thread_name_prefix="gguf-quant")
         submit_i = start
@@ -442,6 +487,8 @@ def convert_to_gguf(
                     stats.f32_kept_count += 1
                 elif kind == "fallback_f16":
                     stats.fallback_f16_count += 1
+                elif kind == "fallback_legacy":
+                    stats.fallback_legacy_count += 1
                 else:
                     stats.quantized_count += 1
 

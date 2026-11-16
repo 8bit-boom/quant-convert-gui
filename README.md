@@ -206,11 +206,12 @@ ComfyUI-GGUF's own `tools/convert.py` uses.
   C++ build, no GPU, no ComfyUI install needed just to *produce* the
   file). F16/BF16 skip quantization entirely (just repacks into a GGUF
   container) — useful as input to your own `llama-quantize` run.
-- **K-quants (Q4_K_M, Q5_K_S, Q6_K, etc.) are not available.** That family
-  only has a *decoder* in the `gguf` package; producing them needs a
-  patched `llama-quantize` binary compiled from llama.cpp source (see
-  [ComfyUI-GGUF's `tools/README.md`](https://github.com/city96/ComfyUI-GGUF/blob/main/tools/README.md)).
-  Convert to F16/BF16 here first if you want to run that yourself.
+- **K-quants (Q2_K, Q3_K_S/M/L, Q4_K_S/M, Q5_K_S/M, Q6_K) are available**,
+  written by this repo's own encoder, `quant_gui/kquants.py` - see
+  [K-quants for image models](#k-quants-for-image-models-q4_k_m-etc) below.
+  (The `gguf` package only has a *decoder* for them, and stock
+  `llama-quantize` refuses image architectures; the usual route is a patched
+  llama.cpp build, which this avoids.)
 - **Architecture is auto-detected**, not guessed: `quant_gui/gguf_backend.py`
   ports the exact same detection keys (`double_blocks.0.img_attn.proj.weight`
   for Flux, etc.) that ComfyUI-GGUF's own `tools/convert.py` uses, because
@@ -445,11 +446,70 @@ community-patched loader fork is needed anyway). It wraps the repo's own
 the DiT goes into the GGUF with `arch = krea2` and ComfyUI-native tensor
 names; the text encoder (Qwen3-VL fp8) and VAE (Qwen-Image) stay separate
 safetensors, with download buttons for all three on the tab. Quant
-choices are q8_0 down to q4_0 plus lossless bf16. See
-[docs/KREA2.md](docs/KREA2.md) for the full precision rules, the ComfyUI
-loading recipe, and the two-stage K-quant flow (a
+choices are q8_0 down to q4_0, the K-quants (q2_k ... q6_k, see below), plus
+lossless bf16. See [docs/KREA2.md](docs/KREA2.md) for the full precision
+rules, the ComfyUI loading recipe, and the older two-stage flow (a
 `tools/krea2_kquant_plan.py` sensitivity planner that emits a
 `--tensor-type-file` template for a krea2-patched `llama-quantize`).
+
+## K-quants for image models (Q4_K_M etc.)
+
+Hugging Face lists image-model GGUFs as Q2_K, Q3_K_S/M, Q4_K_S/M, Q5_K_S/M,
+Q6_K. This app writes those too, for the **Convert → GGUF** format and for the
+**Image → GGUF** (Krea 2) tab.
+
+**How.** `gguf-py` can only *decode* K-quants, and stock `llama-quantize`
+refuses image architectures (the community uses a patched llama.cpp build).
+`quant_gui/kquants.py` is a numpy port of llama.cpp's reference quantizers
+(`quantize_row_q{2,3,4,5,6}_K_ref`, the path `llama-quantize` takes without
+an importance matrix), vectorised across blocks and optionally multi-threaded.
+
+**Verified.** Against the real ggml encoder (built from llama.cpp
+`ef6bc6f3`, `ggml_quantize_chunk`): byte-identical blocks for all five types
+on Gaussian, Laplace, Student-t, bf16-rounded, sparse, integer, one-sided,
+all-zero, huge (3e4) and tiny (3e-6) data, plus mixed per-row scales - 26,400
+blocks per type (132,000 comparisons), plus 27 hand-picked awkward blocks
+(constant, outlier, mostly-zero). A separate magnitude sweep of Q4_K matched
+from 1e-8 down to 1e-35. The one exception found: values near 1e-37 (float32
+denormals) differ for Q4_K/Q5_K, which no real weight has.
+`tests/fixtures/kquants_golden.npz` holds 27 such blocks produced by ggml, so
+CI checks byte-equality without needing a llama.cpp build (set `GGML_LIB`
+to a built `libggml-base.so` for the live comparison). gguf-py's separate
+decoders read our blocks back with the expected error ladder (relative RMSE
+on Gaussian weights ~0.30 / 0.15 / 0.07 / 0.04 / 0.02 for Q2_K..Q6_K).
+
+**Not verified.** Loading a K-quant file in a real ComfyUI-GGUF / sd.cpp /
+Unsloth Studio install - nothing here runs those. The blocks are the format
+those tools read (they are what ggml writes), but that end-to-end step has
+not been done from here.
+
+**What the _S / _M / _L suffix means (and doesn't).** For an LLM, llama.cpp's
+S/M/L are *recipes* that give some attention/ffn tensors more bits. The patched
+tool does not apply those to image architectures, so every suffix of a family
+is one uniform type: Q4_K_S = Q4_K_M = Q4_K. A published qwen_image repo shows
+exactly that (identical sizes for Q4_K_S and Q4_K_M, Q3_K_S and Q3_K_M,
+Q5_K_S and Q5_K_M). This app lists the suffixed names so they match what you
+see on Hugging Face; the tensor data is the same, only the file name and
+`general.file_type` label differ.
+
+**Which tensors.** The same rules as the other GGUF types: 1-D tensors, tiny
+tensors, and the architecture's precision-sensitive layers stay F32 (for
+Krea 2: `first.`, `last.`, `tproj.`, `tmlp.`, `txtmlp.`,
+`txtfusion.projector.`). K-quants need a row length that is a multiple of 256;
+a layer that isn't uses the same legacy fallback llama.cpp does (Q2_K/Q3_K ->
+Q4_0, Q4_K -> Q5_0, Q5_K -> Q5_1, Q6_K -> Q8_0), or F16 if it doesn't even fit
+32. The log and the size estimate say how many layers did.
+
+**Cost.** Slower than the legacy types - the scale search runs 16-21 trial
+steps per block. Measured on a 4-core machine: roughly 9-21 M weights/s (Q6_K
+fastest, Q4_K slowest), i.e. about 10-25 minutes for a 12.9B model; single-threaded it
+is ~4x longer. `QUANT_GUI_QUANT_THREADS` sets the worker count. Stop/resume
+works as for the other types.
+
+**No importance matrix.** This is the uniform, uncalibrated K-quant. Image
+models have no `llama-imatrix`, so there is nothing to weight by; the
+`tools/krea2_kquant_plan.py` per-tensor plan (a weight-only proxy) is still a
+separate, unvalidated option.
 
 ## About the other tabs
 
@@ -689,6 +749,8 @@ default where applicable and neither changes the output:
   recipes, size estimate and fit-to-a-size, plus the stdlib GGUF header
   reader they use (both ported from the owner's `8bit-boom/Llm-training`).
 - `quant_gui/model_card.py` - the Hugging Face model card (README.md) writer.
+- `quant_gui/kquants.py` - K-quant (Q2_K..Q6_K) encoders; byte-identical to
+  ggml's on the blocks tested (see [K-quants for image models](#k-quants-for-image-models-q4_k_m-etc)).
 - `quant_gui/imatrix_hub.py` - Unsloth's published-matrix lookup/download.
 - `quant_gui/gguf_inspect.py` — read-only GGUF inspection for the
   Inspector tab (header metadata + type histogram, no tensor loading).

@@ -19,7 +19,15 @@ RealRebelAI/KREA-2_GGUFs:
     4. big BF16 2-D linears -> the requested quant (or BF16 passthrough)
     5. remaining F32 2-D -> F16
 * gguf-py can emit F16/BF16/Q4_0/Q4_1/Q5_0/Q5_1/Q8_0 directly. K-quants
-  (Q4_K_M ...) need the two-stage patched-llama-quantize flow instead.
+  (Q2_K, Q3_K_S/M/L, Q4_K_S/M, Q5_K_S/M, Q6_K) have no encoder in gguf-py, so
+  they are written by quant_gui/kquants.py (a numpy port of llama.cpp's
+  reference quantizers, byte-identical to ggml's encoder on the blocks tested)
+  - no patched llama-quantize needed. The S/M/L suffix only changes the file
+  type label: llama.cpp's S/M/L mixtures are LLM-specific (attn_v/ffn_down
+  get more bits), and the patched tool applies none of that to image
+  architectures, so every suffix of a family is the same uniform K type.
+  K-quants need rows of 256; other layers use llama.cpp's legacy fallback
+  (Q2_K/Q3_K->Q4_0, Q4_K->Q5_0, Q5_K->Q5_1, Q6_K->Q8_0).
 
 Sources:
   * Best: Comfy-Org/Krea-2 `diffusion_models/krea2_{raw,turbo}_bf16.safetensors`
@@ -42,12 +50,25 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import sys
 import time
 from pathlib import Path
 
 import numpy as np
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))   # repo root, for quant_gui.kquants
+from quant_gui import kquants  # noqa: E402  (numpy only)
+
+# K-quant labels (as listed on Hugging Face) -> the one ggml type they store
+KQUANT_LABELS = {
+    "q2_k": "Q2_K", "q3_k_s": "Q3_K", "q3_k_m": "Q3_K", "q3_k_l": "Q3_K",
+    "q4_k_s": "Q4_K", "q4_k_m": "Q4_K", "q5_k_s": "Q5_K", "q5_k_m": "Q5_K", "q6_k": "Q6_K",
+}
+# llama.cpp tensor_type_fallback for rows that are not a multiple of 256
+KQUANT_FALLBACK = {"Q2_K": "Q4_0", "Q3_K": "Q4_0", "Q4_K": "Q5_0", "Q5_K": "Q5_1", "Q6_K": "Q8_0"}
+QUANT_CHOICES = ["bf16", "f16", "q8_0", "q5_1", "q5_0", "q4_1", "q4_0", *KQUANT_LABELS]
 
 # ---------------------------------------------------------------------------
 # minimal safetensors reader (numpy only - no torch dependency)
@@ -193,9 +214,15 @@ def pick_qtype(key: str, shape: tuple[int, ...], src_dtype: str,
         return QT.F32
     if key.startswith(HIPREC_PREFIXES):
         return QT.F32
-    if (quant and src_dtype == "BF16" and len(shape) == 2
-            and shape[-1] % 32 == 0 and n_elems > QUANT_THRESHOLD_ELEMS):
-        return QT[quant.upper()]
+    if quant and src_dtype == "BF16" and len(shape) == 2 and n_elems > QUANT_THRESHOLD_ELEMS:
+        if quant in KQUANT_LABELS:
+            base = KQUANT_LABELS[quant]
+            if shape[-1] % 256 == 0:
+                return QT[base]
+            if shape[-1] % 32 == 0:
+                return QT[KQUANT_FALLBACK[base]]       # what llama-quantize does for such rows
+        elif shape[-1] % 32 == 0:
+            return QT[quant.upper()]
     if src_dtype == "BF16":
         return QT.BF16
     return QT.F16
@@ -221,16 +248,10 @@ def convert(src: Path, dst: Path, quant: str | None, arch: str = "krea2",
                for k in keys):
         raise SystemExit("not a Krea 2 transformer checkpoint - no attn.wq/to_q keys found")
 
-    file_type = {
-        None: LlamaFileType.MOSTLY_BF16,
-        "bf16": LlamaFileType.MOSTLY_BF16,
-        "f16": LlamaFileType.MOSTLY_F16,
-        "q8_0": LlamaFileType.MOSTLY_Q8_0,
-        "q5_1": LlamaFileType.MOSTLY_Q5_1,
-        "q5_0": LlamaFileType.MOSTLY_Q5_0,
-        "q4_1": LlamaFileType.MOSTLY_Q4_1,
-        "q4_0": LlamaFileType.MOSTLY_Q4_0,
-    }[quant]
+    file_type = getattr(LlamaFileType, f"MOSTLY_{(quant or 'bf16').upper()}", None)
+    if file_type is None:
+        raise SystemExit(f"this gguf package has no file type for {quant!r}")
+    k_threads = max(1, min(8, (os.cpu_count() or 2) - 1))
 
     writer = GGUFWriter(path=None, arch=arch)
     writer.add_quantization_version(gguf.GGML_QUANT_VERSION)
@@ -248,11 +269,14 @@ def convert(src: Path, dst: Path, quant: str | None, arch: str = "krea2",
             data = data.reshape(-1)  # scale_shift_table (6, h) -> [6*h]
         qtype = pick_qtype(name, tuple(data.shape), src_dt, quant)
         tag = qtype.name
-        packed = gguf.quants.quantize(
-            data.astype(np.float32, copy=False)
-            if qtype.name not in ("F32", "F16") else data,
-            qtype,
-        )
+        if qtype.name in kquants.SUPPORTED:
+            packed = kquants.quantize(data.astype(np.float32, copy=False), qtype.name, threads=k_threads)
+        else:
+            packed = gguf.quants.quantize(
+                data.astype(np.float32, copy=False)
+                if qtype.name not in ("F32", "F16") else data,
+                qtype,
+            )
         # For quantized targets the writer expects the PACKED byte shape
         # (it converts byte shape -> element shape via raw_dtype). For
         # F32/F16 targets `packed` is the float array itself and the shape
@@ -274,8 +298,9 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--src", type=Path, required=True, help="source safetensors")
     ap.add_argument("--dst", type=Path, required=True, help="output .gguf")
-    ap.add_argument("--quant", default="q8_0", choices=["bf16", "f16", "q8_0", "q5_1", "q5_0", "q4_1", "q4_0"],
-                    help="quant for big BF16 2-D linears (default q8_0; 'bf16' = lossless passthrough)")
+    ap.add_argument("--quant", default="q8_0", choices=QUANT_CHOICES,
+                    help="quant for big BF16 2-D linears (default q8_0; 'bf16' = lossless passthrough; "
+                         "q*_k* are K-quants written by quant_gui/kquants.py)")
     ap.add_argument("--arch", default="krea2",
                     help="architecture tag; use 'qwen_image' only if targeting stock city96 nodes")
     ap.add_argument("-v", "--verbose", action="store_true")

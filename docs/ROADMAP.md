@@ -89,7 +89,11 @@ tried triton-windows install; a single Q8_0 kernel is a contained first step.
 Keep numpy fallback; make GPU quant an opt-in toggle like ctq's.
 
 ### 3.3 K-quants for image DiT GGUF (M)
-Documented gap: the Krea-2 converter emits legacy quants only. Two-stage
+**Partly done:** uniform Q2_K..Q6_K (any _S/_M/_L label) are now written by
+`quant_gui/kquants.py`, byte-identical to ggml's encoder on the blocks tested.
+Still open: per-tensor mixed K plans validated on real DiT output, IQ types,
+and a calibration pass for imatrix-weighted DiT quants. Original note: the
+Krea-2 converter emitted legacy quants only. Two-stage
 flow (BF16 GGUF → patched `llama-quantize` with tensor-type file) would give
 Q4_K_M/IQ4_XS-class image models. The smart-quant tuner machinery
 (tensor-type file + budget knapsack) transfers directly — imatrix for a DiT

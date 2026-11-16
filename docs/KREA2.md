@@ -59,11 +59,17 @@ Memory-mapped streaming: RAM usage stays modest even for the 26 GB source.
 | `q5_1` / `q5_0` | 5-bit legacy | ~8–9 GB |
 | `q4_1` / `q4_0` | 4-bit legacy | ~7 GB |
 
-K-quants (Q4_K_M, IQ4_XS, …) are **not** single-stage: gguf-py cannot emit them
-directly. Use the two-stage flow (this converter → BF16 GGUF → patched
-`llama-quantize`) if you need K-quants.
+| `q2_k` … `q6_k`, `q3_k_s/m/l`, `q4_k_s/m`, `q5_k_s/m` | K-quants (uniform type) | see below |
 
-### Two-stage K-quant flow with a sensitivity plan
+K-quants are written directly by `quant_gui/kquants.py` (a numpy port of
+llama.cpp's reference quantizers, byte-identical to ggml's encoder on the
+blocks tested; `--quant q4_k_m` etc.). The `_s/_m/_l` suffixes are the same
+file for an image model (llama.cpp's S/M/L mixtures are LLM-specific), rows not
+divisible by 256 fall back to Q4_0/Q5_0/Q5_1/Q8_0 like llama.cpp does, and no
+importance matrix is used. Loading the result in ComfyUI-GGUF has not been
+tested from here. IQ types (IQ4_XS etc.) are *not* supported.
+
+### Alternative: two-stage K-quant flow with a sensitivity plan
 
 Stock `llama-quantize` refuses the krea2 arch; community forks
 (RealRebelAI/molbal) ship a krea2-patched `llama-quantize` that accepts

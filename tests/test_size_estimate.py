@@ -167,3 +167,27 @@ def test_estimates_accept_a_sharded_checkpoint_and_match_the_single_file(tmp_pat
     # an incomplete set is explained, not silently estimated from the shards present
     (shards / "m-00002-of-00002.safetensors").unlink()
     assert "incomplete" in estimate_gguf_from_file(str(shards / "m-00001-of-00002.safetensors"), "Q8_0")
+
+
+def test_estimate_gguf_kquants_matches_the_converters_per_tensor_choice(tmp_path):
+    model_path = tmp_path / "model.safetensors"
+    write_fake_safetensors(model_path, {
+        "cap_embedder.1.weight": ("BF16", [1024, 2048]),
+        "context_refiner.0.attention.qkv.weight": ("BF16", [3072, 1024]),
+        "blocks.0.attn.wq.weight": ("BF16", [1024, 1024]),
+        "blocks.0.norm.weight": ("BF16", [1024]),            # 1D -> F32
+        "blocks.0.legacy.weight": ("BF16", [64, 800]),       # %32 but not %256 -> Q5_0 for Q4_K
+        "blocks.0.oddshape.weight": ("BF16", [64, 50]),      # not %32 -> F16
+    })
+    tensors = read_header(str(model_path))
+
+    est = estimate_gguf(tensors, "Q4_K_M")
+    want = int(1024 * 2048 * 144 / 256) + int(3072 * 1024 * 144 / 256) + int(1024 * 1024 * 144 / 256)
+    want += int(64 * 800 * 22 / 32)          # legacy fallback Q5_0
+    want += int(64 * 50 * 2.0)               # F16 fallback
+    want += int(1024 * 4.0)                  # F32 norm
+    assert est.estimated_bytes == want
+    assert est.quantized_count == 4 and est.kept_count == 2
+    # every suffix of a family is the same size (image models have no S/M/L mixture)
+    assert estimate_gguf(tensors, "Q4_K_S").estimated_bytes == est.estimated_bytes
+    assert estimate_gguf(tensors, "Q6_K").estimated_bytes > est.estimated_bytes > estimate_gguf(tensors, "Q2_K").estimated_bytes

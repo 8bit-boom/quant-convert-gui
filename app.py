@@ -102,12 +102,17 @@ GGUF_NOTICE_READY = (
     "[city96/ComfyUI-GGUF](https://github.com/city96/ComfyUI-GGUF) custom node. This format calls the "
     "`gguf` package (llama.cpp's own Python bindings) directly, the same one that project's own "
     "`tools/convert.py` uses.\n\n"
-    f"**Real, pure-Python block quantization** — {', '.join(t for t in GGUF_QUANT_TYPE_CHOICES if t.startswith('Q'))} "
-    "are genuinely computed here (`gguf.quants`, no C++ build needed), not just relabeled F16. "
-    "**K-quants (Q4_K_M, Q5_K_S, Q6_K, etc.) are *not* available** — that family only has a *decoder* in "
-    "the Python package; producing them needs a patched `llama-quantize` binary compiled from source (see "
-    "ComfyUI-GGUF's `tools/README.md`), which this app doesn't build or shell out to. If you need K-quants, "
-    "convert here to F16/BF16 first, then run `llama-quantize` yourself on that file.\n\n"
+    "**Real, pure-Python block quantization** — Q8_0, Q5_1, Q5_0, Q4_1 and Q4_0 are computed by the `gguf` "
+    "package (`gguf.quants`, no C++ build), not just relabeled F16. **K-quants (Q2_K, Q3_K_S/M/L, Q4_K_S/M, "
+    "Q5_K_S/M, Q6_K)** have no encoder in that package, so this app ships its own "
+    "(`quant_gui/kquants.py`): a numpy port of llama.cpp's reference quantizers that matched ggml's real "
+    "encoder byte-for-byte on every block tested - so you do not need a patched `llama-quantize` build. "
+    "For image/video models the S/M/L suffix changes nothing (those are LLM-only recipes that give some "
+    "attention/ffn tensors more bits); every suffix of a family writes the same uniform K type, which is "
+    "consistent with a published qwen_image GGUF repo that lists identical sizes for Q4_K_S and Q4_K_M. K-quants need "
+    "rows of 256 values; layers that don't fit use the same legacy fallback llama.cpp does. They are slower "
+    "to encode than the legacy types (minutes to an hour for a 12B model, depending on cores) and use no "
+    "importance matrix.\n\n"
     "**Architecture is auto-detected** from the tensor names already in your file — GGUF's own loader "
     f"only accepts a fixed set of names, so this app recognizes exactly those: {', '.join(GGUF_SUPPORTED_ARCH_NAMES)}. "
     "Anything else (including diffusers-format checkpoints) is refused rather than silently mislabeled. "
@@ -176,8 +181,8 @@ FORMAT_HELP = {
     ),
     "gguf": (
         "A completely different container/quant format from everything else here - for ComfyUI's separate "
-        "GGUF loader, via the `gguf` package directly (not ctq). Real Q4_0/Q4_1/Q5_0/Q5_1/Q8_0 quantization; "
-        "K-quants need a compiled llama-quantize binary this app doesn't provide. Architecture is "
+        "GGUF loader, via the `gguf` package directly (not ctq). Real Q4_0/Q4_1/Q5_0/Q5_1/Q8_0 quantization plus "
+        "K-quants (Q2_K..Q6_K) from this app's own encoder. Architecture is "
         "auto-detected from your model's tensor names - unsupported architectures are refused outright."
     ),
 }
@@ -633,6 +638,12 @@ def run_gguf_convert(
                         f"  ⚠️ {stats.fallback_f16_count} layer(s) had a shape not divisible by 32 and fell "
                         f"back to F16 instead of {gguf_quant_type}.\n"
                     )
+                if stats.fallback_legacy_count:
+                    log += (
+                        f"  ℹ️ {stats.fallback_legacy_count} layer(s) have a row length that isn't a multiple of 256 "
+                        f"(required by {gguf_quant_type}), so they use the legacy type llama.cpp falls back to "
+                        "(Q2_K/Q3_K→Q4_0, Q4_K→Q5_0, Q5_K→Q5_1, Q6_K→Q8_0).\n"
+                    )
                 if stats.high_dim_f32_count:
                     log += (
                         f"  ℹ️ {stats.high_dim_f32_count} tensor(s) with more than 4 dimensions (e.g. a video "
@@ -647,6 +658,7 @@ def run_gguf_convert(
                         summary=[f"{stats.quantized_count} layer(s) quantized to {gguf_quant_type}",
                                  f"{stats.f32_kept_count} layer(s) kept F32 (1D / tiny / precision-sensitive)",
                                  f"{stats.fallback_f16_count} layer(s) fell back to F16 (shape not divisible by 32)"]
+                                + ([f"{stats.fallback_legacy_count} layer(s) used a legacy type (row length not a multiple of 256)"] if stats.fallback_legacy_count else [])
                                 + ([f"{stats.high_dim_f32_count} tensor(s) with >4 dimensions stored as F32"] if stats.high_dim_f32_count else []),
                     )
                 if checkpoint is not None:
@@ -2306,9 +2318,9 @@ with gr.Blocks(title="Quant Convert GUI") as demo:
                             GGUF_QUANT_TYPE_CHOICES,
                             value="Q8_0",
                             label="GGUF quant type",
-                            info="Q8_0 = best quality/largest of the real quant types here; Q4_0 = smallest/"
-                            "roughest. F16/BF16 skip quantization entirely (just repacks into a GGUF "
-                            "container) - useful as input to your own llama-quantize run for K-quants.",
+                            info="Q8_0 = best quality/largest of the legacy types; Q4_0 = smallest/roughest. K-quants "
+                            "(Q2_K ... Q6_K) pack more quality per byte but encode slower; for image models "
+                            "the _S/_M/_L suffixes are the same file. F16/BF16 skip quantization entirely.",
                         )
                         gr.Markdown(
                             f"Architecture is auto-detected from your model's own tensor names - supported: "
@@ -2890,8 +2902,11 @@ with gr.Blocks(title="Quant Convert GUI") as demo:
                                   file_types=[".safetensors"], type="filepath")
             with gr.Row():
                 img_quant = gr.Dropdown(
-                    choices=["q8_0", "q5_1", "q5_0", "q4_1", "q4_0", "bf16"],
+                    choices=["q8_0", "q5_1", "q5_0", "q4_1", "q4_0", "q2_k", "q3_k_s", "q3_k_m", "q3_k_l",
+                             "q4_k_s", "q4_k_m", "q5_k_s", "q5_k_m", "q6_k", "bf16"],
                     value="q8_0", label="Quant for big BF16 linears",
+                    info="q*_k* are K-quants, written by this app's own encoder (no patched llama-quantize "
+                         "needed). The _s/_m/_l suffix makes no difference for an image model - same file.",
                 )
                 img_dst_name = gr.Textbox(label="Output name", value="krea2_turbo_q8_0.gguf")
                 img_convert_btn = gr.Button("Convert", variant="primary")
@@ -3053,10 +3068,10 @@ with gr.Blocks(title="Quant Convert GUI") as demo:
                 "node. `convert_to_quant` never touches GGUF at all, so this also bypasses ctq — it calls the "
                 "`gguf` package (llama.cpp's Python bindings) directly, real Q4_0/Q4_1/Q5_0/Q5_1/Q8_0 block "
                 "quantization computed in pure Python (with an optional Triton GPU path for Q8_0 - the "
-                "\"Use GPU quantization\" checkbox, bit-identical output). K-quants (Q4_K_M, Q6_K, etc.) "
-                "aren't available *here* — that family only has a *decoder* in the Python package; producing "
-                "them needs a compiled llama.cpp toolchain, which is exactly what the LLM → GGUF tab sets up "
-                "for text models. Architecture (flux/sdxl/wan/etc.) is "
+                "\"Use GPU quantization\" checkbox, bit-identical output). K-quants (Q2_K ... Q6_K, with the "
+                "_S/_M/_L names) are also available - the `gguf` package can't encode them, so this app ships "
+                "its own encoder (`quant_gui/kquants.py`, byte-identical to llama.cpp's on the blocks tested). "
+                "Architecture (flux/sdxl/wan/etc.) is "
                 "auto-detected from your model's own tensor names, using the exact same detection logic as "
                 "ComfyUI-GGUF's own converter, since its loader rejects anything it doesn't recognize.\n\n"
                 "## Which format for which GPU\n"
