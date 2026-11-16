@@ -124,6 +124,24 @@ yet. If a GPU was detected, it also flags whether the estimate fits in its
 VRAM. It's a planning figure, not exact — it approximates ctq's per-layer
 choices rather than replicating them (see `quant_gui/size_estimate.py`).
 
+## Hugging Face model card (README.md)
+
+Every finished conversion (ctq `.safetensors`, INT4, image/video GGUF, and the
+LLM quantize / mixed-recipe / smart-tune outputs) also gets a model card
+written **next to the output** as `<output name>.README.md`. Copy or rename it
+to `README.md` in the Hugging Face repo you upload to. Turn it off with the
+checkbox at the top of the app (the choice is remembered).
+
+What's in it - only facts the app has: the YAML header (`base_model` +
+`base_model_relation: quantized` when you fill in the optional "Original model
+on Hugging Face" box, `library_name: gguf` for GGUF, tags), the file and its
+real size, the format and settings used, what the converter reported (layer
+counts, fallbacks), the exact command where one exists, and a short usage hint
+for the format. What it deliberately does *not* contain: any quality claim (no
+benchmark is run, and the card says so), or a guessed license - a quantized
+file inherits its base model's license, so the card tells you to check it and
+add the `license:` field yourself. The output file is never uploaded by the app.
+
 ## About "INT4 ConvRot"
 
 Real INT4/W4A4 ConvRot models exist and are in use — e.g.
@@ -670,6 +688,7 @@ default where applicable and neither changes the output:
 - `quant_gui/mixed_quant.py` / `quant_gui/gguf_header.py` - the mixed
   recipes, size estimate and fit-to-a-size, plus the stdlib GGUF header
   reader they use (both ported from the owner's `8bit-boom/Llm-training`).
+- `quant_gui/model_card.py` - the Hugging Face model card (README.md) writer.
 - `quant_gui/imatrix_hub.py` - Unsloth's published-matrix lookup/download.
 - `quant_gui/gguf_inspect.py` — read-only GGUF inspection for the
   Inspector tab (header metadata + type histogram, no tensor loading).

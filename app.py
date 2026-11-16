@@ -27,6 +27,7 @@ from quant_gui.hf import HFUrlError, download as hf_download, download_repo as h
 from quant_gui.loop_timing import LoopPhaseTimer
 from quant_gui import llamacpp_backend as lcpp
 from quant_gui import sharded
+from quant_gui import model_card as mc
 from quant_gui import mixed_quant as mq
 from quant_gui import imatrix_hub
 from quant_gui import gguf_header
@@ -57,6 +58,22 @@ RUN_HISTORY = APP_DIR / rh.HISTORY_NAME
 LLAMACPP_DIR = lcpp.default_llamacpp_dir(APP_DIR)
 LLM_MODELS_DIR = APP_DIR / "llm_models"
 MERGED_DIR = APP_DIR / "merged"
+
+# Hugging Face model card (README.md) written next to each finished output.
+# `enabled` persists; `base` (the original model's HF id) is per-session on purpose - it is
+# different for every model and a stale value would put the wrong base_model in the card.
+_CARD_PREFS = {"enabled": bool(ui_settings.load_settings(APP_DIR).get("write_model_card", True)), "base": ""}
+
+
+def _write_model_card(**kw) -> str:
+    """Writes <output stem>.README.md beside the output; returns a log line ('' when disabled)."""
+    if not _CARD_PREFS["enabled"]:
+        return ""
+    try:
+        path = mc.write_card(mc.CardInfo(base_model=_CARD_PREFS["base"], **kw))
+    except Exception as exc:  # a card must never fail a finished conversion
+        return f"(Hugging Face model card not written: {exc})\n"
+    return f"📝 Hugging Face model card: {path}\n   (copy it to README.md in your Hugging Face repo)\n"
 
 # Persisted UI settings (ui_settings.json). GPU quantization is the first
 # one: the checkbox defaults to the saved value, and a saved "on" is applied
@@ -498,6 +515,15 @@ def run_int4_convert(
                     )
                 if result_path:
                     log += f"Output: {result_path}\n"
+                    log += _write_model_card(
+                        kind="int4", output_path=result_path, source=input_path,
+                        quant_label="INT4 ConvRot (comfy-kitchen)",
+                        settings=[("Preset", preset), ("INT4 layer regex", (int4_layers_regex or "").strip()),
+                                  ("INT8 fallback for other layers", "yes" if int4_fallback_int8 else "no"),
+                                  ("Kept at full precision (regex)", (exclude_layers or "").strip())],
+                        summary=[f"{stats.int4_count} layer(s) INT4 ConvRot", f"{stats.int8_count} layer(s) INT8 tensorwise (fallback)",
+                                 f"{stats.kept_count} layer(s) kept at original precision"],
+                    )
                 if checkpoint is not None:
                     # The run completed - the full output file exists, so the
                     # per-tensor shards are dead weight; clean them up.
@@ -615,6 +641,14 @@ def run_gguf_convert(
                     )
                 if result_path:
                     log += f"Output: {result_path}\n"
+                    log += _write_model_card(
+                        kind="gguf_image", output_path=result_path, source=input_path, quant_label=gguf_quant_type,
+                        settings=[("Architecture", stats.arch), ("Preset", preset), ("Kept at full precision (regex)", (exclude_layers or "").strip())],
+                        summary=[f"{stats.quantized_count} layer(s) quantized to {gguf_quant_type}",
+                                 f"{stats.f32_kept_count} layer(s) kept F32 (1D / tiny / precision-sensitive)",
+                                 f"{stats.fallback_f16_count} layer(s) fell back to F16 (shape not divisible by 32)"]
+                                + ([f"{stats.high_dim_f32_count} tensor(s) with >4 dimensions stored as F32"] if stats.high_dim_f32_count else []),
+                    )
                 if checkpoint is not None:
                     ckpt.delete_checkpoint(checkpoint.path.parent, checkpoint.id)
                 yield log, result_path, _progress_bar_html(1.0, "Done")
@@ -950,6 +984,13 @@ def run_llm_quantize(input_gguf: str, output_name: str, quant_type: str, imatrix
         if line == "__OK__":
             result_path = output_path if Path(output_path).is_file() else None
             log += f"\n✅ Quantization finished.\nOutput: {result_path or output_path}\n"
+            if result_path:
+                log += _write_model_card(
+                    kind="gguf_llm", output_path=result_path, source=input_gguf, quant_label=quant_type,
+                    pipeline_tag="text-generation",
+                    settings=[("Importance matrix", Path(imatrix_file).name if imatrix_file else "none"),
+                              ("Per-tensor overrides file", Path(tensor_type_file.strip()).name if (tensor_type_file or "").strip() else "none")],
+                )
             yield log, result_path
         elif line.startswith("__FAIL__"):
             log += f"\n❌ Quantization failed (see log above).\n"
@@ -1067,6 +1108,14 @@ def run_llm_mixed_quantize(input_gguf: str, recipe: str, target_gb, imatrix_file
             result_path = out_path if Path(out_path).is_file() else None
             size = Path(out_path).stat().st_size / 1e9 if result_path else 0.0
             log += f"\n✅ Done. Output: {result_path or out_path} ({size:.2f} GB, estimate was {est['gb']:.2f} GB)\n"
+            if result_path:
+                log += _write_model_card(
+                    kind="gguf_llm", output_path=result_path, source=path, quant_label=f"{plan['label']} ({mq.LABEL})",
+                    pipeline_tag="text-generation", command="llama-quantize " + " ".join(plan["flags"]) + f" <in> <out> {plan['base']}",
+                    settings=[("Base type", plan["base"]), ("Importance matrix", Path(imatrix_file).name if imatrix_file else "none"),
+                              ("--tensor-type rules", len(plan["rules"]))],
+                    notes=["Mixed-precision recipe is the author's own, not an Unsloth Dynamic (UD) quant."],
+                )
             yield log, result_path
         elif line.startswith("__FAIL__"):
             log += "\n❌ Quantization failed (see log above). If llama-quantize rejected --tensor-type, update llama.cpp.\n"
@@ -1467,6 +1516,14 @@ def run_llm_smart_tune(model_gguf: str, imatrix_file: str, mode: str, target_siz
             result_path = output_path if Path(output_path).is_file() else None
             size_gb = Path(output_path).stat().st_size / 1e9 if result_path else 0.0
             log += f"\n✅ Done. Output: {result_path or output_path} ({size_gb:.2f} GB)\n"
+            if result_path:
+                log += _write_model_card(
+                    kind="gguf_llm", output_path=result_path, source=model_gguf, quant_label=f"Per-tensor tuned (base {base_ftype})",
+                    pipeline_tag="text-generation",
+                    settings=[("Mode", "K-ladder" if use_k_ladder else "legacy"), ("Importance matrix", Path(imatrix_file).name if imatrix_file else "none"),
+                              ("Per-tensor types file", tt_path.name)],
+                    notes=["Per-tensor types were chosen by this app's own imatrix-weighted sensitivity heuristic, not Unsloth's recipe."],
+                )
             yield log, result_path
         elif line.startswith("__FAIL__"):
             log += "\n❌ Quantization failed (see log above).\n"
@@ -1781,6 +1838,16 @@ def run_convert(
                 log += "\n✅ Conversion finished.\n"
                 if result_path:
                     log += f"Output: {result_path}\n"
+                    log += _write_model_card(
+                        kind="ctq", output_path=result_path, source=input_path, command=format_command(opts),
+                        quant_label=f"{opts.quant_format.upper()}" + (" ConvRot" if opts.convrot else "") + f" ({opts.scaling_mode}-wise scaling)",
+                        settings=[("Preset", opts.preset), ("ConvRot group size", opts.convrot_group_size if opts.convrot else ""),
+                                  ("Mode", "simple" if opts.simple else "learned rounding"),
+                                  ("Kept at full precision (regex)", opts.exclude_layers or ""),
+                                  ("Mixed-precision layers (regex)", opts.custom_layers or ""),
+                                  ("Mixed-precision type", opts.custom_type or ""), ("Output dtype", opts.output_dtype),
+                                  ("comfy_quant metadata", "yes" if opts.comfy_quant else "no")],
+                    )
                 elif found:
                     log += f"Output (reported, not found on disk yet): {found}\n"
                 yield log, result_path, _progress_bar_html(1.0, "Done")
@@ -2012,6 +2079,10 @@ def resume_ctq(cp):
                 log += "\n✅ Conversion finished.\n"
                 if result_path:
                     log += f"Output: {result_path}\n"
+                    log += _write_model_card(
+                        kind="ctq", output_path=result_path, source=str(cp.params.get("input_path") or ""),
+                        command=str(cp.params.get("command") or " ".join(args)), quant_label="convert_to_quant",
+                    )
                 ckpt.delete_checkpoint(CHECKPOINT_ROOT, cp.id)
                 if checkpoint_dir:
                     shutil.rmtree(checkpoint_dir, ignore_errors=True)
@@ -2129,6 +2200,18 @@ with gr.Blocks(title="Quant Convert GUI") as demo:
         "format your card can actually accelerate. There's also a separate **LLM → GGUF** tab for text models "
         "(Gemma, Llama, Qwen, etc.) — a different pipeline built around a real llama.cpp checkout."
     )
+
+    with gr.Row():
+        card_enable = gr.Checkbox(
+            label="Write a Hugging Face model card (README.md) next to each finished output",
+            value=_CARD_PREFS["enabled"],
+            info="Saved as <output name>.README.md - copy it to README.md in your HF repo. Facts only: format, "
+                 "settings, converter summary, size. No quality claims, no guessed license.",
+        )
+        card_base = gr.Textbox(
+            label="Original model on Hugging Face (optional)", placeholder="owner/model-name",
+            info="Fills base_model and the license link in the card. Not saved between sessions.",
+        )
 
     with gr.Tabs():
         with gr.Tab("Convert"):
@@ -3772,6 +3855,15 @@ with gr.Blocks(title="Quant Convert GUI") as demo:
         inputs=[llm_imatrix_model, llm_calib_mode, llm_imatrix_calibration, llm_imatrix_output_name],
         outputs=[llm_log, llm_result_file],
     ).then(carry_over_result, inputs=[llm_result_file], outputs=[llm_quantize_imatrix])
+    def _persist_card_enabled(enabled):
+        _CARD_PREFS["enabled"] = bool(enabled)
+        ui_settings.set_setting(APP_DIR, "write_model_card", bool(enabled))
+
+    def _set_card_base(text):
+        _CARD_PREFS["base"] = (text or "").strip()
+
+    card_enable.change(_persist_card_enabled, inputs=[card_enable], outputs=[])
+    card_base.change(_set_card_base, inputs=[card_base], outputs=[])
     llm_quantize_btn.click(
         run_llm_quantize,
         inputs=[

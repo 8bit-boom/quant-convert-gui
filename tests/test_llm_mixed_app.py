@@ -90,3 +90,21 @@ def test_merge_needs_two_inputs(tmp_path, env):
 def test_published_lookup_offline_is_plain(monkeypatch):
     monkeypatch.setenv("HF_ENDPOINT", "http://127.0.0.1:9")
     assert "could not be reached" in app.run_llm_published_lookup("x/y")
+
+
+def test_mixed_quantize_writes_a_card_when_enabled(tmp_path, env, monkeypatch):
+    monkeypatch.setitem(app._CARD_PREFS, "enabled", True)
+    monkeypatch.setitem(app._CARD_PREFS, "base", "google/gemma-3-4b-it")
+    f = qwen_like(tmp_path / "m.gguf")
+    res = list(app.run_llm_mixed_quantize(str(f), "mixed_4", 0, "", ""))
+    card = tmp_path / "out" / "m-mixed_4.README.md"
+    assert card.is_file() and "base_model: google/gemma-3-4b-it" in card.read_text()
+    assert "own recipe, not an Unsloth Dynamic" in card.read_text() or "not an Unsloth Dynamic" in card.read_text()
+    assert "model card" in res[-1][0]
+
+
+def test_no_card_when_disabled(tmp_path, env, monkeypatch):
+    monkeypatch.setitem(app._CARD_PREFS, "enabled", False)
+    f = qwen_like(tmp_path / "m.gguf")
+    list(app.run_llm_mixed_quantize(str(f), "mixed_4", 0, "", ""))
+    assert not list((tmp_path / "out").glob("*.README.md"))
