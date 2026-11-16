@@ -188,11 +188,11 @@ QUANT_TYPE_CHOICES = ["Q8_0", "Q5_1", "Q5_0", "Q4_1", "Q4_0", "F16", "BF16"]
 # K-quant names as Hugging Face lists them -> the one ggml tensor type they all store.
 # (llama.cpp's S/M/L pick LLM-specific per-tensor mixtures; there is nothing to mix in a DiT.)
 KQUANT_LABEL_TO_TYPE = {
-    "Q2_K": "Q2_K",
+    "Q2_K": "Q2_K", "Q2_K_L": "Q2_K",
     "Q3_K_S": "Q3_K", "Q3_K_M": "Q3_K", "Q3_K_L": "Q3_K",
-    "Q4_K_S": "Q4_K", "Q4_K_M": "Q4_K",
-    "Q5_K_S": "Q5_K", "Q5_K_M": "Q5_K",
-    "Q6_K": "Q6_K",
+    "Q4_K_S": "Q4_K", "Q4_K_M": "Q4_K", "Q4_K_L": "Q4_K",
+    "Q5_K_S": "Q5_K", "Q5_K_M": "Q5_K", "Q5_K_L": "Q5_K",
+    "Q6_K": "Q6_K", "Q6_K_L": "Q6_K",
 }
 KQUANT_CHOICES = list(KQUANT_LABEL_TO_TYPE)
 QUANT_TYPE_CHOICES = QUANT_TYPE_CHOICES + KQUANT_CHOICES
@@ -406,7 +406,10 @@ def convert_to_gguf(
             set_total(checkpoint, stats.total)
         writer = gguf.GGUFWriter(path=None, arch=arch.arch)
         writer.add_quantization_version(gguf.GGML_QUANT_VERSION)
-        file_type = getattr(gguf.LlamaFileType, f"MOSTLY_{quant_type}", None)
+        # _L names beyond Q3_K_L (bartowski-style Q4_K_L ...) have no gguf enum: label them with the _M type
+        file_type = (getattr(gguf.LlamaFileType, f"MOSTLY_{quant_type}", None)
+                     or getattr(gguf.LlamaFileType, f"MOSTLY_{quant_type[:-2]}_M", None)
+                     or getattr(gguf.LlamaFileType, f"MOSTLY_{KQUANT_LABEL_TO_TYPE.get(quant_type, quant_type)}", None))
         if file_type is not None:
             writer.add_file_type(file_type)
 

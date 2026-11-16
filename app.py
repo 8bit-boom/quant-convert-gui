@@ -103,8 +103,8 @@ GGUF_NOTICE_READY = (
     "`gguf` package (llama.cpp's own Python bindings) directly, the same one that project's own "
     "`tools/convert.py` uses.\n\n"
     "**Real, pure-Python block quantization** — Q8_0, Q5_1, Q5_0, Q4_1 and Q4_0 are computed by the `gguf` "
-    "package (`gguf.quants`, no C++ build), not just relabeled F16. **K-quants (Q2_K, Q3_K_S/M/L, Q4_K_S/M, "
-    "Q5_K_S/M, Q6_K)** have no encoder in that package, so this app ships its own "
+    "package (`gguf.quants`, no C++ build), not just relabeled F16. **K-quants (Q2_K, Q3_K_S/M/L, Q4_K_S/M/L, "
+    "Q5_K_S/M/L, Q6_K, plus Q2_K_L/Q6_K_L)** have no encoder in that package, so this app ships its own "
     "(`quant_gui/kquants.py`): a numpy port of llama.cpp's reference quantizers that matched ggml's real "
     "encoder byte-for-byte on every block tested - so you do not need a patched `llama-quantize` build. "
     "For image/video models the S/M/L suffix changes nothing (those are LLM-only recipes that give some "
@@ -2902,11 +2902,11 @@ with gr.Blocks(title="Quant Convert GUI") as demo:
                                   file_types=[".safetensors"], type="filepath")
             with gr.Row():
                 img_quant = gr.Dropdown(
-                    choices=["q8_0", "q5_1", "q5_0", "q4_1", "q4_0", "q2_k", "q3_k_s", "q3_k_m", "q3_k_l",
-                             "q4_k_s", "q4_k_m", "q5_k_s", "q5_k_m", "q6_k", "bf16"],
+                    choices=["q8_0", "q5_1", "q5_0", "q4_1", "q4_0", "q2_k", "q2_k_l", "q3_k_s", "q3_k_m", "q3_k_l",
+                             "q4_k_s", "q4_k_m", "q4_k_l", "q5_k_s", "q5_k_m", "q5_k_l", "q6_k", "q6_k_l", "bf16"],
                     value="q8_0", label="Quant for big BF16 linears",
                     info="q*_k* are K-quants, written by this app's own encoder (no patched llama-quantize "
-                         "needed). The _s/_m/_l suffix makes no difference for an image model - same file.",
+                         "needed). The _s/_m/_l suffix (incl. bartowski-style q4_k_l) makes no difference for an image model - same file.",
                 )
                 img_dst_name = gr.Textbox(label="Output name", value="krea2_turbo_q8_0.gguf")
                 img_convert_btn = gr.Button("Convert", variant="primary")

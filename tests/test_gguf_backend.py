@@ -228,6 +228,7 @@ def _write_kquant_model(path: Path) -> None:
 @pytest.mark.parametrize("label,ktype,legacy", [
     ("Q4_K_M", "Q4_K", "Q5_0"), ("Q5_K_S", "Q5_K", "Q5_1"), ("Q6_K", "Q6_K", "Q8_0"),
     ("Q3_K_L", "Q3_K", "Q4_0"), ("Q2_K", "Q2_K", "Q4_0"),
+    ("Q4_K_L", "Q4_K", "Q5_0"), ("Q5_K_L", "Q5_K", "Q5_1"), ("Q6_K_L", "Q6_K", "Q8_0"), ("Q2_K_L", "Q2_K", "Q4_0"),
 ])
 def test_kquant_conversion_types_stats_and_fallbacks(tmp_path, label, ktype, legacy):
     src = tmp_path / "model.safetensors"

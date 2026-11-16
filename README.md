@@ -206,7 +206,7 @@ ComfyUI-GGUF's own `tools/convert.py` uses.
   C++ build, no GPU, no ComfyUI install needed just to *produce* the
   file). F16/BF16 skip quantization entirely (just repacks into a GGUF
   container) — useful as input to your own `llama-quantize` run.
-- **K-quants (Q2_K, Q3_K_S/M/L, Q4_K_S/M, Q5_K_S/M, Q6_K) are available**,
+- **K-quants (Q2_K, Q3_K_S/M/L, Q4_K_S/M/L, Q5_K_S/M/L, Q6_K, Q6_K_L, Q2_K_L) are available**,
   written by this repo's own encoder, `quant_gui/kquants.py` - see
   [K-quants for image models](#k-quants-for-image-models-q4_k_m-etc) below.
   (The `gguf` package only has a *decoder* for them, and stock
@@ -455,7 +455,7 @@ rules, the ComfyUI loading recipe, and the older two-stage flow (a
 ## K-quants for image models (Q4_K_M etc.)
 
 Hugging Face lists image-model GGUFs as Q2_K, Q3_K_S/M, Q4_K_S/M, Q5_K_S/M,
-Q6_K. This app writes those too, for the **Convert → GGUF** format and for the
+Q6_K (and bartowski-style Q4_K_L, Q5_K_L, Q6_K_L). This app writes those too, for the **Convert → GGUF** format and for the
 **Image → GGUF** (Krea 2) tab.
 
 **How.** `gguf-py` can only *decode* K-quants, and stock `llama-quantize`
@@ -483,7 +483,7 @@ Unsloth Studio install - nothing here runs those. The blocks are the format
 those tools read (they are what ggml writes), but that end-to-end step has
 not been done from here.
 
-**What the _S / _M / _L suffix means (and doesn't).** For an LLM, llama.cpp's
+**What the _S / _M / _L suffix means (and doesn't).** Bartowski-style `Q4_K_L`/`Q5_K_L`/`Q6_K_L`/`Q2_K_L` are LLM recipes that keep the token-embedding and output tensors at Q8_0; a DiT has no such tensors (its input/output layers are already F32 here), so those are the same uniform file too. For an LLM, llama.cpp's
 S/M/L are *recipes* that give some attention/ffn tensors more bits. The patched
 tool does not apply those to image architectures, so every suffix of a family
 is one uniform type: Q4_K_S = Q4_K_M = Q4_K. A published qwen_image repo shows

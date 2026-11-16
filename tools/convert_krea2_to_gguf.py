@@ -63,8 +63,9 @@ from quant_gui import kquants  # noqa: E402  (numpy only)
 
 # K-quant labels (as listed on Hugging Face) -> the one ggml type they store
 KQUANT_LABELS = {
-    "q2_k": "Q2_K", "q3_k_s": "Q3_K", "q3_k_m": "Q3_K", "q3_k_l": "Q3_K",
-    "q4_k_s": "Q4_K", "q4_k_m": "Q4_K", "q5_k_s": "Q5_K", "q5_k_m": "Q5_K", "q6_k": "Q6_K",
+    "q2_k": "Q2_K", "q2_k_l": "Q2_K", "q3_k_s": "Q3_K", "q3_k_m": "Q3_K", "q3_k_l": "Q3_K",
+    "q4_k_s": "Q4_K", "q4_k_m": "Q4_K", "q4_k_l": "Q4_K", "q5_k_s": "Q5_K", "q5_k_m": "Q5_K", "q5_k_l": "Q5_K",
+    "q6_k": "Q6_K", "q6_k_l": "Q6_K",
 }
 # llama.cpp tensor_type_fallback for rows that are not a multiple of 256
 KQUANT_FALLBACK = {"Q2_K": "Q4_0", "Q3_K": "Q4_0", "Q4_K": "Q5_0", "Q5_K": "Q5_1", "Q6_K": "Q8_0"}
@@ -248,7 +249,11 @@ def convert(src: Path, dst: Path, quant: str | None, arch: str = "krea2",
                for k in keys):
         raise SystemExit("not a Krea 2 transformer checkpoint - no attn.wq/to_q keys found")
 
-    file_type = getattr(LlamaFileType, f"MOSTLY_{(quant or 'bf16').upper()}", None)
+    name = (quant or "bf16").upper()
+    # bartowski-style _L names (Q4_K_L ...) have no enum: label them with the _M type of the family
+    file_type = (getattr(LlamaFileType, f"MOSTLY_{name}", None)
+                 or getattr(LlamaFileType, f"MOSTLY_{name[:-2]}_M", None)
+                 or getattr(LlamaFileType, f"MOSTLY_{KQUANT_LABELS.get(quant, name)}", None))
     if file_type is None:
         raise SystemExit(f"this gguf package has no file type for {quant!r}")
     k_threads = max(1, min(8, (os.cpu_count() or 2) - 1))

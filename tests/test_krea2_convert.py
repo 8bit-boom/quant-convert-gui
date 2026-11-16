@@ -197,8 +197,10 @@ def test_pick_qtype_kquants_and_fallbacks():
     assert pq("blocks.0.prenorm.scale", (6144,), "BF16", "q4_k_m") == QT.F32
 
 
-@pytest.mark.parametrize("quant,want", [("q4_k_m", QT.Q4_K), ("q4_k_s", QT.Q4_K), ("q5_k_m", QT.Q5_K),
-                                        ("q6_k", QT.Q6_K), ("q3_k_s", QT.Q3_K), ("q2_k", QT.Q2_K)])
+@pytest.mark.parametrize("quant,want", [("q4_k_m", QT.Q4_K), ("q4_k_s", QT.Q4_K), ("q4_k_l", QT.Q4_K),
+                                        ("q5_k_m", QT.Q5_K), ("q5_k_l", QT.Q5_K), ("q6_k", QT.Q6_K),
+                                        ("q6_k_l", QT.Q6_K), ("q3_k_s", QT.Q3_K), ("q2_k", QT.Q2_K),
+                                        ("q2_k_l", QT.Q2_K)])
 def test_convert_end_to_end_kquant(tmp_path, quant, want):
     rng = np.random.default_rng(11)
     w = (rng.standard_normal((256, 512)) * 0.02).astype(np.float32)
@@ -236,8 +238,8 @@ def test_kquant_labels_of_one_family_are_the_same_bytes(tmp_path):
     src = tmp_path / "t.safetensors"
     _write_safetensors(src, {"blocks.0.attn.wq.weight": (_to_bf16_storage(w), "BF16")})
     outs = []
-    for q in ("q4_k_s", "q4_k_m"):
+    for q in ("q4_k_s", "q4_k_m", "q4_k_l"):
         dst = tmp_path / f"{q}.gguf"
         k2g.convert(src, dst, q)
         outs.append(np.asarray(next(t for t in GGUFReader(str(dst)).tensors if t.name.endswith("wq.weight")).data).tobytes())
-    assert outs[0] == outs[1]
+    assert outs[0] == outs[1] == outs[2]
