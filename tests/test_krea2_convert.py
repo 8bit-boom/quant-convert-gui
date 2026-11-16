@@ -251,8 +251,9 @@ def test_truncated_source_is_reported_plainly_not_as_a_reshape_error(tmp_path):
     cut = tmp_path / "cut.safetensors"
     cut.write_bytes(src.read_bytes()[:-1000])            # an upload/download that stopped early
 
-    with pytest.raises(ValueError, match="incomplete.*missing"):
+    with pytest.raises(ValueError, match="incomplete.*cut.safetensors") as ei:
         k2g.SafetensorsFile(cut)
+    assert "bytes" in str(ei.value) and "missing" in str(ei.value)
     # the CLI prints the message and exits 1 instead of a traceback
     assert k2g.main(["--src", str(cut), "--dst", str(tmp_path / "o.gguf")]) == 1
     assert k2g.SafetensorsFile(src).keys() == ["blocks.0.attn.wq.weight"]      # a complete file is fine

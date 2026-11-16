@@ -102,12 +102,17 @@ class SafetensorsFile:
             (v["data_offsets"][1] for k, v in self.header.items() if k != "__metadata__"), default=0)
         have = self.path.stat().st_size
         if have < want:
+            where = str(self.path.resolve())
+            temp_copy = "gradio" in where.lower() and "temp" in where.lower()
             raise ValueError(
-                f"{self.path.name} is incomplete: it is {have:,} bytes but its header says {want:,} "
-                f"({(want - have) / 1e6:.1f} MB missing). The download was interrupted or the file was "
-                "copied/uploaded only partway - download it again (the Downloads buttons on the "
-                "Image → GGUF tab save to image_models/) and point the converter at that file with "
-                "'Local file path' rather than uploading it."
+                f"the file being read is incomplete: {where}\n"
+                f"  on disk: {have:,} bytes   its header says: {want:,} bytes   ({(want - have) / 1e6:.1f} MB missing)\n"
+                + ("  This path is Gradio's temporary UPLOAD COPY, not your original file: the copy was cut short "
+                   "(commonly the temp drive ran out of space). Use the 'Local file path' box with the original "
+                   "file's path instead of the upload picker.\n" if temp_copy else
+                   "  Compare this size with the original file's size in Explorer. If the original is the full size, "
+                   "the converter was given a different, cut-short copy; if it is also this size, the original is "
+                   "partial and needs downloading again.\n")
             )
         self._data = np.memmap(self.path, dtype=np.uint8, mode="r")
 
@@ -254,6 +259,7 @@ def convert(src: Path, dst: Path, quant: str | None, arch: str = "krea2",
 
     LlamaFileType = getattr(gguf, "GGMLFileType", None) or gguf.LlamaFileType
 
+    print(f"source: {Path(src).resolve()} ({Path(src).stat().st_size / 1e9:.2f} GB)", flush=True)
     st = SafetensorsFile(src)
     keys = st.keys()
     diffusers = looks_like_diffusers(keys)
