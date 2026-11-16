@@ -95,12 +95,15 @@ def test_unknown_architecture_raises(tmp_path):
         convert_to_gguf(str(src), str(tmp_path / "out.gguf"), "Q8_0")
 
 
-def test_kquant_type_is_rejected(tmp_path):
+@pytest.mark.parametrize("label", ["IQ4_XS", "IQ2_XXS", "Q4_K_XL", "Q4_K_M_foo"])
+def test_unsupported_quant_types_are_still_refused(tmp_path, label):
+    """K-quants (Q2_K..Q6_K) are written by quant_gui/kquants.py now; IQ types and made-up names are not."""
     src = tmp_path / "model.safetensors"
     _write_lumina2_model(src)
 
-    with pytest.raises(GGUFBackendError, match="llama-quantize"):
-        convert_to_gguf(str(src), str(tmp_path / "out.gguf"), "Q4_K_M")
+    with pytest.raises(GGUFBackendError, match="Unsupported GGUF quant type"):
+        convert_to_gguf(str(src), str(tmp_path / "out.gguf"), label)
+    assert not (tmp_path / "out.gguf").exists()
 
 
 def test_stream_gguf_conversion_yields_progress_then_ok(tmp_path):
