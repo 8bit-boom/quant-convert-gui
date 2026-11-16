@@ -507,9 +507,43 @@ is ~4x longer. `QUANT_GUI_QUANT_THREADS` sets the worker count. Stop/resume
 works as for the other types.
 
 **No importance matrix.** This is the uniform, uncalibrated K-quant. Image
-models have no `llama-imatrix`, so there is nothing to weight by; the
-`tools/krea2_kquant_plan.py` per-tensor plan (a weight-only proxy) is still a
-separate, unvalidated option.
+models have no `llama-imatrix`, so there is nothing to weight by.
+
+### Finding a mixed K-quant plan (Image → GGUF tab, "Analyze")
+
+K-quant files can mix types per tensor. The **Analyze** accordion on the
+Image → GGUF tab (or `convert_krea2_to_gguf.py --analyze plan.json`) measures,
+for every big BF16 linear, the real squared weight error at Q2_K, Q3_K, Q4_K,
+Q5_K, Q6_K and Q8_0 on a sample of 128 rows of your actual weights (using the
+encoders above, decoded with gguf-py), then picks a type per tensor to
+minimise the total error for a size budget - by default the size of a uniform
+Q4_K_M file, so the comparison is apples to apples. Pass the resulting plan to
+Convert (`--plan plan.json`); layers the plan does not cover follow `--quant`.
+The report shows size and weight error for uniform Q3_K..Q6_K and for the plan,
+the types chosen, and the average bits per weight by tensor role and by block.
+On a 4-core machine it costs about 0.5-1.1 s per tensor (roughly 3-6 minutes
+for a model with ~300 big linears); it reads only the sampled rows and converts
+nothing.
+
+*Checked:* on a synthetic Krea-2-shaped model the error the analysis predicted
+for the plan (0.0491) matched the error measured by decoding the file the
+converter produced (0.0491; uniform Q4_K_M predicted 0.0806, measured 0.0804),
+the allocator is within 10% of brute force on a small case, and the plan was
+~39% lower in weight error than uniform Q4_K at the same file size.
+
+*Not checked, and the important caveat:* this optimises **weight-space error
+under the assumption that every layer sees the same input energy**. It never
+runs the model, so it cannot know which layers matter most for the picture
+(first/last blocks, conditioning paths and tensors with unusually small inputs
+may deserve more bits than their weights suggest). A plan that wins by this
+measure may or may not give better images than uniform Q4_K_M; no image
+comparison has been run. Render the same prompt and seed with both files
+before trusting it. Large-magnitude tensors tend to be given the most bits
+because they contribute the most absolute error - that is a property of the
+objective, not proof they matter more. Only BF16 2-D linears whose row length
+is a multiple of 256 are planned; everything else follows the usual rules
+(`tools/krea2_kquant_plan.py` is the older weight-only proxy and is not used
+by this).
 
 ## About the other tabs
 
@@ -749,6 +783,8 @@ default where applicable and neither changes the output:
   recipes, size estimate and fit-to-a-size, plus the stdlib GGUF header
   reader they use (both ported from the owner's `8bit-boom/Llm-training`).
 - `quant_gui/model_card.py` - the Hugging Face model card (README.md) writer.
+- `quant_gui/kquant_plan.py` - per-tensor K-quant error measurement and the
+  size-budgeted mixed plan (see "Finding a mixed K-quant plan").
 - `quant_gui/kquants.py` - K-quant (Q2_K..Q6_K) encoders; byte-identical to
   ggml's on the blocks tested (see [K-quants for image models](#k-quants-for-image-models-q4_k_m-etc)).
 - `quant_gui/imatrix_hub.py` - Unsloth's published-matrix lookup/download.

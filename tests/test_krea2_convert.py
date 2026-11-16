@@ -257,3 +257,79 @@ def test_truncated_source_is_reported_plainly_not_as_a_reshape_error(tmp_path):
     # the CLI prints the message and exits 1 instead of a traceback
     assert k2g.main(["--src", str(cut), "--dst", str(tmp_path / "o.gguf")]) == 1
     assert k2g.SafetensorsFile(src).keys() == ["blocks.0.attn.wq.weight"]      # a complete file is fine
+
+
+# ---------------------------------------------------------------------------
+# mixed K-quant plan: --analyze then --plan
+# ---------------------------------------------------------------------------
+
+def _planning_model(path: Path):
+    rng = np.random.default_rng(21)
+    t = {}
+    for b in range(3):
+        for n, shp, sc in (("attn.wq", (256, 512), 0.02), ("mlp.down", (512, 1024), 0.01), ("mlp.up", (1024, 512), 0.02)):
+            w = rng.standard_normal(shp).astype(np.float32) * sc * (8 if (b, n) == (0, "attn.wq") else 1)
+            t[f"blocks.{b}.{n}.weight"] = (_to_bf16_storage(w), "BF16", w)
+    t["blocks.0.prenorm.scale"] = (np.ones(512, np.float32), "F32", None)
+    _write_safetensors(path, {k: (v[0], v[1]) for k, v in t.items()})
+    return t
+
+
+def test_analyze_writes_a_plan_that_conversion_applies_and_that_beats_uniform(tmp_path, capsys):
+    from quant_gui import kquant_plan as kp
+    src = tmp_path / "k2.safetensors"
+    _planning_model(src)
+    plan_f = tmp_path / "plan.json"
+
+    assert k2g.main(["--src", str(src), "--analyze", str(plan_f), "--sample-rows", "32"]) == 0
+    text = capsys.readouterr().out
+    assert "mixed plan" in text and "not an image-quality measurement" in text
+    plan = kp.load_plan(plan_f)
+    assert set(plan) == {k for k in _planning_model(tmp_path / "again.safetensors") if k.endswith("weight")}
+    assert len(set(plan.values())) > 1                       # tensors differ, so the plan is genuinely mixed
+    assert plan["blocks.0.attn.wq.weight"] != "Q2_K"          # the 8x larger weights are not starved
+
+    mixed, uni = tmp_path / "mixed.gguf", tmp_path / "uni.gguf"
+    assert k2g.main(["--src", str(src), "--dst", str(mixed), "--quant", "q4_k_m", "--plan", str(plan_f)]) == 0
+    assert k2g.main(["--src", str(src), "--dst", str(uni), "--quant", "q4_k_m"]) == 0
+    assert mixed.stat().st_size <= uni.stat().st_size * 1.01          # budget = size of uniform Q4_K
+
+    from gguf import quants
+    ref = {k: v[2] for k, v in _planning_model(tmp_path / "ref.safetensors").items() if v[2] is not None}
+    bf = {k: (_to_bf16_storage(w).astype(np.uint32) << 16).view(np.float32) for k, w in ref.items()}
+
+    def total_err(path):
+        sse = n2 = 0.0
+        for t in GGUFReader(str(path)).tensors:
+            if t.name in bf:
+                got = quants.dequantize(np.asarray(t.data), t.tensor_type).reshape(bf[t.name].shape)
+                sse += float(((got.astype(np.float64) - bf[t.name]) ** 2).sum())
+                n2 += float((bf[t.name].astype(np.float64) ** 2).sum())
+        return (sse / n2) ** 0.5
+
+    got_types = {t.name: t.tensor_type.name for t in GGUFReader(str(mixed)).tensors}
+    assert all(got_types[k] == v for k, v in plan.items())            # every planned tensor got its planned type
+    assert total_err(mixed) < total_err(uni)                          # lower weight error at (about) the same size
+
+
+def test_plan_for_another_model_is_refused_and_bad_plan_files_are_messages(tmp_path, capsys):
+    from quant_gui import kquant_plan as kp
+    src = tmp_path / "k2.safetensors"
+    _planning_model(src)
+    other = tmp_path / "other.json"
+    other.write_text('{"format": "kquant-plan-1", "types": {"not.a.tensor.weight": "Q4_K"}}')
+    with pytest.raises(SystemExit, match="matches no tensor"):
+        k2g.main(["--src", str(src), "--dst", str(tmp_path / "o.gguf"), "--plan", str(other)])
+    bad = tmp_path / "bad.json"
+    bad.write_text("{}")
+    assert k2g.main(["--src", str(src), "--dst", str(tmp_path / "o.gguf"), "--plan", str(bad)]) == 1
+    assert "not a kquant-plan-1" in capsys.readouterr().err
+    assert k2g.main(["--src", str(src)]) == 1                          # neither --dst nor --analyze
+
+
+def test_pick_qtype_follows_a_plan_only_where_the_shape_allows():
+    plan = {"blocks.0.attn.wq.weight": "Q6_K", "blocks.0.odd.weight": "Q6_K", "first.weight": "Q6_K"}
+    assert k2g.pick_qtype("blocks.0.attn.wq.weight", (512, 1024), "BF16", "q4_k_m", plan) == QT.Q6_K
+    assert k2g.pick_qtype("blocks.0.odd.weight", (512, 800), "BF16", "q4_k_m", plan) == QT.Q5_0     # plan can't apply: fallback
+    assert k2g.pick_qtype("first.weight", (512, 1024), "BF16", "q4_k_m", plan) == QT.F32           # precision rules win
+    assert k2g.pick_qtype("blocks.1.attn.wq.weight", (512, 1024), "BF16", "q4_k_m", plan) == QT.Q4_K  # not in plan

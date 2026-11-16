@@ -60,6 +60,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))   # repo root, for quant_gui.kquants
 from quant_gui import kquants  # noqa: E402  (numpy only)
+from quant_gui import kquant_plan as kp  # noqa: E402  (numpy + gguf, imported lazily by measure)
 
 # K-quant labels (as listed on Hugging Face) -> the one ggml type they store
 KQUANT_LABELS = {
@@ -137,6 +138,20 @@ class SafetensorsFile:
             )
         np_dt = _ST_DTYPES[dt]
         return self._slice(info).view(np_dt).reshape(info["shape"]), dt
+
+    def load_rows(self, key: str, idx: np.ndarray) -> np.ndarray:
+        """Float32 rows `idx` of a 2-D BF16/F16/F32 tensor, reading only those rows from disk."""
+        info = self.header[key]
+        shape = info["shape"]
+        if len(shape) != 2:
+            raise ValueError(f"{key}: row access needs a 2-D tensor")
+        dt = info["dtype"]
+        if dt == "BF16":
+            raw = self._slice(info).view(np.uint16).reshape(shape)
+            return bf16_to_f32(raw[idx])
+        if dt in ("F16", "F32"):
+            return self._slice(info).view(_ST_DTYPES[dt]).reshape(shape)[idx].astype(np.float32)
+        raise ValueError(f"{key}: dtype {dt} is not supported for analysis")
 
     def _slice(self, info: dict) -> np.ndarray:
         b0, b1 = info["data_offsets"]
@@ -221,7 +236,7 @@ QUANT_THRESHOLD_ELEMS = 1024
 
 
 def pick_qtype(key: str, shape: tuple[int, ...], src_dtype: str,
-               quant: str | None) -> "object":
+               quant: str | None, plan: dict | None = None) -> "object":
     """Return the GGMLQuantizationType for a tensor. `quant` (e.g. 'q8_0')
     is applied to big 2-D BF16 linears only; everything else follows the
     precision rules."""
@@ -234,6 +249,10 @@ def pick_qtype(key: str, shape: tuple[int, ...], src_dtype: str,
         return QT.F32
     if key.startswith(HIPREC_PREFIXES):
         return QT.F32
+    if plan and key in plan and src_dtype == "BF16" and len(shape) == 2 and n_elems > QUANT_THRESHOLD_ELEMS:
+        t = plan[key]                       # per-tensor type chosen by --analyze (only if the shape allows it)
+        if (t in kquants.SUPPORTED and shape[-1] % 256 == 0) or (t == "Q8_0" and shape[-1] % 32 == 0):
+            return QT[t]
     if quant and src_dtype == "BF16" and len(shape) == 2 and n_elems > QUANT_THRESHOLD_ELEMS:
         if quant in KQUANT_LABELS:
             base = KQUANT_LABELS[quant]
@@ -253,7 +272,7 @@ def pick_qtype(key: str, shape: tuple[int, ...], src_dtype: str,
 # ---------------------------------------------------------------------------
 
 def convert(src: Path, dst: Path, quant: str | None, arch: str = "krea2",
-            verbose: bool = False) -> dict:
+            verbose: bool = False, plan: dict | None = None) -> dict:
     import gguf
     from gguf import GGUFWriter
 
@@ -277,6 +296,13 @@ def convert(src: Path, dst: Path, quant: str | None, arch: str = "krea2",
     if file_type is None:
         raise SystemExit(f"this gguf package has no file type for {quant!r}")
     k_threads = max(1, min(8, (os.cpu_count() or 2) - 1))
+    if plan is not None:
+        names = {rename_diffusers_key(k) if diffusers else k for k in keys}
+        hit = sum(1 for n in plan if n in names)
+        if hit == 0:
+            raise SystemExit("the plan file matches no tensor of this model (was it made for a different checkpoint?)")
+        print(f"plan: {hit} of {len(plan)} entries match tensors in this file"
+              + (f" ({len(plan) - hit} do not and are ignored)" if hit < len(plan) else ""), flush=True)
 
     writer = GGUFWriter(path=None, arch=arch)
     writer.add_quantization_version(gguf.GGML_QUANT_VERSION)
@@ -292,7 +318,7 @@ def convert(src: Path, dst: Path, quant: str | None, arch: str = "krea2",
         name = rename_diffusers_key(key) if diffusers else key
         if name.endswith(".mod.lin") and data.ndim == 2:
             data = data.reshape(-1)  # scale_shift_table (6, h) -> [6*h]
-        qtype = pick_qtype(name, tuple(data.shape), src_dt, quant)
+        qtype = pick_qtype(name, tuple(data.shape), src_dt, quant, plan)
         tag = qtype.name
         if qtype.name in kquants.SUPPORTED:
             packed = kquants.quantize(data.astype(np.float32, copy=False), qtype.name, threads=k_threads)
@@ -319,25 +345,117 @@ def convert(src: Path, dst: Path, quant: str | None, arch: str = "krea2",
     return stats
 
 
+_BYTES_PER_ELEM_FIXED = {"F32": 4.0, "F16": 2.0, "BF16": 2.0, "Q4_0": 18 / 32, "Q5_0": 22 / 32, "Q5_1": 24 / 32,
+                         "Q8_0": 34 / 32, "Q4_1": 20 / 32}
+
+
+def analyze(src: Path, out: Path, budget_gb: float | None = None, budget_like: str = "q4_k_m",
+            floor: str = "q2_k", ceiling: str = "q8_0", sample_rows: int = 128) -> int:
+    """Measure the real K-quant error of every quantizable linear at every level and write a mixed plan
+    (see quant_gui/kquant_plan.py for what the numbers do and do not mean). Reads only a row sample of
+    each tensor, never converts anything."""
+    print(f"source: {Path(src).resolve()} ({Path(src).stat().st_size / 1e9:.2f} GB)", flush=True)
+    st = SafetensorsFile(src)
+    keys = st.keys()
+    diffusers = looks_like_diffusers(keys)
+    like = KQUANT_LABELS.get(budget_like.lower(), budget_like.upper())
+    entries, fixed_bytes, name_of = [], 0, {}
+    for key in sorted(keys):
+        info = st.tensor_info(key)
+        shape = tuple(info["shape"])
+        name = rename_diffusers_key(key) if diffusers else key
+        n_elems = int(np.prod(shape)) if shape else 0
+        if name.endswith(".mod.lin") and len(shape) == 2:
+            shape = (n_elems,)
+        # default per-tensor choice when asked for a K-quant: tensors this returns a K type for are plannable
+        qt = pick_qtype(name, shape, info["dtype"], "q4_k_m").name
+        if qt in kquants.SUPPORTED:
+            entries.append(kp.TensorEntry(name, shape[0], shape[1], lambda idx, k=key: st.load_rows(k, idx)))
+            name_of[name] = key
+        else:
+            fixed_bytes += int(n_elems * _BYTES_PER_ELEM_FIXED.get(qt, 4.0))
+    if not entries:
+        print("error: no quantizable 2-D BF16 linears with a row length that is a multiple of 256 were found "
+              "(the analysis needs a BF16 source)", file=sys.stderr)
+        return 1
+    threads = max(1, min(8, (os.cpu_count() or 2) - 1))
+    print(f"analyzing {len(entries)} tensors at {', '.join(kp.LADDER)} on {sample_rows} sampled rows each "
+          f"({threads} threads) - weights only, no images", flush=True)
+    t0 = time.time()
+
+    def progress(i, n, name):
+        if i % 20 == 0 or i == n:
+            print(f"[{time.time() - t0:6.1f}s] {i}/{n} {name}", flush=True)
+
+    measures, skipped = kp.measure(entries, sample_rows=sample_rows, threads=threads, progress_cb=progress)
+    by_name = {e.name: e for e in entries}
+    for n in skipped:                                    # non-finite weights: left to the default rule (counted as BF16)
+        fixed_bytes += int(by_name[n].rows * by_name[n].cols * 2)
+    if skipped:
+        print(f"warning: {len(skipped)} tensor(s) contain non-finite values and were left out of the plan", flush=True)
+    if budget_gb:
+        budget = int(budget_gb * 1e9)
+        note = f"{budget_gb:g} GB"
+    else:
+        ub, _ = kp.uniform(measures, like, fixed_bytes)
+        budget, note = ub, f"the size of a uniform {like}"
+    plan = kp.allocate(measures, budget, fixed_bytes=fixed_bytes, floor=KQUANT_LABELS.get(floor, floor.upper()),
+                       ceiling=KQUANT_LABELS.get(ceiling, ceiling.upper()))
+    print()
+    print(kp.report(measures, plan, fixed_bytes))
+    print(f"\n(budget = {note}; other layers (norms, conditioning, odd shapes) are counted at their default size, "
+          f"{fixed_bytes / 1e9:.2f} GB)")
+    kp.save_plan(out, plan, {"source": Path(src).name, "budget": note, "sample_rows": sample_rows,
+                             "floor": floor, "ceiling": ceiling, "tensors": len(measures)})
+    print(f"plan written: {out}\nconvert with:  --plan \"{out}\"  (any --quant works for the layers the plan does not cover)")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--src", type=Path, required=True, help="source safetensors")
-    ap.add_argument("--dst", type=Path, required=True, help="output .gguf")
+    ap.add_argument("--dst", type=Path, help="output .gguf (not needed with --analyze)")
     ap.add_argument("--quant", default="q8_0", choices=QUANT_CHOICES,
                     help="quant for big BF16 2-D linears (default q8_0; 'bf16' = lossless passthrough; "
                          "q*_k* are K-quants written by quant_gui/kquants.py)")
     ap.add_argument("--arch", default="krea2",
                     help="architecture tag; use 'qwen_image' only if targeting stock city96 nodes")
     ap.add_argument("-v", "--verbose", action="store_true")
+    ap.add_argument("--analyze", type=Path, metavar="PLAN.json",
+                    help="measure every linear at Q2_K..Q8_0 on the real weights and write a mixed plan here "
+                         "(no conversion); see quant_gui/kquant_plan.py for what the error means")
+    ap.add_argument("--budget-gb", type=float, help="with --analyze: target file size in GB "
+                                                      "(default: the size of a uniform --budget-like file)")
+    ap.add_argument("--budget-like", default="q4_k_m", choices=list(KQUANT_LABELS),
+                    help="with --analyze and no --budget-gb: match the size of this uniform K-quant")
+    ap.add_argument("--floor", default="q2_k", choices=["q2_k", "q3_k", "q4_k", "q5_k", "q6_k", "q8_0"],
+                    help="with --analyze: lowest type a tensor may get")
+    ap.add_argument("--ceiling", default="q8_0", choices=["q2_k", "q3_k", "q4_k", "q5_k", "q6_k", "q8_0"],
+                    help="with --analyze: highest type a tensor may get")
+    ap.add_argument("--sample-rows", type=int, default=128, help="with --analyze: rows sampled per tensor")
+    ap.add_argument("--plan", type=Path, metavar="PLAN.json",
+                    help="convert using a per-tensor plan made by --analyze (other layers follow --quant)")
     args = ap.parse_args(argv)
 
     if not args.src.is_file():
         print(f"not found: {args.src}", file=sys.stderr)
         return 1
+    if args.analyze:
+        try:
+            args.analyze.parent.mkdir(parents=True, exist_ok=True)
+            return analyze(args.src, args.analyze, args.budget_gb, args.budget_like, args.floor, args.ceiling,
+                           max(8, args.sample_rows))
+        except ValueError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+    if args.dst is None:
+        print("error: --dst is required unless --analyze is given", file=sys.stderr)
+        return 1
     args.dst.parent.mkdir(parents=True, exist_ok=True)
     try:
+        plan = kp.load_plan(args.plan) if args.plan else None
         convert(args.src, args.dst, None if args.quant == "bf16" else args.quant,
-                arch=args.arch, verbose=args.verbose)
+                arch=args.arch, verbose=args.verbose, plan=plan)
     except ValueError as exc:       # incomplete source, unsupported dtype: a message, not a traceback
         print(f"error: {exc}", file=sys.stderr)
         return 1

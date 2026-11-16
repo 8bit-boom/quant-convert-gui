@@ -69,6 +69,16 @@ divisible by 256 fall back to Q4_0/Q5_0/Q5_1/Q8_0 like llama.cpp does, and no
 importance matrix is used. Loading the result in ComfyUI-GGUF has not been
 tested from here. IQ types (IQ4_XS etc.) are *not* supported.
 
+### Mixed K-quant plans (`--analyze` / `--plan`)
+
+`python tools/convert_krea2_to_gguf.py --src model_bf16.safetensors --analyze plan.json`
+measures the real weight error of every big linear at Q2_K..Q8_0 and writes a
+per-tensor plan for the size of a uniform Q4_K_M file (`--budget-gb`,
+`--budget-like`, `--floor`, `--ceiling`, `--sample-rows` change that);
+`--dst out.gguf --plan plan.json` applies it. This is weight-space only - see
+the README section "Finding a mixed K-quant plan" for what it does and does not
+tell you. Verify with fixed-seed renders.
+
 ### Alternative: two-stage K-quant flow with a sensitivity plan
 
 Stock `llama-quantize` refuses the krea2 arch; community forks

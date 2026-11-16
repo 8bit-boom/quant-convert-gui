@@ -2917,6 +2917,33 @@ with gr.Blocks(title="Quant Convert GUI") as demo:
                 )
                 img_dst_name = gr.Textbox(label="Output name", value="krea2_turbo_q8_0.gguf")
                 img_convert_btn = gr.Button("Convert", variant="primary")
+            img_plan_path = gr.Textbox(
+                label="Mixed K-quant plan file (optional)",
+                placeholder="made by 'Analyze' below, or leave empty for one uniform type",
+                info="With a plan, each big linear gets the type the analysis chose; the quant above is used for "
+                     "anything the plan does not cover (e.g. layers whose row length is not a multiple of 256).",
+            )
+            with gr.Accordion("Find a better mixed K-quant plan (analyze the weights)", open=False):
+                gr.Markdown(
+                    "Measures the **real** quantization error of every big linear at Q2_K, Q3_K, Q4_K, Q5_K, Q6_K and "
+                    "Q8_0 (on a sample of rows of your actual weights), then gives each tensor the type that lowers "
+                    "the total error most for the size you pick - tensors that suffer most from rounding get more "
+                    "bits, the rest fewer. Reads only a row sample; **nothing is converted**.\n\n"
+                    "**What this is not:** it never runs the model, so it optimizes *weight-space error*, assuming "
+                    "every layer sees the same input energy. It does not know which layers matter most for the "
+                    "picture. A plan that beats uniform Q4_K by this measure may or may not beat it in renders - "
+                    "compare both with the same prompt and seed before trusting it."
+                )
+                with gr.Row():
+                    img_plan_like = gr.Dropdown(
+                        ["q4_k_m", "q3_k_m", "q5_k_m", "q6_k", "q2_k"], value="q4_k_m",
+                        label="Same size as a uniform...",
+                        info="The plan's size budget = the file size of this uniform K-quant (apples to apples).",
+                    )
+                    img_plan_gb = gr.Number(label="...or a target size in GB (0 = use the box on the left)", value=0, minimum=0)
+                    img_plan_rows = gr.Number(label="Rows sampled per tensor", value=128, minimum=8, precision=0,
+                                              info="More = slower and more exact (error is scaled up from the sample).")
+                img_analyze_btn = gr.Button("Analyze and write plan")
             img_convert_log = gr.Textbox(label="Conversion log", lines=12, interactive=False, autoscroll=True)
 
             gr.Markdown("### Downloads (Comfy-Org/Krea-2 on Hugging Face)")
@@ -3783,20 +3810,54 @@ with gr.Blocks(title="Quant Convert GUI") as demo:
         else:
             yield f"Done.\n`{state['path']}`"
 
-    def run_img_convert(src, local_path, quant, dst_name):
-        src = (local_path or "").strip().strip('"') or src
+    def _img_source(src, local_path):
+        return (local_path or "").strip().strip('"') or src
+
+    def run_img_convert(src, local_path, quant, dst_name, plan_path=""):
+        src = _img_source(src, local_path)
         if not src:
             yield "Pick a source safetensors first (or give a local path, or download one below)."
             return
         if not Path(src).is_file():
             yield f"File not found: {src}"
             return
+        plan_path = (plan_path or "").strip().strip('"')
+        if plan_path and not Path(plan_path).is_file():
+            yield f"Plan file not found: {plan_path}"
+            return
         dst = OUTPUT_DIR / (dst_name or "krea2_q8_0.gguf")
         dst.parent.mkdir(parents=True, exist_ok=True)
-        yield from _stream_tool_cmd([
+        cmd = [
             str(APP_DIR / "tools" / "convert_krea2_to_gguf.py"),
             "--src", str(src), "--dst", str(dst), "--quant", quant or "q8_0",
-        ])
+        ]
+        if plan_path:
+            cmd += ["--plan", plan_path]
+        yield from _stream_tool_cmd(cmd)
+
+    def _img_plan_file(src):
+        return OUTPUT_DIR / f"{Path(src).stem}.kplan.json"
+
+    def run_img_analyze(src, local_path, like, target_gb, sample_rows):
+        src = _img_source(src, local_path)
+        if not src:
+            yield "Pick a source safetensors first (give its local path)."
+            return
+        if not Path(src).is_file():
+            yield f"File not found: {src}"
+            return
+        OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+        cmd = [str(APP_DIR / "tools" / "convert_krea2_to_gguf.py"), "--src", str(src),
+               "--analyze", str(_img_plan_file(src)), "--budget-like", like or "q4_k_m",
+               "--sample-rows", str(int(sample_rows or 128))]
+        if target_gb and float(target_gb) > 0:
+            cmd += ["--budget-gb", str(float(target_gb))]
+        yield from _stream_tool_cmd(cmd)
+
+    def fill_img_plan(src, local_path):
+        src = _img_source(src, local_path)
+        f = _img_plan_file(src) if src else None
+        return str(f) if f and f.is_file() else gr.update()
 
     def dl_turbo():
         yield from run_img_download(
@@ -3823,8 +3884,12 @@ with gr.Blocks(title="Quant Convert GUI") as demo:
     img_dl_te_btn.click(dl_te, outputs=[img_dl_log])
     img_dl_vae_btn.click(dl_vae, outputs=[img_dl_log])
     img_convert_btn.click(run_img_convert,
-                          inputs=[img_src, img_src_path, img_quant, img_dst_name],
+                          inputs=[img_src, img_src_path, img_quant, img_dst_name, img_plan_path],
                           outputs=[img_convert_log])
+    img_analyze_btn.click(run_img_analyze,
+                          inputs=[img_src, img_src_path, img_plan_like, img_plan_gb, img_plan_rows],
+                          outputs=[img_convert_log]).then(
+        fill_img_plan, inputs=[img_src, img_src_path], outputs=[img_plan_path])
 
     def run_llamacpp_clone():
         yield from run_llamacpp_setup_step("clone", "")
